@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IndyCar Pós-venda</title>
+  <meta name="description" content="Central de mensagens programadas da IndyCar: aniversários, pós-venda, retorno para revisão e satisfação dos clientes." />
+  <meta name="theme-color" content="#070a14" />
+
+  <!-- Tema (claro/escuro) aplicado ANTES de pintar a tela, para não piscar. -->
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem('indycar_tema');
+        if (t === 'claro') {
+          document.documentElement.setAttribute('data-tema', 'claro');
+          var m = document.querySelector('meta[name="theme-color"]');
+          if (m) m.setAttribute('content', '#eef0f4');
+        }
+      } catch (e) { /* sem localStorage: segue no escuro */ }
+    })();
+  </script>
+
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+  <link rel="apple-touch-icon" href="/icon-192.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="IndyCar Pós-venda" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- ===================== SIDEBAR ===================== -->
+    <aside class="sidebar">
+      <div class="logo"><span>INDY</span><span>CAR</span></div>
+      <nav class="nav" id="nav">
+        <div class="nav-grupo">
+          <p class="nav-rotulo">Pós-venda</p>
+          <a class="nav-item active" data-route="inicio" tabindex="0" role="button">
+            <svg viewBox="0 0 24 24"><path d="M3 11l9-8 9 8v9a2 2 0 0 1-2 2h-4v-7h-6v7H5a2 2 0 0 1-2-2z"/></svg>
+            <span>INÍCIO</span>
+          </a>
+          <a class="nav-item" data-route="mensagens" tabindex="0" role="button">
+            <svg viewBox="0 0 24 24"><path d="M21 11.5a8.4 8.4 0 0 1-12.3 7.4L3 21l2.2-5.6A8.4 8.4 0 1 1 21 11.5z"/></svg>
+            <span>MENSAGENS</span>
+            <em class="badge" id="badgeFila">0</em>
+          </a>
+          <a class="nav-item" data-route="campanhas" tabindex="0" role="button">
+            <svg viewBox="0 0 24 24"><path d="M3 11l18-7-7 18-2.5-7.5z"/></svg>
+            <span>CAMPANHAS</span>
+          </a>
+          <a class="nav-item" data-route="clientes" tabindex="0" role="button">
+            <svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/></svg>
+            <span>CLIENTES</span>
+          </a>
+          <a class="nav-item" data-route="satisfacao" tabindex="0" role="button">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><path d="M9 9h.01M15 9h.01"/></svg>
+            <span>SATISFAÇÃO</span>
+          </a>
+        </div>
+      </nav>
+
+      <div class="rodape-lateral">
+        <button type="button" class="tema-toggle" id="btnTema"
+                aria-label="Alternar entre tema claro e escuro">
+          <span class="tema-ico" id="temaIco" aria-hidden="true">🌙</span>
+          <span class="tema-txt" id="temaTxt">Escuro</span>
+        </button>
+        <div class="avatar-bottom" id="avatarPerfil" title="Sua conta">IC</div>
+      </div>
+    </aside>
+
+    <!-- ===================== CONTEÚDO ===================== -->
+    <main class="main">
+      <header class="topbar">
+        <div class="company">
+          <div class="company-logo">IC</div>
+          <div>
+            <div class="company-title">
+              <h1>IndyCar Centro Automotivo</h1>
+              <span class="tag-dashboard" id="pageTag">PÓS-VENDA</span>
+            </div>
+            <div class="company-sub">
+              <span>Mensagens programadas e satisfação dos clientes</span>
+              <em>Quem conhece, Indyca! 🏎</em>
+            </div>
+          </div>
+        </div>
+        <button class="btn-novo" id="btnNova">
+          <svg viewBox="0 0 24 24"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4z"/></svg>
+          Nova mensagem
+        </button>
+      </header>
+
+      <section class="view" id="view"><!-- preenchido por app.js --></section>
+    </main>
+  </div>
+
+  <!-- ===================== MODAL ===================== -->
+  <div class="modal-overlay" id="modalOverlay">
+    <div class="modal" id="modal"><!-- preenchido por app.js --></div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast"></div>
+
+  <!-- ============ LOGIN ============ -->
+  <div id="telaLogin" class="login-capa">
+    <form id="formLogin" class="login-caixa" autocomplete="on">
+      <img src="/logo.png" alt="IndyCar Centro Automotivo" class="login-logo" />
+      <h1>Pós-venda</h1>
+      <p class="login-sub">Entre com o mesmo e-mail e senha do Atendimento, do CRM e da Agenda.</p>
+      <label>E-mail
+        <input name="loginEmail" type="email" required autocomplete="username"
+               placeholder="voce@indycartaubate.com" />
+      </label>
+      <label>Senha
+        <input name="loginSenha" type="password" required autocomplete="current-password"
+               placeholder="••••••••" />
+      </label>
+      <button type="submit" class="btn-entrar" id="btnEntrar">ENTRAR</button>
+      <p class="login-erro" id="erroLogin" hidden></p>
+    </form>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

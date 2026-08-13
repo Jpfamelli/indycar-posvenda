@@ -1,0 +1,29 @@
+# O "carteiro" do Pós-venda: de 15 em 15 minutos acorda o servidor no Render
+# (plano free dorme) e manda ele gerar/enviar as mensagens programadas.
+# Precisa do secret RUNNER_TOKEN (Settings > Secrets and variables > Actions),
+# com o MESMO valor da variável RUNNER_TOKEN no Render.
+name: carteiro
+on:
+  schedule:
+    - cron: '*/15 11-23 * * *'   # 11h-23h UTC = 8h-20h em São Paulo
+  workflow_dispatch: {}
+
+jobs:
+  rodar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Acordar o servidor e rodar o carteiro
+        env:
+          RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+        run: |
+          if [ -z "$RUNNER_TOKEN" ]; then echo "Secret RUNNER_TOKEN não configurado"; exit 1; fi
+          # 1ª chamada acorda o Render free (pode demorar ~1 min); repete até responder
+          for i in 1 2 3; do
+            code=$(curl -s -o resposta.json -w "%{http_code}" --max-time 120 \
+              -X POST -H "X-Runner-Token: $RUNNER_TOKEN" \
+              https://indycar-posvenda.onrender.com/api/rodar) && [ "$code" = "200" ] && break
+            echo "tentativa $i: HTTP $code — esperando o servidor acordar…"
+            sleep 30
+          done
+          cat resposta.json || true
+          [ "$code" = "200" ]

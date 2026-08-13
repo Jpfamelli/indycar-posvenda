@@ -1,0 +1,13 @@
+{
+  "name": "indycar-posvenda",
+  "version": "1.0.0",
+  "description": "IndyCar Pós-venda — mensagens programadas (aniversário, pós-venda, retorno) e satisfação dos clientes",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
