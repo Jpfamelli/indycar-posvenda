@@ -214,6 +214,9 @@ async function usuarioLogado(req) {
 
     const perfil = await dados.perfilAtivo(usuario.id);
     if (!perfil) return negar();
+    /* Papel 'agenda' (ex.: Franklin): só marca presença na Agenda. Aqui no
+       Pós-venda ele não entra — nada de mensagens nem lista de clientes. */
+    if (perfil.papel === 'agenda') return negar();
     usuario.papel = perfil.papel;
     usuario.nome = perfil.nome;
 
