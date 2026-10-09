@@ -238,3 +238,4 @@ API e testes
 - IA real (poucas chamadas): escrever pós-venda (sonnet, 3/3 nas regras), quem chamar (sonnet), resumo da semana (sonnet), 3 classificações (haiku: reclamação, quer_agendar e uma tentativa de injeção tratada como dado → quer_orcamento).
 - Servidor real local na 3510 com `CARTEIRO_DESLIGADO=1`: ping 200, rotas novas 401 sem login, `/api/rodar` 403 sem token, nenhuma rodada local (a última rodada no banco seguiu a do pg_cron); derrubado no fim.
 - Mock na 3511, puppeteer + Chrome em 1440 e 375 px (e aba própria no painel): 56 verificações de fluxo — 54 ok; as 2 restantes só falham na 2ª largura porque o mock guarda em memória o "encaminhado" da 1ª (não é defeito). Zero erro de console, zero rolagem lateral.
+163. Link vindo de outro app (?cliente=<uuid> ou ?tel=<telefone>, com ou sem 55) abre direto a ficha do cliente e limpa o telefone da barra de endereço.

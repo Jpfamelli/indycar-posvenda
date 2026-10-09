@@ -1502,6 +1502,26 @@ async function abrirApp() {
   } catch { /* segue com o padrão */ }
   carregarSaude();
   await route('inicio');
+  await abrirPorLink();
+}
+
+/* Link vindo de outro app (Atendimento, CRM, Agenda): ?cliente=<uuid> ou ?tel=<telefone>
+   abre a ficha do cliente. O telefone sai da barra de endereço logo depois. */
+async function abrirPorLink() {
+  const p = new URLSearchParams(location.search);
+  const id = p.get('cliente'), tel = (p.get('tel') || '').replace(/[^0-9]/g, '');
+  if (!id && tel.length < 8) return;
+  history.replaceState(null, '', location.pathname);
+  try {
+    let alvo = /^[0-9a-f-]{36}$/i.test(id || '') ? id : null;
+    if (!alvo && tel) {
+      const lista = await api('GET', '/clientes?q=' + encodeURIComponent(tel.replace(/^55(?=[0-9]{10,11}$)/, '')));
+      alvo = lista?.[0]?.id || null;
+    }
+    if (!alvo) return toast('Cliente desse link não encontrado no cadastro.', 'err');
+    await route('clientes');
+    await abrirFicha(alvo);
+  } catch (e) { toast(e.message || 'Não consegui abrir o cliente do link.', 'err'); }
 }
 
 $('#formLogin').addEventListener('submit', async e => {
