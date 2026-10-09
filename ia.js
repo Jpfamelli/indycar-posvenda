@@ -155,6 +155,8 @@ const clientePadrao = {
     const inicio = Date.now();
     const corpo = {
       model: modelo, max_tokens: maxTokens,
+      // Sonnet 5.5 pensa por padrão e pode gastar o teto inteiro pensando: só entre ferramentas.
+      ...(/sonnet-5-5/.test(String(modelo)) ? { thinking: { type: 'between_tools' } } : {}), 
       system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
       messages: mensagens,
     };
