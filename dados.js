@@ -30,6 +30,11 @@ const T = {
   modelos: 'comunicar_modelos',
   v360: 'v_cliente_360',
   vigia: 'vigia_estado',
+  conversas: 'conversas',
+  mensagens: 'whatsapp_mensagens',
+  iaConfig: 'ia_config',
+  iaAcoes: 'ia_acoes',
+  agendaIa: 'agenda_ia_config',
 };
 
 const LINHA_UNICA = 'id=is.true';
@@ -359,11 +364,11 @@ export async function fichaCliente(id) {
 const FAIXAS = {
   dias_posvenda: [0, 30], meses_retorno: [1, 24], horas_lembrete: [1, 72], dias_orcamento: [1, 30],
   dias_nao_fechou: [1, 60], meses_reativacao: [3, 36], intervalo_minimo_dias: [0, 60],
-  janela_inicio: [0, 23], janela_fim: [1, 24],
+  janela_inicio: [0, 23], janela_fim: [1, 24], limite_por_hora: [1, 500],
 };
 const PADRAO_NUM = {
   dias_posvenda: 2, meses_retorno: 6, horas_lembrete: 20, dias_orcamento: 3, dias_nao_fechou: 7,
-  meses_reativacao: 12, intervalo_minimo_dias: 7, janela_inicio: 8, janela_fim: 20,
+  meses_reativacao: 12, intervalo_minimo_dias: 7, janela_inicio: 8, janela_fim: 20, limite_por_hora: 60,
 };
 
 export async function obterConfig() {
@@ -380,6 +385,8 @@ export async function obterConfig() {
   cfg.pausa_geral = !!c.pausa_geral;
   cfg.telefone_teste = c.telefone_teste || '';
   cfg.carteiro_configurado = !!c.runner_token;
+  cfg.ia_resumo = c.ia_resumo || null;
+  cfg.ia_resumo_em = c.ia_resumo_em || null;
   cfg.updated_at = c.updated_at || null;
   return cfg;
 }
@@ -480,9 +487,14 @@ export async function listarModelos() {
 // FILA DE ENVIOS
 // ============================================================================
 
-export async function listarEnvios({ status, tipo, q, limite = 300 } = {}) {
+export async function listarEnvios({ status, tipo, q, de, ate, intencao, limite = 300 } = {}) {
   const p = new URLSearchParams('select=*');
   if (status && status !== 'todas') p.set('status', `eq.${status}`);
+  if (intencao && intencao !== 'todas') p.set('intencao', intencao === 'qualquer' ? 'not.is.null' : `eq.${intencao}`);
+  // período no fuso da oficina (de/até inclusivos, 'YYYY-MM-DD')
+  const dIni = dataBanco(de), dFim = dataBanco(ate);
+  if (dIni) p.append('enviar_em', `gte.${instanteSP(dIni, '00:00').toISOString()}`);
+  if (dFim) p.append('enviar_em', `lt.${instanteSP(somarDias(dFim, 1), '00:00').toISOString()}`);
   if (tipo && tipo !== 'todos') p.set('tipo', `eq.${tipo}`);
   if (q) {
     const t = termoBusca(q);
@@ -492,8 +504,8 @@ export async function listarEnvios({ status, tipo, q, limite = 300 } = {}) {
     p.set('or', `(${partes.join(',')})`);
   }
   p.set('order', 'enviar_em.desc');
-  p.set('limit', String(Math.min(Number(limite) || 300, 1000)));
-  return selecionar(T.envios, p);
+  p.set('limit', String(Math.min(Number(limite) || 300, 5000)));
+  return Number(limite) > 1000 ? selecionarTudo(T.envios, p) : selecionar(T.envios, p);
 }
 
 /**
@@ -528,11 +540,17 @@ export async function cancelarEnvio(id) {
   return atualizarUm(T.envios, `id=eq.${id}&status=eq.pendente`, { status: 'cancelado' });
 }
 
+/** Desfaz um cancelamento: a mensagem volta à fila no MESMO horário (se já passou, sai na próxima rodada). */
+export async function desfazerCancelamento(id) {
+  if (!ehUuid(id)) return null;
+  return atualizarUm(T.envios, `id=eq.${id}&status=eq.cancelado`, { status: 'pendente' });
+}
+
 /** Falhou/cancelada/pulada volta para a fila agora. */
 export async function reenfileirar(id) {
   if (!ehUuid(id)) return null;
   return atualizarUm(T.envios, `id=eq.${id}&status=in.(falhou,cancelado,pulado)`, {
-    status: 'pendente', erro: null, motivo_pulado: null, enviar_em: new Date().toISOString(),
+    status: 'pendente', erro: null, motivo_pulado: null, enviar_em: new Date().toISOString(), tentativas: 0,
   });
 }
 
@@ -546,10 +564,11 @@ export async function enviosDevidos(limite = 25) {
   return selecionar(T.envios, p);
 }
 
-export async function marcarEnvio(id, status, erro = null, tentativas = undefined) {
+export async function marcarEnvio(id, status, erro = null, tentativas = undefined, extra = {}) {
   const campos = {
     status, erro,
     enviado_em: status === 'enviado' ? new Date().toISOString() : null,
+    ...extra,
   };
   if (Number.isInteger(tentativas)) campos.tentativas = tentativas;
   return atualizarUm(T.envios, `id=eq.${id}`, campos);
@@ -1008,7 +1027,7 @@ export async function resumo() {
     obterConfig(),
     contar(T.envios, 'status=eq.pendente'),
     contar(T.envios, `status=eq.pendente&enviar_em=lte.${encodeURIComponent(duasHorasAtras)}`),
-    selecionarTudo(T.envios, `select=id,tipo,status,enviado_em,respondido_em,resposta_tipo,agendou_depois_id,created_at,erro&created_at=gte.${encodeURIComponent(ini30)}`),
+    selecionarTudo(T.envios, `select=id,tipo,status,enviado_em,respondido_em,resposta_tipo,agendou_depois_id,created_at,erro,intencao,encaminhado_em&created_at=gte.${encodeURIComponent(ini30)}`),
     selecionarTudo(T.clientes, 'select=id,nome,telefone,nascimento&nascimento=not.is.null'),
     selecionar(T.respostas, 'select=satisfeito,nota,created_at&order=created_at.desc&limit=1000'),
     contar(T.clientes, 'aceita_mensagens=is.false'),
@@ -1058,8 +1077,12 @@ export async function resumo() {
   const satisfeitos = respostas.filter((r) => r.satisfeito).length;
   const notas = respostas.map((r) => Number(r.nota)).filter((n) => n >= 1 && n <= 5);
 
+  const intencoes7 = {};
+  for (const e of envios30) if (e.intencao && (e.respondido_em || '') >= ini7) intencoes7[e.intencao] = (intencoes7[e.intencao] || 0) + 1;
+
   return {
-    pendentes, vencidos, enviadosHoje, falhas, ultimoErro,
+    pendentes, vencidos, enviadosHoje, falhas, ultimoErro, intencoes7,
+    limitePorHora: cfg.limite_por_hora,
     semana: { enviadas: enviados7.length, respondidas: enviados7.filter((e) => e.respondido_em).length },
     mes30: { enviadas: enviados30.filter((e) => e.status === 'enviado').length, respondidas: respondidas30, agendaram, concluidos, receita },
     porRegua,
@@ -1114,4 +1137,376 @@ export async function saude() {
 export async function perfilAtivo(id) {
   const p = await selecionarUm(T.perfis, `select=ativo,papel,nome&id=eq.${encodeURIComponent(id)}`);
   return p?.ativo ? p : null;
+}
+
+// ============================================================================
+// RODADA 2 — feriados, falhas transitórias, limite por hora, "alguém está
+// atendendo", histórico no Atendimento, IA (config, chave, log), relatórios
+// ============================================================================
+
+/** Feriados nacionais 2026–2027 (lista fixa). Régua de relacionamento não sai neles. */
+export const FERIADOS = {
+  '2026-01-01': 'Confraternização Universal', '2026-02-16': 'Carnaval', '2026-02-17': 'Carnaval',
+  '2026-04-03': 'Sexta-feira Santa', '2026-04-21': 'Tiradentes', '2026-05-01': 'Dia do Trabalho',
+  '2026-06-04': 'Corpus Christi', '2026-09-07': 'Independência', '2026-10-12': 'Nossa Senhora Aparecida',
+  '2026-11-02': 'Finados', '2026-11-15': 'Proclamação da República', '2026-11-20': 'Consciência Negra',
+  '2026-12-25': 'Natal',
+  '2027-01-01': 'Confraternização Universal', '2027-02-08': 'Carnaval', '2027-02-09': 'Carnaval',
+  '2027-03-26': 'Sexta-feira Santa', '2027-04-21': 'Tiradentes', '2027-05-01': 'Dia do Trabalho',
+  '2027-05-27': 'Corpus Christi', '2027-09-07': 'Independência', '2027-10-12': 'Nossa Senhora Aparecida',
+  '2027-11-02': 'Finados', '2027-11-15': 'Proclamação da República', '2027-11-20': 'Consciência Negra',
+  '2027-12-25': 'Natal',
+};
+export const feriado = (dataIso) => FERIADOS[String(dataIso || '').slice(0, 10)] || null;
+/** Réguas que esperam o feriado passar (lembrete, aniversário e avaliação saem no dia; campanha é decisão de gente). */
+export const TIPOS_SEGURAM_NO_FERIADO = new Set(['posvenda', 'retorno', 'reativacao', 'orcamento', 'nao_fechou']);
+/** Réguas que esperam quando alguém está atendendo o cliente agora. */
+export const TIPOS_ESPERAM_ATENDIMENTO = new Set(['posvenda', 'retorno', 'reativacao', 'orcamento', 'nao_fechou', 'aniversario', 'campanha']);
+
+/** Próximo dia (a partir de amanhã) que não é feriado nem domingo (se domingo não envia), às HH:MM. */
+export function proximoDiaDeEnvio(dataIso, horaHM = '09:30', enviaDomingo = false) {
+  let d = somarDias(dataIso, 1);
+  for (let i = 0; i < 10; i++) {
+    const dow = new Date(d + 'T12:00:00').getDay();
+    if (!feriado(d) && (enviaDomingo || dow !== 0)) break;
+    d = somarDias(d, 1);
+  }
+  return instanteSP(d, horaHM).toISOString();
+}
+
+export const MAX_TENTATIVAS = 3;
+/** Erro que não melhora tentando de novo (número inválido, sem WhatsApp). */
+const ERRO_DEFINITIVO = /inv[aá]lid|not.*(registered|on whatsapp|exist)|n[aã]o (tem|possui|est[aá] no) whatsapp|n[aã]o existe/i;
+
+/**
+ * O que fazer com um envio que falhou (erro não estrutural):
+ * transitório e abaixo de 3 tentativas → volta à fila com espera (5, 15 min);
+ * senão → falhou de vez.
+ */
+export function decidirFalha(erro, tentativas, agora = Date.now()) {
+  if (ERRO_DEFINITIVO.test(String(erro || '')) || tentativas >= MAX_TENTATIVAS) {
+    return { status: 'falhou', enviar_em: null };
+  }
+  const esperaMin = tentativas <= 1 ? 5 : 15;
+  return { status: 'pendente', enviar_em: new Date(agora + esperaMin * 60000).toISOString(), esperaMin };
+}
+
+/** Quantas cabem nesta rodada sem passar do limite por hora (e do lote máximo). */
+export function vagasNestaRodada(limitePorHora, enviadasUltimaHora, loteMax = 25) {
+  const lim = Math.max(1, Number(limitePorHora) || 60);
+  return Math.max(0, Math.min(loteMax, lim - (Number(enviadasUltimaHora) || 0)));
+}
+
+export async function enviadasNaUltimaHora() {
+  return contar(T.envios, `status=eq.enviado&enviado_em=gte.${encodeURIComponent(new Date(Date.now() - 3600000).toISOString())}`);
+}
+
+/** Adia um pendente (alguém atendendo, feriado…) com o motivo visível na tela. */
+export async function adiarEnvio(id, enviarEm, motivo) {
+  if (!ehUuid(id)) return null;
+  return atualizarUm(T.envios, `id=eq.${id}&status=eq.pendente`, { enviar_em: enviarEm, motivo_pulado: motivo ? `adiado: ${motivo}`.slice(0, 200) : null });
+}
+
+/** A conversa do cliente no Atendimento (uma por telefone). */
+export async function conversaDoTelefone(telefone) {
+  const t = telefoneNacional(telefone);
+  if (!t) return null;
+  return selecionarUm(T.conversas, `select=id,cliente_id,nome,telefone,aguardando_consultor,aguardando_desde,nao_lidas,ia_ativa&telefone_e164=eq.${encodeURIComponent(t)}&limit=1`);
+}
+
+/**
+ * Pura: alguém está atendendo agora? Sim se a conversa está esperando o
+ * consultor, ou se a última mensagem é do CLIENTE, sem resposta, nas últimas 2 h.
+ */
+export function conversaOcupada(conversa, ultimaMensagem, agora = Date.now()) {
+  if (!conversa) return { ocupada: false };
+  if (conversa.aguardando_consultor) return { ocupada: true, motivo: 'o cliente está esperando o consultor no Atendimento' };
+  if (ultimaMensagem?.direcao === 'entrada') {
+    const idade = agora - new Date(ultimaMensagem.created_at).getTime();
+    if (idade >= 0 && idade < 2 * 3600000) return { ocupada: true, motivo: 'o cliente mandou mensagem há pouco e ainda não foi respondido' };
+  }
+  return { ocupada: false };
+}
+
+export async function ocupacaoDaConversa(telefone) {
+  const conversa = await conversaDoTelefone(telefone);
+  if (!conversa) return { ocupada: false, conversa: null };
+  const ultima = await selecionarUm(T.mensagens, `select=direcao,created_at&conversa_id=eq.${conversa.id}&order=created_at.desc&limit=1`);
+  return { ...conversaOcupada(conversa, ultima), conversa };
+}
+
+/**
+ * Depois que o carteiro envia, a mensagem aparece no histórico da conversa do
+ * Atendimento: uma linha em whatsapp_mensagens (saída, enviado, sem wamid —
+ * a sincronia do Atendimento "adota" a linha quando o aparelho a devolver).
+ * Só grava quando a conversa JÁ existe (não abre conversa nem lead novo por
+ * causa de um parabéns) e só uma vez por envio (posvenda_envios.mensagem_id).
+ * O gatilho de saída zera a espera do consultor e as não lidas: devolvemos
+ * como estavam — mensagem automática não é atendimento.
+ */
+export async function registrarNoHistorico(envio, conversa = undefined) {
+  if (!envio?.id || envio.mensagem_id) return { gravou: false, motivo: 'já registrada' };
+  const conv = conversa === undefined ? await conversaDoTelefone(envio.telefone) : conversa;
+  if (!conv) return { gravou: false, motivo: 'cliente sem conversa no Atendimento' };
+  const msg = await inserirUm(T.mensagens, {
+    conversa_id: conv.id, cliente_id: uuidOuNulo(envio.cliente_id) || conv.cliente_id || null,
+    lead_id: uuidOuNulo(envio.lead_id), agendamento_id: uuidOuNulo(envio.agendamento_id),
+    telefone: envio.telefone, nome: envio.nome || conv.nome || null,
+    corpo: envio.corpo, direcao: 'saida', status: 'enviado', gerada_por_ia: false,
+  }, 'select=id,conversa_id');
+  if (!msg) return { gravou: false, motivo: 'descartada como duplicada pelo Atendimento' };
+  const volta = {};
+  if (conv.aguardando_consultor) { volta.aguardando_consultor = true; volta.aguardando_desde = conv.aguardando_desde; }
+  if (Number(conv.nao_lidas) > 0) volta.nao_lidas = Number(conv.nao_lidas);
+  if (Object.keys(volta).length) await atualizarUm(T.conversas, `id=eq.${conv.id}`, volta).catch(() => null);
+  await atualizarUm(T.envios, `id=eq.${envio.id}`, { mensagem_id: msg.id, conversa_id: msg.conversa_id || conv.id }).catch(() => null);
+  return { gravou: true, mensagem_id: msg.id };
+}
+
+// ---- IA: configuração, chave e log ------------------------------------------
+
+let _cacheIaCfg = { valor: null, em: 0 };
+/** ia_config (cache 60 s) com os modelos de reserva. */
+export async function iaConfig() {
+  if (_cacheIaCfg.valor && Date.now() - _cacheIaCfg.em < 60_000) return _cacheIaCfg.valor;
+  const c = await selecionarUm(T.iaConfig, 'select=ativo,modelo_rapido,modelo_forte,autonomia,limite_chamadas_dia&id=is.true').catch(() => null);
+  const v = {
+    ativo: c?.ativo !== false,
+    autonomia: ['sugerir', 'confirmar', 'automatico'].includes(c?.autonomia) ? c.autonomia : 'confirmar',
+    limite: Number(c?.limite_chamadas_dia) || 500,
+    modelos: {
+      rapido: c?.modelo_rapido || 'claude-sonnet-5-5',
+      forte: c?.modelo_forte || 'claude-opus-5-5',
+      barato: 'claude-haiku-5-5',
+    },
+  };
+  _cacheIaCfg = { valor: v, em: Date.now() };
+  return v;
+}
+
+let _cacheChave = { valor: null, em: 0 };
+/** Chave da IA: ANTHROPIC_API_KEY ou, se faltar, agenda_ia_config.api_key (service role). Nunca sai do servidor. */
+export async function chaveIA() {
+  const env = (process.env.ANTHROPIC_API_KEY || '').trim();
+  if (env) return env;
+  if (_cacheChave.valor && Date.now() - _cacheChave.em < 5 * 60_000) return _cacheChave.valor;
+  const r = await selecionarUm(T.agendaIa, 'select=api_key&id=is.true').catch(() => null);
+  _cacheChave = { valor: r?.api_key || null, em: Date.now() };
+  return _cacheChave.valor;
+}
+
+export async function chamadasIAHoje() {
+  return contar(T.iaAcoes, `origem=eq.comunicar&created_at=gte.${encodeURIComponent(instanteSP(hoje(), '00:00').toISOString())}`).catch(() => 0);
+}
+
+/** Tudo o que a IA faz no Comunicar vai para ia_acoes (origem 'comunicar'). */
+export async function registrarAcaoIA(a) {
+  return inserirUm(T.iaAcoes, {
+    origem: 'comunicar', tipo: a.tipo, status: a.status || 'executada',
+    conversa_id: uuidOuNulo(a.conversa_id), cliente_id: uuidOuNulo(a.cliente_id), lead_id: uuidOuNulo(a.lead_id),
+    agendamento_id: uuidOuNulo(a.agendamento_id), perfil_id: uuidOuNulo(a.perfil_id),
+    resumo: a.resumo ? String(a.resumo).slice(0, 500) : null, entrada: a.entrada ?? null, saida: a.saida ?? null,
+    erro: a.erro ? String(a.erro).slice(0, 500) : null, modelo: a.modelo || null,
+    tokens_entrada: Number.isInteger(a.tokens_entrada) ? a.tokens_entrada : null,
+    tokens_saida: Number.isInteger(a.tokens_saida) ? a.tokens_saida : null,
+    duracao_ms: Number.isInteger(a.duracao_ms) ? a.duracao_ms : null,
+    executada_em: a.executada_em || null,
+  }, 'select=id').catch((e) => { console.error('ia_acoes:', e?.message || e); return null; });
+}
+
+/** Marca a conversa do envio como "esperando o consultor" (o Atendimento atende). */
+export async function chamarConsultor(envio) {
+  let convId = uuidOuNulo(envio.conversa_id);
+  if (!convId) convId = (await conversaDoTelefone(envio.telefone))?.id || null;
+  if (!convId) return false;
+  // não sobrescreve a hora de quem já estava esperando
+  const ja = await atualizarUm(T.conversas, `id=eq.${convId}&aguardando_consultor=is.true`, { updated_at: new Date().toISOString() });
+  const r = ja || await atualizarUm(T.conversas, `id=eq.${convId}`, {
+    aguardando_consultor: true, aguardando_desde: envio.respondido_em || new Date().toISOString(),
+  });
+  if (r && envio.conversa_id !== convId && envio.id) await atualizarUm(T.envios, `id=eq.${envio.id}`, { conversa_id: convId }).catch(() => null);
+  return !!r;
+}
+
+/** A "loja" que a leitura das respostas usa (ia.js › lerRespostas). */
+export const lojaRespostas = {
+  async pendentes(limite = 20) {
+    const p = new URLSearchParams('select=id,tipo,corpo,resposta,resposta_tipo,respondido_em,cliente_id,lead_id,agendamento_id,conversa_id,telefone,intencao');
+    p.set('respondido_em', `gte.${new Date(Date.now() - 72 * 3600000).toISOString()}`);
+    p.set('intencao', 'is.null');
+    p.set('resposta_tipo', 'neq.parar');
+    p.set('order', 'respondido_em.asc');
+    p.set('limit', String(limite));
+    return selecionar(T.envios, p);
+  },
+  gravarIntencao: (id, campos) => atualizarUm(T.envios, `id=eq.${id}`, campos),
+  chamarConsultor,
+  registrar: registrarAcaoIA,
+};
+
+/** Respostas lidas pela IA nos últimos N dias (para a tela). */
+export async function intencoesRecentes(dias = 7) {
+  const p = new URLSearchParams('select=id,tipo,nome,telefone,cliente_id,conversa_id,resposta,respondido_em,intencao,intencao_resumo,encaminhado_em');
+  p.set('intencao', 'not.is.null');
+  p.set('respondido_em', `gte.${new Date(Date.now() - dias * 86400000).toISOString()}`);
+  p.set('order', 'respondido_em.desc');
+  p.set('limit', '200');
+  const lista = await selecionar(T.envios, p);
+  const contagem = {};
+  for (const e of lista) contagem[e.intencao] = (contagem[e.intencao] || 0) + 1;
+  return { contagem, lista };
+}
+
+/** Clique "Passar ao Atendimento" (modo confirmar). */
+export async function encaminharEnvio(id, perfil = null) {
+  if (!ehUuid(id)) return null;
+  const e = await selecionarUm(T.envios, `select=*&id=eq.${id}`);
+  if (!e) return null;
+  const ok = await chamarConsultor(e);
+  if (!ok) return { ok: false, erro: 'Esse cliente ainda não tem conversa no Atendimento.' };
+  await atualizarUm(T.envios, `id=eq.${id}`, { encaminhado_em: new Date().toISOString() });
+  await registrarAcaoIA({
+    tipo: 'chamar_consultor', status: 'executada', cliente_id: e.cliente_id, conversa_id: e.conversa_id, perfil_id: perfil?.id,
+    resumo: `Passou ao consultor (${e.intencao || 'resposta'}) com um clique${perfil?.nome ? ` de ${perfil.nome}` : ''}`,
+    entrada: { envio_id: id }, executada_em: new Date().toISOString(),
+  });
+  return { ok: true };
+}
+
+/** Resumo da IA guardado em cache (6 h) na configuração. */
+export async function salvarResumoIA(texto) {
+  return atualizarUm(T.config, LINHA_UNICA, { ia_resumo: texto, ia_resumo_em: new Date().toISOString() });
+}
+
+/** Números compactos da semana para a IA (sem nome de cliente). */
+export async function numerosDaSemana() {
+  const r = await resumo();
+  const { contagem } = await intencoesRecentes(7).catch(() => ({ contagem: {} }));
+  const sd = await saude().catch(() => null);
+  const porRegua = Object.fromEntries(Object.entries(r.porRegua).map(([k, v]) => [k, {
+    ligada: v.ligada, enviadas_30d: v.enviadas, responderam: v.respondidas, positivas: v.positivas,
+    negativas: v.negativas, pediram_parar: v.pararam, agendaram: v.agendaram,
+  }]));
+  return {
+    hoje: hoje(), na_fila: r.pendentes, atrasadas: r.vencidos, falhas_30d: r.falhas, ultimo_erro: r.ultimoErro,
+    semana: r.semana, mes30: r.mes30, por_regua: porRegua, intencoes_7d: contagem,
+    satisfacao: r.satisfacao, fora_da_lista: r.foraDaLista, horarios_48h: r.proximos48h,
+    aniversariantes_mes: r.aniversariantesDoMes.length, clientes_com_aniversario: r.comNascimento,
+    pausa_geral: r.pausaGeral, reguas_ligadas: r.reguasLigadas,
+    whatsapp_parado: !!sd?.whatsappParado, problema_do_sistema: sd?.problema || null,
+  };
+}
+
+/** Pura: agrupa envios em semanas (segunda a domingo) para o gráfico do relatório. */
+export function semanasDoRelatorio(envios, semanas = 8, hojeIso = hoje()) {
+  const dow = new Date(hojeIso + 'T12:00:00').getDay();
+  const segunda = somarDias(hojeIso, -((dow + 6) % 7));
+  const lista = [];
+  for (let i = semanas - 1; i >= 0; i--) {
+    const ini = somarDias(segunda, -7 * i);
+    lista.push({ inicio: ini, fim: somarDias(ini, 6), enviadas: 0, respondidas: 0, positivas: 0, negativas: 0, agendaram: 0 });
+  }
+  for (const e of envios) {
+    if (e.status !== 'enviado' || !e.enviado_em) continue;
+    const d = agoraSP(new Date(e.enviado_em)).data;
+    const s = lista.find((x) => d >= x.inicio && d <= x.fim);
+    if (!s) continue;
+    s.enviadas++;
+    if (e.respondido_em) s.respondidas++;
+    if (e.resposta_tipo === 'positiva') s.positivas++;
+    if (e.resposta_tipo === 'negativa') s.negativas++;
+    if (e.agendou_depois_id) s.agendaram++;
+  }
+  return lista;
+}
+
+/** Relatório de uma régua (ou de todas): 8 semanas, taxas e intenções. */
+export async function relatorioRegua(tipo = null, semanas = 8) {
+  const desde = instanteSP(somarDias(hoje(), -7 * semanas - 7), '00:00').toISOString();
+  const p = new URLSearchParams('select=tipo,status,enviado_em,respondido_em,resposta_tipo,agendou_depois_id,intencao');
+  p.set('status', 'eq.enviado');
+  p.set('enviado_em', `gte.${desde}`);
+  if (tipo && tipo !== 'todas') p.set('tipo', `eq.${tipo}`);
+  const envios = await selecionarTudo(T.envios, p);
+  return montarRelatorio(envios, tipo, semanas);
+}
+
+/** Pura: relatório a partir dos envios (o mock usa a mesma). */
+export function montarRelatorio(envios, tipo = null, semanas = 8, hojeIso = hoje()) {
+  const linhas = semanasDoRelatorio(envios, semanas, hojeIso);
+  const tot = linhas.reduce((a, s) => ({ enviadas: a.enviadas + s.enviadas, respondidas: a.respondidas + s.respondidas, agendaram: a.agendaram + s.agendaram }), { enviadas: 0, respondidas: 0, agendaram: 0 });
+  const intencoes = {};
+  for (const e of envios) if (e.intencao) intencoes[e.intencao] = (intencoes[e.intencao] || 0) + 1;
+  return {
+    tipo: tipo || 'todas', semanas: linhas, total: tot, intencoes,
+    taxaResposta: tot.enviadas ? Math.round((tot.respondidas / tot.enviadas) * 100) : null,
+    taxaAgendamento: tot.enviadas ? Math.round((tot.agendaram / tot.enviadas) * 100) : null,
+  };
+}
+
+/** Pura: CSV (separador ; e BOM, abre direto no Excel em pt-BR). Fórmulas neutralizadas. */
+export function paraCSV(linhas, colunas) {
+  const cel = (v) => {
+    let s = v === null || v === undefined ? '' : String(v);
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+    return /[;"\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const cab = colunas.map((c) => cel(c.rotulo)).join(';');
+  const corpo = linhas.map((l) => colunas.map((c) => cel(typeof c.valor === 'function' ? c.valor(l) : l[c.campo])).join(';'));
+  return '﻿' + [cab, ...corpo].join('\r\n');
+}
+
+const dataHoraSP = (ts) => {
+  if (!ts) return '';
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '';
+  const a = agoraSP(d);
+  return `${a.data.split('-').reverse().join('/')} ${String(a.hora).padStart(2, '0')}:${String(a.minuto).padStart(2, '0')}`;
+};
+export const COLUNAS_CSV_ENVIOS = [
+  { rotulo: 'Programada para', valor: (e) => dataHoraSP(e.enviar_em) },
+  { rotulo: 'Enviada em', valor: (e) => dataHoraSP(e.enviado_em) },
+  { rotulo: 'Tipo', valor: (e) => ROTULO_TIPO[e.tipo] || e.tipo },
+  { rotulo: 'Status', campo: 'status' },
+  { rotulo: 'Cliente', campo: 'nome' },
+  { rotulo: 'Telefone', campo: 'telefone' },
+  { rotulo: 'Mensagem', campo: 'corpo' },
+  { rotulo: 'Resposta', campo: 'resposta' },
+  { rotulo: 'Tom da resposta', campo: 'resposta_tipo' },
+  { rotulo: 'Intenção (IA)', campo: 'intencao' },
+  { rotulo: 'Agendou depois', valor: (e) => (e.agendou_depois_id ? 'sim' : '') },
+  { rotulo: 'Tentativas', campo: 'tentativas' },
+  { rotulo: 'Erro', campo: 'erro' },
+  { rotulo: 'Criada por', campo: 'criado_por' },
+];
+
+/**
+ * Aniversários na base compartilhada (a mesma do CRM e do Atendimento):
+ * quantos têm data, os próximos 30 dias e quem foi atendido recentemente sem data.
+ */
+export async function aniversariosDaBase() {
+  const h = hoje();
+  const [comData, total, recentes] = await Promise.all([
+    selecionarTudo(T.clientes, 'select=id,nome,telefone,nascimento,aceita_mensagens&nascimento=not.is.null'),
+    contar(T.clientes, 'telefone=not.is.null'),
+    selecionar(T.agendamentos, 'select=cliente_id,data&status=eq.concluido&cliente_id=not.is.null&order=data.desc&limit=300'),
+  ]);
+  return montarAniversarios(comData, total, recentes, h, clientesPorIds);
+}
+
+/** Meio-pura (a busca dos sem-data é injetada): o mock usa a mesma. */
+export async function montarAniversarios(comData, total, recentes, h, buscarClientes) {
+  const proximos = [];
+  for (const c of comData) {
+    const mmdd = String(c.nascimento).slice(5, 10);
+    for (let i = 0; i <= 30; i++) {
+      const d = somarDias(h, i);
+      if (d.slice(5) === mmdd) { proximos.push({ id: c.id, nome: c.nome, telefone: c.telefone, data: d, em_dias: i, aceita: c.aceita_mensagens !== false }); break; }
+    }
+  }
+  proximos.sort((a, b) => a.em_dias - b.em_dias);
+  const comDataIds = new Set(comData.map((c) => c.id));
+  const semDataIds = [...new Set(recentes.map((a) => a.cliente_id).filter((id) => id && !comDataIds.has(id)))].slice(0, 12);
+  const semData = semDataIds.length ? await buscarClientes(semDataIds) : [];
+  return { total, comData: comData.length, proximos: proximos.slice(0, 40), semDataRecentes: semData.slice(0, 12) };
 }

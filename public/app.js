@@ -81,11 +81,13 @@ const STATUS_AG = { aguardando:['Aguardando', 'bp-orange'], confirmado:['Confirm
   cancelado:['Cancelado', 'bp-gray'] };
 const pillAg = (s) => { const [r, c] = STATUS_AG[s] || [s, 'bp-gray']; return `<span class="badge-pill ${c}">${esc(r)}</span>`; };
 const ATENDIMENTO_URL = 'https://indycar-atendimento.onrender.com';
+const CRM_URL = 'https://indycar-crm.onrender.com';
+const AGENDA_URL = 'https://indycar-agendamentos.onrender.com';
 
 /* Ecossistema IndyCar — os apps da oficina; este (Comunicar) vem marcado. */
 const ECOSSISTEMA = [
-  { chave:'agenda',      nome:'Agenda',      desc:'horários e presença',   url:'https://indycar-agendamentos.onrender.com', ico:I.calendar },
-  { chave:'crm',         nome:'CRM',         desc:'leads e funil',         url:'https://indycar-crm.onrender.com',          ico:I.flag },
+  { chave:'agenda',      nome:'Agenda',      desc:'horários e presença',   url:AGENDA_URL,                                  ico:I.calendar },
+  { chave:'crm',         nome:'CRM',         desc:'leads e funil',         url:CRM_URL,                                     ico:I.flag },
   { chave:'atendimento', nome:'Atendimento', desc:'conversas do WhatsApp', url:ATENDIMENTO_URL,                             ico:I.wa },
   { chave:'comunicar',   nome:'Comunicar',   desc:'lembretes e réguas',    url:'https://indycar-posvenda.onrender.com',     ico:I.send },
   { chave:'orcador',     nome:'Orçador',     desc:'orçamentos com IA',     url:'https://indycar-orcador.netlify.app',       ico:I.money },
@@ -98,7 +100,7 @@ const EXEMPLO = { nome:'Maria Aparecida Souza', carro:'HB20 2019', placa:'FHR6F1
 
 // ---- estado -----------------------------------------------------------------
 const state = { route:'inicio', perfil:null, cfg:null, cfgEdit:{}, regras:null, modelos:null, segmentos:null,
-  msg:{ status:'todas', tipo:'todos', q:'' }, cliQ:'', saude:null };
+  msg:{ status:'todas', tipo:'todos', q:'', de:'', ate:'', intencao:'todas' }, cliQ:'', saude:null };
 
 // ---- API --------------------------------------------------------------------
 let sb = null, CONFIG = null;
@@ -333,9 +335,16 @@ async function renderInicio() {
       ${statCard('wa', s.pct === null || s.pct === undefined ? '—' : s.pct, 'Satisfação', I.smile, { sufixo:'%', sub: s.notaMedia ? `nota média ${String(s.notaMedia).replace('.', ',')} · ${s.total} respostas` : `${s.total || 0} respostas` })}
     </div>
 
+    <div class="cols ia-cols" id="iaLinha">
+      <div class="panel ia-panel-resumo"><div class="panel-head"><h2><span class="ia-selo">✨ IA</span> Resumo da semana</h2><span class="panel-sub">cache de 6 h</span></div>
+        <div class="panel-body" id="iaResumo"><div class="skel" style="height:72px"></div></div></div>
+      <div class="panel"><div class="panel-head"><h2><span class="ia-selo">✨ IA</span> Quem respondeu</h2><span class="panel-sub">7 dias</span></div>
+        <div class="panel-body" id="iaIntencoes"><div class="skel" style="height:72px"></div></div></div>
+    </div>
+
     <div class="cols larga">
       <div class="panel">
-        <div class="panel-head"><h2>${svg(I.regua)} Por régua</h2><span class="panel-sub">últimos 30 dias</span></div>
+        <div class="panel-head"><h2>${svg(I.regua)} Por régua</h2><span class="panel-sub">últimos 30 dias</span><button type="button" class="btn btn-mini" id="btnRelatorio">📊 Relatório</button></div>
         <div class="pr"><div class="pr-h"><span>Régua</span><span><i class="l">Enviadas</i><i class="c">Env.</i></span><span><i class="l">Responderam</i><i class="c">Resp.</i></span><span><i class="l">Agendaram</i><i class="c">Agend.</i></span></div>
           ${linhasRegua}</div>
       </div>
@@ -362,6 +371,8 @@ async function renderInicio() {
     </div>`;
 
   animarNumeros(view);
+  carregarLinhaIA();
+  $('#btnRelatorio')?.addEventListener('click', () => abrirRelatorio('todas'));
   waPromise.then(wa => { const el = $('#waItem'); if (el) el.innerHTML = htmlWhatsapp(wa); });
   $('#btnRodar').addEventListener('click', rodarAgora);
   $('#btnPrevia').addEventListener('click', () => abrirPrevia());
@@ -440,12 +451,16 @@ async function renderReguas() {
           <div class="regua-nota">${svg(I.alerta)}<span>Dispara sozinha, uns minutos depois de o cliente responder bem ao pós-venda. Sem o link, não sai.</span></div>` : ''}
         <div class="field"><label for="msg_${tipo}">Mensagem</label>
           <textarea id="msg_${tipo}" data-cfg="msg_${tipo}" maxlength="1000" ${gestor ? '' : 'disabled'}>${esc(v(`msg_${tipo}`))}</textarea>
-          <div class="var-chips" aria-label="Variáveis: clique para inserir">${vars.map(x => `<button type="button" class="var-chip${(t.vars || []).includes(x) ? ' esp' : ''}" data-var="${x}" data-alvo="msg_${tipo}" ${gestor ? '' : 'disabled'}>{${x}}</button>`).join('')}</div></div>
-        <div class="previa"><small>Prévia · como a ${esc(EXEMPLO.nome.split(' ')[0])} veria</small><div class="bolha" data-previa="${tipo}"></div></div>
+          <div class="var-chips" aria-label="Variáveis: clique para inserir">${vars.map(x => `<button type="button" class="var-chip${(t.vars || []).includes(x) ? ' esp' : ''}" data-var="${x}" data-alvo="msg_${tipo}" ${gestor ? '' : 'disabled'}>{${x}}</button>`).join('')}
+            <button type="button" class="var-chip ia-chip" data-ia="${tipo}" ${gestor ? '' : 'disabled'} title="Gera 3 opções no tom da casa">✨ Escrever com IA</button></div>
+          <div class="ia-box" data-ia-box="${tipo}" hidden></div></div>
+        <div class="previa"><small>Prévia · como a ${esc(EXEMPLO.nome.split(' ')[0])} vê no celular</small>${celularWA(`<div class="bolha wa-rec" data-previa="${tipo}"></div>`)}</div>
         ${tipo === 'retorno' ? `<div class="regras" id="regrasBox">${htmlRegras(regras, gestor)}</div>` : ''}
         <div class="regua-acoes">
           ${tipo !== 'avaliacao' ? `<button type="button" class="btn" data-quem="${tipo}">${svg(I.olho)} Quem receberia hoje</button>` : ''}
           <button type="button" class="btn wa" data-teste="${tipo}" ${gestor ? '' : 'disabled'}>${svg(I.wa)} Mandar teste para mim</button>
+          <button type="button" class="btn" data-relatorio="${tipo}">📊 Relatório</button>
+          ${tipo === 'aniversario' ? `<button type="button" class="btn" id="btnAnivBase">${svg(I.gift)} Puxar do CRM</button>` : ''}
         </div>
       </div>
     </article>`;
@@ -469,6 +484,9 @@ async function renderReguas() {
           <div class="field curto"><label for="cfg_int">Intervalo mínimo</label>
             <input id="cfg_int" type="number" inputmode="numeric" min="0" max="60" value="${esc(v('intervalo_minimo_dias'))}" data-cfg="intervalo_minimo_dias" ${gestor ? '' : 'disabled'}>
             <small>dias entre duas mensagens de relacionamento para o mesmo cliente</small></div>
+          <div class="field curto"><label for="cfg_lim">Limite por hora</label>
+            <input id="cfg_lim" type="number" inputmode="numeric" min="1" max="500" value="${esc(v('limite_por_hora') ?? 60)}" data-cfg="limite_por_hora" ${gestor ? '' : 'disabled'}>
+            <small>mensagens no máximo — sem cara de disparo</small></div>
           <div class="field"><label for="cfg_tel">Telefone de teste</label><input id="cfg_tel" type="tel" inputmode="tel" placeholder="(12) 99999-9999" value="${esc(telBR(v('telefone_teste')) === '—' ? '' : telBR(v('telefone_teste')))}" data-cfg="telefone_teste" ${gestor ? '' : 'disabled'}></div>
           <div class="field curto"><span class="rot">Domingo</span>
             <label class="sw" style="padding:9px 0"><input type="checkbox" data-cfg="envia_domingo" ${v('envia_domingo') ? 'checked' : ''} ${gestor ? '' : 'disabled'}><span class="tr"></span><span class="sw-txt">${v('envia_domingo') ? 'Envia' : 'Não envia'}</span></label></div>
@@ -494,6 +512,13 @@ async function renderReguas() {
   $('#btnSalvar').addEventListener('click', salvarConfig);
   $('#btnSalvarTopo').addEventListener('click', salvarConfig);
   $('#btnDescartar').addEventListener('click', () => route('reguas'));
+  $$('[data-ia]', view).forEach(b => b.addEventListener('click', () => {
+    const tipo = b.dataset.ia, ta = $(`#msg_${tipo}`);
+    painelEscreverIA($(`[data-ia-box="${tipo}"]`, view), { regua: tipo, lerTexto: () => ta.value,
+      aplicar: (t) => { ta.value = t; ta.dispatchEvent(new Event('input', { bubbles:true })); ta.focus(); } });
+  }));
+  $$('[data-relatorio]', view).forEach(b => b.addEventListener('click', () => abrirRelatorio(b.dataset.relatorio)));
+  $('#btnAnivBase')?.addEventListener('click', abrirAniversariosBase);
 }
 
 /* Lê o valor de um campo de configuração do jeito que o servidor espera. */
@@ -540,10 +565,7 @@ function atualizarPrevia(tipo) {
   const corpo = $(`#msg_${tipo}`)?.value || '';
   const cfg = { ...state.cfg, ...state.cfgEdit };
   const ctx = { ...EXEMPLO, meses: cfg.meses_retorno, link_avaliacao: cfg.link_avaliacao || 'https://g.page/r/indycar' };
-  const txt = renderTemplate(corpo, ctx);
-  el.classList.toggle('vazia', !txt);
-  el.textContent = txt || 'Escreva a mensagem acima para ver a prévia.';
-  if (txt) { const h = document.createElement('span'); h.className = 'hora'; h.textContent = (state.cfgEdit.hora_envio || state.cfg.hora_envio || '09:30').slice(0, 5) + ' ✓✓'; el.append(h); }
+  pintarBolha(el, renderTemplate(corpo, ctx), state.cfgEdit.hora_envio || state.cfg.hora_envio || '09:30', 'Escreva a mensagem acima para ver a prévia.');
 }
 function atualizarBarra() {
   const n = Object.keys(state.cfgEdit).length;
@@ -667,10 +689,14 @@ async function renderMensagens({ quieto } = {}) {
   if (f.status !== 'todas') q.set('status', f.status);
   if (f.tipo !== 'todos') q.set('tipo', f.tipo);
   if (f.q) q.set('q', f.q);
+  if (f.de) q.set('de', f.de);
+  if (f.ate) q.set('ate', f.ate);
+  if (f.intencao !== 'todas') q.set('intencao', f.intencao);
+  state._qMsg = new URLSearchParams(q);
   const lista = await api('GET', '/envios' + (q.toString() ? `?${q}` : ''));
   const htmlLista = () => lista.length ? lista.map(cartaoEnvio).join('')
-    : vazio(I.wa, f.q || f.status !== 'todas' || f.tipo !== 'todos' ? 'Nada com esse filtro' : 'Nenhuma mensagem ainda',
-        f.q || f.status !== 'todas' || f.tipo !== 'todos' ? 'Tente outro status, tipo ou busca.' : 'As automáticas aparecem sozinhas quando você ligar as réguas; campanhas e avulsas também caem aqui.');
+    : vazio(I.wa, f.q || f.de || f.ate || f.intencao !== 'todas' || f.status !== 'todas' || f.tipo !== 'todos' ? 'Nada com esse filtro' : 'Nenhuma mensagem ainda',
+        f.q || f.de || f.ate || f.intencao !== 'todas' || f.status !== 'todas' || f.tipo !== 'todos' ? 'Tente outro status, tipo, período ou busca.' : 'As automáticas aparecem sozinhas quando você ligar as réguas; campanhas e avulsas também caem aqui.');
 
   /* Atualização quieta (filtro, busca, cancelar…): só a lista e os contadores
      mudam — o campo de busca continua com o foco e o cursor de quem digita. */
@@ -691,6 +717,15 @@ async function renderMensagens({ quieto } = {}) {
         <select id="tipoMsg" class="inp" style="width:auto" aria-label="Filtrar por tipo">${tipos.map(t => `<option value="${t}" ${f.tipo === t ? 'selected' : ''}>${t === 'todos' ? 'Todos os tipos' : `${TIPO[t]?.emoji || ''} ${TIPO[t]?.rotulo || t}`}</option>`).join('')}</select>
       </div>
     </div>
+    <div class="filtros-linha">
+      <label class="periodo"><span>De</span><input type="date" id="deMsg" class="inp" value="${esc(f.de)}" aria-label="Desde o dia"></label>
+      <label class="periodo"><span>até</span><input type="date" id="ateMsg" class="inp" value="${esc(f.ate)}" aria-label="Até o dia"></label>
+      <button type="button" class="btn btn-mini ghost" id="limparPeriodo" ${f.de || f.ate ? '' : 'hidden'}>${svg(I.x)} limpar período</button>
+      <select id="intMsg" class="inp" style="width:auto" aria-label="Filtrar pela intenção lida pela IA">
+        <option value="todas">✨ Qualquer resposta</option><option value="qualquer" ${f.intencao === 'qualquer' ? 'selected' : ''}>✨ Lidas pela IA</option>
+        ${Object.entries(INTENCAO).map(([k, x]) => `<option value="${k}" ${f.intencao === k ? 'selected' : ''}>${x[0]} ${esc(x[1])}</option>`).join('')}</select>
+      <button type="button" class="btn btn-mini" id="btnCSV" style="margin-left:auto">${svg(I.upload)} Exportar CSV</button>
+    </div>
     <div class="pilulas" role="tablist">
       ${pilula('todas', 'Todas')}${pilula('pendente', '🕒 Na fila')}${pilula('enviado', '✅ Enviadas')}${pilula('falhou', '❌ Falharam')}${pilula('cancelado', 'Canceladas')}${pilula('pulado', '⏭ Puladas')}
     </div>
@@ -699,6 +734,19 @@ async function renderMensagens({ quieto } = {}) {
   $$('.pilula', view).forEach(b => b.addEventListener('click', () => { state.msg.status = b.dataset.filtro; route(null, { quieto:true }); }));
   $('#tipoMsg').addEventListener('change', e => { state.msg.tipo = e.target.value; route(null, { quieto:true }); });
   $('#qMsg').addEventListener('input', debounce(e => { state.msg.q = e.target.value.trim(); route(null, { quieto:true }); }, 300));
+  const mudarPeriodo = () => {
+    state.msg.de = $('#deMsg').value; state.msg.ate = $('#ateMsg').value;
+    if (state.msg.de && state.msg.ate && state.msg.de > state.msg.ate) { toast('O "de" precisa vir antes do "até".', 'err'); return; }
+    $('#limparPeriodo').hidden = !(state.msg.de || state.msg.ate); route(null, { quieto:true });
+  };
+  $('#deMsg').addEventListener('change', mudarPeriodo); $('#ateMsg').addEventListener('change', mudarPeriodo);
+  $('#limparPeriodo').addEventListener('click', () => { $('#deMsg').value = ''; $('#ateMsg').value = ''; mudarPeriodo(); });
+  $('#intMsg').addEventListener('change', e => { state.msg.intencao = e.target.value; route(null, { quieto:true }); });
+  $('#btnCSV').addEventListener('click', async (e) => {
+    const b = e.currentTarget; b.disabled = true;
+    try { await baixarCSV(state._qMsg || new URLSearchParams()); toast('CSV baixado — abre direto no Excel.'); }
+    catch (err) { toast(err.message, 'err'); } finally { b.disabled = false; }
+  });
   ligarAcoesEnvio($('#listaEnvios'));
 }
 
@@ -715,7 +763,7 @@ function cartaoEnvio(e) {
       <div class="envio-quem"><span class="linha" style="gap:8px"><span class="tipo-ico" aria-hidden="true">${t.emoji}</span>
         ${e.cliente_id ? `<button type="button" class="cli-nome" data-ficha="${esc(e.cliente_id)}"><b>${esc(e.nome || e.telefone)}</b></button>` : `<b>${esc(e.nome || e.telefone)}</b>`}</span>
         <small>${esc(telBR(e.telefone))}${e.criado_por && e.criado_por !== 'gerador' && e.criado_por !== 'gatilho' ? ` · por ${esc(e.criado_por)}` : ''}</small></div>
-      <div class="envio-chips">${pillTipo(e.tipo)}${pillStatus(e.status)}${e.agendou_depois_id ? `<span class="selo-agendou">${svg(I.calendar)} agendou depois</span>` : ''}</div>
+      <div class="envio-chips">${pillTipo(e.tipo)}${pillStatus(e.status)}${e.intencao ? pillIntencao(e.intencao, e.intencao_resumo) : ''}${e.agendou_depois_id ? `<span class="selo-agendou">${svg(I.calendar)} agendou depois</span>` : ''}${e.mensagem_id ? '<span class="selo-hist" title="Aparece no histórico da conversa do Atendimento">💬 no histórico</span>' : ''}</div>
     </div>
     <div class="envio-corpo">${esc(e.corpo)}</div>
     ${resposta}
@@ -727,7 +775,8 @@ function cartaoEnvio(e) {
       <div class="envio-acoes">
         ${podeCancelar ? `<button type="button" class="btn btn-mini" data-cancelar="${esc(e.id)}">${svg(I.x)} Cancelar</button>` : ''}
         ${podeReenviar ? `<button type="button" class="btn btn-mini" data-reenviar="${esc(e.id)}">${svg(I.refresh)} Reenviar</button>` : ''}
-        ${e.status === 'enviado' || e.resposta ? `<a class="btn btn-mini ghost" href="${ATENDIMENTO_URL}" target="_blank" rel="noopener">${svg(I.externo)} Abrir conversa</a>` : ''}
+        ${e.intencao && CHAMA_CONSULTOR.has(e.intencao) ? (e.encaminhado_em ? '<span class="badge-pill bp-green">✓ no Atendimento</span>' : `<button type="button" class="btn btn-mini primary" data-encaminhar="${esc(e.id)}">${svg(I.wa)} Passar ao Atendimento</button>`) : ''}
+        ${e.status === 'enviado' || e.resposta ? `<a class="btn btn-mini ghost" href="${esc(linkConversa(e.telefone))}" target="_blank" rel="noopener">${svg(I.externo)} Abrir conversa</a>` : ''}
       </div>
     </div>
   </article>`;
@@ -737,10 +786,17 @@ function ligarAcoesEnvio(root) {
   root.addEventListener('click', async (e) => {
     const c = e.target.closest('[data-cancelar]'), r = e.target.closest('[data-reenviar]'), f = e.target.closest('[data-ficha]');
     if (f) return abrirFicha(f.dataset.ficha);
+    const enc = e.target.closest('[data-encaminhar]'); if (enc) return encaminhar(enc.dataset.encaminhar, enc);
     if (c) {
       if (!confirm('Cancelar esta mensagem? Ela não será enviada.')) return;
       c.disabled = true;
-      try { await api('POST', `/envios/${c.dataset.cancelar}/cancelar`); toast('Mensagem cancelada.'); route(null, { quieto:true }); }
+      try {
+        const id = c.dataset.cancelar;
+        await api('POST', `/envios/${id}/cancelar`); route(null, { quieto:true });
+        toastAcao('Mensagem cancelada.', 'Desfazer', async () => {
+          await api('POST', `/envios/${id}/desfazer-cancelamento`); toast('Voltou para a fila.'); refreshBadge(); route(null, { quieto:true });
+        });
+      }
       catch (err) { toast(err.message, 'err'); c.disabled = false; }
     }
     if (r) {
@@ -806,7 +862,7 @@ async function carregarModelos() { if (!state.modelos) state.modelos = await api
 /* Modal "Nova campanha" em 3 passos: para quem → mensagem → quando. */
 window.openCampanhaModal = async function (pre = {}) {
   const c = { passo:1, alvo: pre.cliente ? 'cliente' : 'segmento', filtro:'todos', valor:'', cliente: pre.cliente || null,
-    previa:null, corpo:'', quando:'agora', enviar_em:'' };
+    previa:null, corpo:'', quando:'agora', enviar_em:'', sugestao:null };
   const [segmentos, modelos] = await Promise.all([carregarSegmentos(), carregarModelos()]);
 
   openModal(`<div class="modal-head"><h3>${svg(I.megafone)} Nova campanha</h3><button type="button" class="modal-close" aria-label="Fechar">×</button></div>
@@ -844,6 +900,8 @@ window.openCampanhaModal = async function (pre = {}) {
         <button type="button" class="alvo-op ${c.alvo === 'cliente' ? 'ativo' : ''}" data-alvo="cliente"><b>${svg(I.send)} Um cliente específico</b><small>mensagem avulsa</small></button>
       </div>
       <div id="alvoSeg" ${c.alvo === 'segmento' ? '' : 'hidden'}>
+        <div class="ia-sugere"><button type="button" class="btn ia" id="campIA">✨ IA, quem devo chamar?</button><small class="muted">olha os números e sugere segmento + mensagem; você confirma</small></div>
+        <div id="campIASug">${c.sugestao ? htmlSugestao(c.sugestao) : ''}</div>
         <div class="campos-linha">
           <div class="field"><label for="campSeg">Segmento</label><select id="campSeg">${segmentos.map(s => `<option value="${esc(s.id)}" ${s.id === c.filtro ? 'selected' : ''}>${esc(s.rotulo)}</option>`).join('')}</select></div>
           <div class="field curto" id="campValorBox" ${seg?.valor !== undefined ? '' : 'hidden'}><label for="campValor">${esc(seg?.unidade === 'texto' ? 'Palavra' : seg?.unidade || 'Valor')}</label>
@@ -858,6 +916,21 @@ window.openCampanhaModal = async function (pre = {}) {
       </div>`;
     $$('.alvo-op', body).forEach(b => b.addEventListener('click', () => { c.alvo = b.dataset.alvo; passo1(); }));
     if (c.alvo === 'segmento') {
+      $('#campIA').addEventListener('click', async (ev) => {
+        const b = ev.currentTarget; b.disabled = true;
+        $('#campIASug').innerHTML = '<div class="ia-pensando"><span class="ia-pontos"><i></i><i></i><i></i></span> olhando os números da oficina…</div>';
+        try { c.sugestao = await api('POST', '/ia/publico'); $('#campIASug').innerHTML = htmlSugestao(c.sugestao); ligarSugestao(); }
+        catch (err) { $('#campIASug').innerHTML = `<p class="form-msg erro">${esc(err.message)}</p>`; }
+        finally { b.disabled = false; }
+      });
+      const ligarSugestao = () => {
+        if (c.sugestao) pintarBolha($('#campIASug [data-sug-bolha]'), renderTemplate(c.sugestao.mensagem, { nome: c.sugestao.previa?.amostra?.[0]?.nome || EXEMPLO.nome, carro: c.sugestao.previa?.amostra?.[0]?.carro || EXEMPLO.carro }));
+        $('#usarSug')?.addEventListener('click', () => {
+          c.filtro = c.sugestao.segmento; c.valor = c.sugestao.valor ?? ''; c.corpo = c.sugestao.mensagem || c.corpo; c.sugestao.usada = true;
+          toast('Sugestão aplicada: segmento escolhido e mensagem pronta no passo 2.'); passo1();
+        });
+      };
+      ligarSugestao();
       $('#campSeg').addEventListener('change', e => { c.filtro = e.target.value; c.valor = ''; passo1(); });
       $('#campValor')?.addEventListener('input', e => { c.valor = e.target.value; atualizarSegPrevia(); });
       atualizarSegPrevia();
@@ -890,18 +963,23 @@ window.openCampanhaModal = async function (pre = {}) {
           ${cats.map(cat => `<optgroup label="${esc(cat)}">${modelos.filter(m => (m.categoria || 'geral') === cat).map(m => `<option value="${esc(m.id)}">${esc(m.titulo)}</option>`).join('')}</optgroup>`).join('')}</select></div>
       <div class="field"><label for="campCorpo">Mensagem</label>
         <textarea id="campCorpo" maxlength="2000" style="min-height:120px" placeholder="Oi {primeiro_nome}! …">${esc(c.corpo)}</textarea>
-        <div class="var-chips">${['nome', 'primeiro_nome', 'carro', 'placa', 'detalhe'].map(v => `<button type="button" class="var-chip" data-var="${v}">{${v}}</button>`).join('')}</div>
+        <div class="var-chips">${['nome', 'primeiro_nome', 'carro', 'placa', 'detalhe'].map(v => `<button type="button" class="var-chip" data-var="${v}">{${v}}</button>`).join('')}
+          <button type="button" class="var-chip ia-chip" id="campIAEscrever">✨ Escrever com IA</button></div>
+        <div class="ia-box" id="campIABox" hidden></div>
         <div class="contador" id="campCont">0 / 2000</div></div>
-      <div class="previa"><small>Prévia · ${esc(clienteDaPrevia()?.nome?.split(' ')[0] || EXEMPLO.nome.split(' ')[0])} veria assim</small><div class="bolha" id="campBolha"></div></div>`;
+      <div class="previa"><small>Prévia · como ${esc(clienteDaPrevia()?.nome?.split(' ')[0] || EXEMPLO.nome.split(' ')[0])} vê no celular</small>${celularWA('<div class="bolha wa-rec" id="campBolha"></div>')}</div>`;
     const ta = $('#campCorpo'), bolha = $('#campBolha'), cont = $('#campCont');
     const pintar = () => {
       c.corpo = ta.value;
       const cli = clienteDaPrevia() || EXEMPLO;
       const txt = renderTemplate(c.corpo, { nome: cli.nome, carro: cli.carro, placa: cli.placa, detalhe:'…' });
-      bolha.classList.toggle('vazia', !txt); bolha.textContent = txt || 'Escreva para ver a prévia.';
+      pintarBolha(bolha, txt, horaBR(new Date()), 'Escreva para ver a prévia.');
       cont.textContent = `${c.corpo.length} / 2000`; cont.classList.toggle('alto', c.corpo.length > 700);
     };
     ta.addEventListener('input', pintar); pintar();
+    $('#campIAEscrever').addEventListener('click', () => painelEscreverIA($('#campIABox'), { regua:'campanha', lerTexto: () => ta.value,
+      aplicar: (t) => { ta.value = t; pintar(); ta.focus(); },
+      exemplo: () => { const x = clienteDaPrevia(); return x ? { nome: x.nome, carro: x.carro, placa: x.placa } : null; } }));
     $('#campModelo').addEventListener('change', e => { const m = modelos.find(x => x.id === e.target.value); if (m) { ta.value = m.corpo; pintar(); ta.focus(); } });
     $$('.var-chip', body).forEach(ch => ch.addEventListener('click', () => {
       const ini = ta.selectionStart ?? ta.value.length, fim = ta.selectionEnd ?? ini, tok = `{${ch.dataset.var}}`;
@@ -1085,7 +1163,10 @@ async function abrirFicha(id, quieto = false) {
       <div class="quem"><span class="av">${esc(iniciais(c.nome) || 'IC')}</span>
         <div><h3 id="gavetaTitulo">${esc(c.nome)}</h3>
           <p><span>${esc(telBR(c.telefone))}</span>${c.carro ? `<span>· ${esc(c.carro)}${c.placa ? ` ${esc(c.placa)}` : ''}</span>` : ''}
-             ${c.nascimento ? `<span>· 🎂 ${esc(nascBR(c.nascimento))}</span>` : ''}</p></div></div>
+             ${c.nascimento ? `<span>· 🎂 ${esc(nascBR(c.nascimento))}</span>` : ''}</p>
+          <div class="eco-links">${c.telefone ? `<a href="${esc(linkConversa(c.telefone))}" target="_blank" rel="noopener">${svg(I.wa)} Conversa</a>` : ''}
+            <a href="${esc(`${CRM_URL}/?cliente=${encodeURIComponent(c.id)}${c.telefone ? `&tel=${encodeURIComponent(soDigitos(c.telefone))}` : ''}`)}" target="_blank" rel="noopener">${svg(I.flag)} CRM</a>
+            <a href="${esc(`${AGENDA_URL}/?cliente=${encodeURIComponent(c.id)}${c.telefone ? `&tel=${encodeURIComponent(soDigitos(c.telefone))}` : ''}`)}" target="_blank" rel="noopener">${svg(I.calendar)} Agenda</a></div></div></div>
       <button type="button" class="modal-close" data-fechar-gaveta aria-label="Fechar ficha">×</button>
     </div>
     <div class="gaveta-body">
@@ -1333,6 +1414,7 @@ document.addEventListener('keydown', e => {
   if (e.ctrlKey || e.metaKey || e.altKey || modalAberto() || gavetaAberta() || document.body.classList.contains('deslogado')) return;
   if (digitando(e.target)) return;
   if (e.key === 'n' || e.key === 'N') { e.preventDefault(); openCampanhaModal(); }
+  else if (e.key === '?') { e.preventDefault(); abrirAjuda(); }
   else if (e.key === '/') { const busca = $('.view .search input'); if (busca) { e.preventDefault(); busca.focus(); busca.select(); } }
 });
 
@@ -1457,6 +1539,254 @@ function aplicarTema(tema) {
 }
 $('#btnTema')?.addEventListener('click', () => aplicarTema(temaAtual() === 'claro' ? 'escuro' : 'claro'));
 aplicarTema(temaAtual());
+
+
+/* ============================================================================
+   RODADA 2 — IA no Comunicar, conectividade e o resto
+   ============================================================================ */
+
+/* ---- prévia de celular fiel ao WhatsApp (como o CLIENTE vê) ---- */
+/** Formatação do WhatsApp (*negrito*, _itálico_, ~riscado~, link) sobre texto JÁ escapado. */
+function formatarWA(txt) {
+  let h = esc(txt);
+  h = h.replace(/(https?:\/\/[^\s<]+)/g, '<span class="wa-link">$1</span>');
+  h = h.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?]|$)/g, '$1<b>$2</b>')
+    .replace(/(^|[\s(])_([^_\n]+)_(?=[\s).,!?]|$)/g, '$1<i>$2</i>')
+    .replace(/(^|[\s(])~([^~\n]+)~(?=[\s).,!?]|$)/g, '$1<s>$2</s>');
+  return h;
+}
+/** Moldura de celular: topo com a conta da oficina, fundo do WhatsApp e o balão recebido. */
+function celularWA(bolhaHtml, { mini = false } = {}) {
+  return `<div class="celular${mini ? ' mini' : ''}">
+    <div class="cel-topo" aria-hidden="true"><span class="cel-voltar">‹</span><span class="cel-av">IC</span>
+      <span class="cel-quem"><b>IndyCar Centro Automotivo</b><small>conta comercial</small></span></div>
+    <div class="cel-fundo"><span class="cel-dia" aria-hidden="true">HOJE</span>${bolhaHtml}</div>
+  </div>`;
+}
+/** Pinta um balão com o texto final (variáveis já trocadas). */
+function pintarBolha(el, txt, hora = '09:30', vazio = 'Escreva a mensagem para ver a prévia.') {
+  if (!el) return;
+  el.classList.toggle('vazia', !txt);
+  el.innerHTML = txt ? formatarWA(txt) : esc(vazio);
+  if (txt) { const h = document.createElement('span'); h.className = 'hora'; h.textContent = String(hora).slice(0, 5); el.append(h); }
+}
+
+/* ---- toast com ação (ex.: Desfazer) ---- */
+function toastAcao(msg, rotulo, fn, ms = 7000) {
+  toast(msg, 'ok', ms);
+  const t = $('#toast');
+  const b = document.createElement('button'); b.type = 'button'; b.className = 'toast-acao'; b.textContent = rotulo;
+  b.addEventListener('click', async () => { b.disabled = true; t.classList.remove('show'); try { await fn(); } catch (e) { toast(e.message, 'err'); } });
+  t.insertBefore(b, $('.toast-barra', t));
+}
+
+/* ---- intenção da resposta (lida pela IA) ---- */
+const INTENCAO = {
+  quer_agendar:['📅', 'quer agendar', 'bp-green'], quer_orcamento:['💰', 'quer orçamento', 'bp-orange'],
+  reclamacao:['⚠️', 'reclamou', 'bp-red'], duvida:['❓', 'tem dúvida', 'bp-blue'],
+  agradecimento:['🙏', 'agradeceu', 'bp-purple'], outro:['💬', 'outro assunto', 'bp-gray'],
+};
+const CHAMA_CONSULTOR = new Set(['quer_agendar', 'quer_orcamento', 'reclamacao']);
+const pillIntencao = (i, resumo) => { const x = INTENCAO[i]; if (!x) return '';
+  return `<span class="badge-pill ${x[2]} intencao" title="${esc(resumo ? `IA: ${resumo}` : 'lido pela IA')}">✨ ${x[0]} ${esc(x[1])}</span>`; };
+function linkConversa(tel) { return `${ATENDIMENTO_URL}/?tel=${encodeURIComponent(soDigitos(tel).replace(/^55(?=\d{10,11}$)/, ''))}`; }
+
+async function encaminhar(id, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    await api('POST', `/envios/${id}/encaminhar`);
+    toast('Pronto: a conversa está na fila do consultor no Atendimento.');
+    if (btn) { btn.outerHTML = '<span class="badge-pill bp-green">✓ no Atendimento</span>'; }
+  } catch (e) { toast(e.message, 'err', 5000); if (btn) btn.disabled = false; }
+}
+
+/* ---- ESCREVER COM IA (painel embutido: réguas e campanha) ----
+   Gera 3 variações no tom da casa; o servidor valida cada uma por código
+   (variável desconhecida, palavra proibida, preço/prazo, tamanho) e manda a
+   prévia com as variáveis trocadas para o cliente de exemplo. */
+function painelEscreverIA(box, { regua, lerTexto, aplicar, exemplo }) {
+  if (!box) return;
+  if (!box.hidden && box.dataset.aberto) { box.hidden = true; box.dataset.aberto = ''; return; }
+  box.hidden = false; box.dataset.aberto = '1';
+  box.innerHTML = `<div class="ia-painel">
+    <div class="ia-topo"><span class="ia-selo">✨ IA</span><b>Escrever com IA</b><small>3 opções no tom da casa — você escolhe</small></div>
+    <div class="ia-linha"><input class="inp" data-ia-pedido maxlength="300" placeholder="O que a mensagem deve dizer? (opcional) — ex.: mais curta, lembrar do diagnóstico grátis" aria-label="Pedido para a IA">
+      <button type="button" class="btn ia" data-ia-gerar>${svg(I.refresh)} Gerar 3 opções</button>
+      <button type="button" class="btn" data-ia-reescrever title="Melhora o texto que já está escrito">Reescrever a atual</button></div>
+    <div class="ia-saida" data-ia-saida aria-live="polite"></div></div>`;
+  const saida = $('[data-ia-saida]', box);
+  const gerar = async (reescrever) => {
+    const pedido = $('[data-ia-pedido]', box).value.trim();
+    const texto = reescrever ? (lerTexto() || '') : '';
+    if (reescrever && !texto.trim()) return toast('Não há texto para reescrever.', 'err');
+    $$('button', box).forEach(b => (b.disabled = true));
+    saida.innerHTML = `<div class="ia-pensando"><span class="ia-pontos"><i></i><i></i><i></i></span> escrevendo as opções…</div>`;
+    try {
+      const r = await api('POST', '/ia/escrever', { regua, pedido, texto, exemplo: exemplo?.() || undefined });
+      if (!r.variacoes?.length) { saida.innerHTML = '<p class="form-msg erro">A IA não trouxe opção agora. Tente de novo.</p>'; return; }
+      saida.innerHTML = `<div class="ia-opcoes">${r.variacoes.map((v, i) => `<div class="ia-opcao${v.ok ? '' : ' com-problema'}">
+          <div class="ia-op-topo"><b>Opção ${i + 1}</b>${v.ok ? '<span class="badge-pill bp-green">✓ nas regras</span>' : `<span class="badge-pill bp-orange" title="${esc(v.problemas.join(' · '))}">⚠ ${esc(v.problemas[0] || 'revisar')}</span>`}${v.corrigido ? '<span class="badge-pill bp-gray" title="troquei palavra proibida sozinho">corrigida</span>' : ''}</div>
+          ${celularWA(`<div class="bolha wa-rec" data-op="${i}"></div>`, { mini:true })}
+          <button type="button" class="btn ${v.ok ? 'primary' : ''} btn-mini" data-usar="${i}">${svg(I.check)} Usar esta</button></div>`).join('')}</div>
+        <small class="dica">O texto vai para a caixa com as variáveis (ex.: {primeiro_nome}); a prévia já mostra como o cliente lê.</small>`;
+      r.variacoes.forEach((v, i) => pintarBolha($(`[data-op="${i}"]`, saida), v.previa || v.texto));
+      $$('[data-usar]', saida).forEach(b => b.addEventListener('click', () => {
+        const v = r.variacoes[Number(b.dataset.usar)];
+        aplicar(v.texto);
+        toast(v.ok ? 'Texto da IA aplicado — revise e salve.' : 'Aplicado. Atenção: ' + v.problemas.join(', '), v.ok ? 'ok' : 'err', 4200);
+        box.hidden = true; box.dataset.aberto = '';
+      }));
+    } catch (e) { saida.innerHTML = `<p class="form-msg erro">${esc(e.message)}</p>`; }
+    finally { $$('button', box).forEach(b => (b.disabled = false)); }
+  };
+  $('[data-ia-gerar]', box).addEventListener('click', () => gerar(false));
+  $('[data-ia-reescrever]', box).addEventListener('click', () => gerar(true));
+  $('[data-ia-pedido]', box).addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); gerar(false); } });
+  setTimeout(() => $('[data-ia-pedido]', box)?.focus(), 30);
+}
+
+/* ---- INÍCIO: resumo da semana pela IA + respostas lidas pela IA ---- */
+async function carregarLinhaIA() {
+  const box = $('#iaLinha'); if (!box) return;
+  const [resumo, intencoes, st] = await Promise.all([
+    api('GET', '/ia/resumo').catch(() => null), api('GET', '/intencoes?dias=7').catch(() => null), api('GET', '/ia/status').catch(() => null),
+  ]);
+  if (!$('#iaLinha')) return;
+  pintarResumoIA(resumo, st);
+  pintarIntencoes(intencoes, st);
+}
+function pintarResumoIA(r, st) {
+  const el = $('#iaResumo'); if (!el) return;
+  const semIA = st && (!st.ativo || !st.temChave);
+  el.innerHTML = r?.texto
+    ? `<p class="ia-texto">${esc(r.texto)}</p><div class="ia-rodape"><small class="muted">gerado ${esc(relativo(r.em))}${r.valido ? '' : ' · pode estar velho'}</small>
+        <button type="button" class="btn btn-mini" id="btnResumoIA" data-forcar="1">${svg(I.refresh)} Atualizar</button></div>`
+    : `<div class="ia-vazio"><p>${semIA ? 'A IA está desligada ou sem chave.' : 'Um parágrafo da IA sobre a semana: o que funcionou, quem respondeu e o que fazer.'}</p>
+        <button type="button" class="btn ia" id="btnResumoIA" ${semIA ? 'disabled' : ''}>✨ Gerar resumo da semana</button></div>`;
+  $('#btnResumoIA')?.addEventListener('click', async (e) => {
+    const b = e.currentTarget; b.disabled = true;
+    el.querySelector('.ia-texto')?.classList.add('carregando');
+    if (!el.querySelector('.ia-texto')) el.querySelector('.ia-vazio p').innerHTML = '<span class="ia-pontos"><i></i><i></i><i></i></span> lendo os números da semana…';
+    try { pintarResumoIA(await api('POST', '/ia/resumo', { forcar: b.dataset.forcar === '1' }), st); }
+    catch (err) { toast(err.message, 'err', 5000); b.disabled = false; el.querySelector('.ia-texto')?.classList.remove('carregando'); }
+  });
+}
+function pintarIntencoes(r, st) {
+  const el = $('#iaIntencoes'); if (!el) return;
+  const lista = r?.lista || [], cont = r?.contagem || {};
+  const quer = (cont.quer_agendar || 0), orc = (cont.quer_orcamento || 0), recl = (cont.reclamacao || 0);
+  const manchete = quer || orc || recl
+    ? [quer && `<b class="verde">${plural(quer, 'cliente quer', 'clientes querem')} agendar</b>`, orc && `<b class="laranja">${plural(orc, 'quer', 'querem')} orçamento</b>`, recl && `<b class="vermelho">${plural(recl, 'reclamou', 'reclamaram')}</b>`].filter(Boolean).join(' · ')
+    : (lista.length ? 'Ninguém pediu horário nem reclamou nesta semana.' : 'Nenhuma resposta lida pela IA nos últimos 7 dias.');
+  const modo = st?.autonomia === 'automatico' ? 'a IA passa sozinha ao consultor' : 'um clique passa ao consultor';
+  el.innerHTML = `<div class="ia-manchete">${manchete}</div>
+    ${Object.keys(cont).length ? `<div class="chips-linha">${Object.entries(cont).map(([k, n]) => `<span class="badge-pill ${INTENCAO[k]?.[2] || 'bp-gray'}">${INTENCAO[k]?.[0] || ''} ${esc(INTENCAO[k]?.[1] || k)} · <b>${n}</b></span>`).join('')}</div>` : ''}
+    <div class="lista-intencoes">${lista.slice(0, 6).map(e => `<div class="li-int">
+        <div class="li-topo"><button type="button" class="cli-nome" ${e.cliente_id ? `data-ficha="${esc(e.cliente_id)}"` : 'disabled'}><b>${esc(e.nome || telBR(e.telefone))}</b></button>${pillIntencao(e.intencao, e.intencao_resumo)}<small class="muted">${esc(relativo(e.respondido_em))}</small></div>
+        <div class="li-resp">“${esc(e.resposta || '')}”</div>
+        <div class="li-acoes"><a class="btn btn-mini ghost" href="${esc(linkConversa(e.telefone))}" target="_blank" rel="noopener">${svg(I.externo)} Abrir conversa</a>
+          ${CHAMA_CONSULTOR.has(e.intencao) ? (e.encaminhado_em ? '<span class="badge-pill bp-green">✓ no Atendimento</span>' : `<button type="button" class="btn btn-mini primary" data-encaminhar="${esc(e.id)}">${svg(I.wa)} Passar ao Atendimento</button>`) : ''}</div>
+      </div>`).join('')}</div>
+    <div class="ia-rodape"><small class="muted">Neutras e negativas passam pela IA (barata) no carteiro · ${esc(modo)} · nunca responde sozinha.</small>
+      ${ehGestor() ? `<button type="button" class="btn btn-mini" id="btnLerAgora">${svg(I.refresh)} Ler respostas agora</button>` : ''}</div>`;
+  el.onclick = (ev) => {
+    const f = ev.target.closest('[data-ficha]'); if (f) return abrirFicha(f.dataset.ficha);
+    const b = ev.target.closest('[data-encaminhar]'); if (b) return encaminhar(b.dataset.encaminhar, b);
+  };
+  $('#btnLerAgora')?.addEventListener('click', async (ev) => {
+    const b = ev.currentTarget; b.disabled = true;
+    try {
+      const x = await api('POST', '/ia/ler-respostas');
+      toast(x.lidas ? `${plural(x.lidas, 'resposta lida', 'respostas lidas')}${x.chamaram ? ` · ${x.chamaram} passou ao consultor` : ''}${x.propostas ? ` · ${x.propostas} esperando seu clique` : ''}` : 'Nenhuma resposta nova para ler.');
+      pintarIntencoes(await api('GET', '/intencoes?dias=7'), st);
+    } catch (err) { toast(err.message, 'err', 5000); b.disabled = false; }
+  });
+}
+
+/* ---- RELATÓRIO por régua (gráfico simples de 8 semanas) ---- */
+async function abrirRelatorio(regua = 'todas') {
+  const titulo = regua === 'todas' ? 'Relatório · todas as mensagens' : `Relatório · ${TIPO[regua]?.rotulo || regua}`;
+  openModal(`<div class="modal-head"><h3>📊 ${esc(titulo)}</h3><button type="button" class="modal-close" aria-label="Fechar">×</button></div>
+    <div class="modal-body"><div class="field"><label for="relRegua">Régua</label><select id="relRegua">
+      <option value="todas">Todas</option>${[...REGUAS, 'campanha', 'avulsa'].map(t => `<option value="${t}" ${t === regua ? 'selected' : ''}>${TIPO[t]?.emoji || ''} ${esc(TIPO[t]?.rotulo || t)}</option>`).join('')}</select></div>
+      <div id="relCorpo"><div class="skel" style="height:220px"></div></div></div>`, { larga:true });
+  const pintar = async (r) => {
+    const box = $('#relCorpo'); if (!box) return;
+    box.innerHTML = '<div class="skel" style="height:220px"></div>';
+    let d; try { d = await api('GET', `/relatorio?regua=${encodeURIComponent(r)}`); } catch (e) { box.innerHTML = `<p class="form-msg erro">${esc(e.message)}</p>`; return; }
+    const max = Math.max(1, ...d.semanas.map(s => s.enviadas));
+    const pct = (n) => Math.round((n / max) * 100);
+    box.innerHTML = `
+      <div class="rel-nums">
+        <div><b>${d.total.enviadas}</b><small>enviadas</small></div>
+        <div class="b"><b>${d.taxaResposta ?? '—'}${d.taxaResposta !== null ? '%' : ''}</b><small>responderam</small></div>
+        <div class="g"><b>${d.total.agendaram}</b><small>agendaram${d.taxaAgendamento ? ` · ${d.taxaAgendamento}%` : ''}</small></div>
+      </div>
+      <div class="grafico" role="img" aria-label="${esc(d.semanas.map(s => `semana de ${dataCurta(s.inicio)}: ${s.enviadas} enviadas, ${s.respondidas} responderam, ${s.agendaram} agendaram`).join('; '))}">
+        ${d.semanas.map(s => `<div class="g-sem" title="semana de ${esc(dataCurta(s.inicio))}: ${s.enviadas} enviadas · ${s.respondidas} responderam · ${s.agendaram} agendaram">
+          <div class="g-barras"><i class="b-env" style="height:${pct(s.enviadas)}%"></i><i class="b-resp" style="height:${pct(s.respondidas)}%"></i><i class="b-ag" style="height:${pct(s.agendaram)}%"></i></div>
+          <span class="g-rot">${esc(dataCurta(s.inicio))}</span></div>`).join('')}
+      </div>
+      <div class="g-legenda"><span><i class="b-env"></i>enviadas</span><span><i class="b-resp"></i>responderam</span><span><i class="b-ag"></i>agendaram</span></div>
+      ${Object.keys(d.intencoes || {}).length ? `<div class="lista-sep">O que a IA leu nas respostas</div><div class="chips-linha">${Object.entries(d.intencoes).map(([k, n]) => `<span class="badge-pill ${INTENCAO[k]?.[2] || 'bp-gray'}">${INTENCAO[k]?.[0] || ''} ${esc(INTENCAO[k]?.[1] || k)} · <b>${n}</b></span>`).join('')}</div>` : ''}
+      ${d.total.enviadas ? '' : '<p class="dica">Nada enviado nessas 8 semanas — o gráfico enche quando a régua estiver ligada e o WhatsApp saindo.</p>'}`;
+  };
+  $('#relRegua').addEventListener('change', e => pintar(e.target.value));
+  pintar(regua);
+}
+
+/* ---- ANIVERSÁRIOS da base (a mesma do CRM) ---- */
+async function abrirAniversariosBase() {
+  openModal(`<div class="modal-head"><h3>${svg(I.gift)} Aniversários na base do CRM</h3><button type="button" class="modal-close" aria-label="Fechar">×</button></div>
+    <div class="modal-body" id="anivCorpo"><div class="skel" style="height:160px"></div></div>
+    <div class="modal-foot"><button type="button" class="btn" id="anivPlanilha">${svg(I.upload)} Importar planilha</button><button type="button" class="btn primary" data-fechar>Pronto</button></div>`, { larga:true });
+  $('#anivPlanilha').addEventListener('click', () => { closeModal(); openImportarModal(); });
+  let d; try { d = await api('GET', '/aniversarios'); } catch (e) { $('#anivCorpo').innerHTML = `<p class="form-msg erro">${esc(e.message)}</p>`; return; }
+  const pctData = d.total ? Math.round((d.comData / d.total) * 100) : 0;
+  $('#anivCorpo').innerHTML = `
+    <div class="rel-nums"><div><b>${d.comData}</b><small>com aniversário</small></div><div><b>${d.total}</b><small>clientes com telefone</small></div><div class="g"><b>${d.proximos.length}</b><small>nos próximos 30 dias</small></div></div>
+    <div class="barra-prog" role="progressbar" aria-valuenow="${pctData}" aria-valuemin="0" aria-valuemax="100" aria-label="Clientes com aniversário"><i style="width:${Math.max(pctData, d.comData ? 2 : 0)}%"></i></div>
+    <p class="dica">O CRM, a Agenda e o Atendimento usam a <b>mesma</b> ficha de cliente: quem já tem data aparece aqui sozinho e entra na régua Aniversário. ${d.comData ? '' : 'Ainda ninguém tem data — cadastre pelos atendidos abaixo ou importe a planilha.'}</p>
+    ${d.proximos.length ? `<div class="lista-sep">Próximos 30 dias <em>${d.proximos.length}</em></div>${d.proximos.map(p => `<div class="ag-linha"><span class="d">${esc(dataCurta(p.data))}</span><span class="s"><b>${esc(p.nome)}</b>${p.aceita ? '' : ' <span class="selo">não quer mensagens</span>'}</span><small class="muted">${p.em_dias === 0 ? 'hoje 🎂' : `em ${plural(p.em_dias, 'dia', 'dias')}`}</small></div>`).join('')}` : ''}
+    ${d.semDataRecentes.length ? `<div class="lista-sep">Atendidos há pouco, sem data <em>${d.semDataRecentes.length}</em></div>${d.semDataRecentes.map(c => `<div class="ag-linha"><span class="s"><b>${esc(c.nome)}</b> <small class="muted">${esc(telBR(c.telefone))}</small></span><button type="button" class="btn btn-mini" data-nasc-base="${esc(c.id)}">${svg(I.gift)} Pôr data</button></div>`).join('')}` : ''}`;
+  $$('[data-nasc-base]').forEach(b => b.addEventListener('click', () => { const c = d.semDataRecentes.find(x => x.id === b.dataset.nascBase); closeModal(); openNascimentoModal(c); }));
+}
+
+/* ---- AJUDA curta ---- */
+function abrirAjuda() {
+  openModal(`<div class="modal-head"><h3>❔ Como o Comunicar funciona</h3><button type="button" class="modal-close" aria-label="Fechar">×</button></div>
+    <div class="modal-body ajuda">
+      <div class="ajuda-item"><span>🏁</span><div><b>Réguas</b><p>Mensagens automáticas (lembrete, pós-venda, revisão, aniversário…). Ligou, o carteiro gera e envia sozinho dentro da janela, no máximo o limite por hora.</p></div></div>
+      <div class="ajuda-item"><span>✨</span><div><b>IA</b><p>Escreve as mensagens (3 opções), lê as respostas e avisa quem quer agendar, quer orçamento ou reclamou, sugere para quem mandar campanha e resume a semana. <b>Nunca responde o cliente sozinha.</b></p></div></div>
+      <div class="ajuda-item"><span>🤝</span><div><b>Respeito ao cliente</b><p>Quem responde PARAR sai de tudo. Se o cliente está conversando com alguém (mensagem sem resposta há menos de 2 h ou esperando consultor), a régua espera 3 h. Feriado nacional segura as réguas de relacionamento.</p></div></div>
+      <div class="ajuda-item"><span>🔁</span><div><b>Falhas</b><p>Erro passageiro tenta de novo sozinho (até 3 vezes, com espera). Chave do WhatsApp recusada para a rodada e devolve a mensagem para a fila.</p></div></div>
+      <div class="ajuda-item"><span>💬</span><div><b>Atendimento</b><p>O que sai daqui aparece no histórico da conversa. "Abrir conversa" leva direto ao cliente no Atendimento.</p></div></div>
+      <div class="ajuda-item"><span>⌨️</span><div><b>Atalhos</b><p><kbd>N</kbd> nova campanha · <kbd>/</kbd> buscar · <kbd>?</kbd> esta ajuda · <kbd>Esc</kbd> fecha</p></div></div>
+    </div>
+    <div class="modal-foot"><button type="button" class="btn primary" data-fechar>Entendi</button></div>`);
+}
+$('#btnAjuda')?.addEventListener('click', abrirAjuda);
+
+/* ---- baixar CSV (precisa do login: vem por fetch e vira arquivo) ---- */
+async function baixarCSV(params) {
+  const r = await fetch('/api/envios.csv' + (params.toString() ? `?${params}` : ''), { headers: await authCabecalhos() });
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.erro || 'Não deu para exportar.'); }
+  const blob = await r.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = `comunicar-mensagens-${hojeSP()}.csv`;
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+/** Cartão da sugestão de público (campanha › passo 1). */
+function htmlSugestao(sg) {
+  return `<div class="ia-sugestao">
+    <div class="ia-sug-topo"><span class="ia-selo">✨ IA sugere</span><b>${esc(sg.rotulo)}${sg.valor !== null && sg.valor !== undefined && sg.valor !== '' ? ` · ${esc(sg.valor)}` : ''}</b><span class="badge-pill bp-gray">${sg.previa?.total ?? '?'} clientes</span></div>
+    <p class="ia-motivo">${esc(sg.motivo)}</p>
+    ${celularWA('<div class="bolha wa-rec" data-sug-bolha></div>', { mini:true })}
+    ${sg.ok === false ? `<p class="form-msg erro">A mensagem sugerida tem: ${esc(sg.problemas.join(', '))} — ajuste no passo 2.</p>` : ''}
+    <button type="button" class="btn primary btn-mini" id="usarSug">${svg(I.check)} ${sg.usada ? 'Usada — usar de novo' : 'Usar sugestão'}</button></div>`;
+}
 
 (async function init() {
   mostrarLogin();

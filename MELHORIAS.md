@@ -146,3 +146,95 @@ Ferramentas
 100. Só gestor/admin altera réguas, regras e manda teste (403 claro); papel `agenda` continua sem entrar.
 101. Cabeçalhos de segurança, 413 para corpo grande, erros sempre em JSON, log só de chamadas lentas/erros, encerramento limpo em SIGTERM.
 102. Estáticos: arquivo inexistente não vira index.html; imagens com cache de 1 dia, HTML/JS/SW sem cache; serviço no Render renomeado para "indycar-comunicar" (URL mantida).
+
+
+## Rodada 2 (09/10/2026)
+
+IA escrevendo as mensagens
+
+103. **Escrever com IA** em cada régua: botão ✨ junto das variáveis abre um painel que gera **3 variações** no tom da casa (curta, calorosa, sem preço/prazo), com pedido opcional ("mais curta…").
+104. "Reescrever a atual": a IA melhora o texto que já está na caixa, mantendo a ideia.
+105. Cada régua manda à IA o objetivo dela e **só as variáveis que o gerador preenche** (`{quando}` no lembrete, `{meses}` na revisão, `{link_avaliacao}` na avaliação…); variável obrigatória exigida.
+106. Validação **por código** de tudo que a IA devolve: variável desconhecida, falta da obrigatória, chave solta, "prezado/efetuar/comparecer/veículo", preço (R$, reais, % de desconto), prazo ("fica pronto em 2 dias") e tamanho (480).
+107. "veículo" vira "carro" sozinho (mantém maiúscula e plural) e a opção ganha o selo "corrigida"; repetidas somem; as que passam nas regras vêm primeiro.
+108. Opção fora das regras aparece tracejada com o motivo ("⚠ fala de preço") — o atendente vê antes de usar.
+109. Prévia de cada opção com as variáveis trocadas para o cliente de exemplo (o servidor troca com o mesmo `renderTemplate` do carteiro).
+110. "Usar esta" põe o texto na régua, atualiza a prévia e liga a barra "alterações sem salvar" — nada é salvo sem o gestor clicar.
+111. **Escrever com IA também na campanha** (passo 2), com a prévia no primeiro cliente do segmento escolhido.
+112. Pedido e texto atual vão para a IA cercados por delimitador aleatório e marcados como DADO (nunca instrução).
+113. Modelos lidos de `ia_config` (cache 60 s; reserva sonnet/opus/haiku); IA desligada, sem chave ou acima do limite do dia → mensagem clara (503/429), a tela não cai.
+114. Chave: `ANTHROPIC_API_KEY` ou, se faltar, `agenda_ia_config.api_key` (service role, cache 5 min) — nunca volta pela API (`/api/ia/status` só diz `temChave`).
+115. Cliente da IA por `fetch` puro com prompt caching no system, teto de tokens e timeout de 30 s; modelo que recusa ferramenta forçada (`tool_choice`) é repetido sozinho com `auto` (o sonnet 5.5 recusou na verificação real — corrigido e testado).
+
+IA lendo as respostas
+
+116. Migração aditiva **`comunicar_v1_2`**: `posvenda_envios.intencao` (com check), `intencao_em`, `intencao_resumo`, `encaminhado_em`, `mensagem_id` + 4 índices parciais; `posvenda_config.limite_por_hora`, `ia_resumo`, `ia_resumo_em`; advisors sem WARN novo.
+117. O carteiro passa as respostas **neutras e negativas** (e as positivas de revisão/reativação/orçamento/não fechou/campanha, onde "quero" é pedido de horário) pela IA barata (**haiku**): quer_agendar, quer_orcamento, reclamacao, duvida, agradecimento, outro.
+118. PARAR e "ficou ótimo" do pós-venda não gastam IA; cada resposta é lida uma vez só (janela de 72 h, 20 por rodada).
+119. Quem quer agendar, quer orçamento ou reclamou → conversa marcada `aguardando_consultor=true` + `aguardando_desde` (sem sobrescrever quem já esperava) seguindo `ia_config.autonomia`: **automático** marca sozinho; **confirmar/sugerir** deixam a proposta e um clique "Passar ao Atendimento" marca.
+120. Tudo vai para `ia_acoes` (origem `comunicar`): leitura, proposta, clique, erro, modelo, tokens e duração. A IA **nunca responde o cliente**.
+121. Chave recusada (401) para a leitura na hora (não gasta as outras); erro da IA nunca para o carteiro.
+122. Início ganha o cartão **"Quem respondeu"**: manchete "1 cliente quer agendar · 1 quer orçamento · 1 reclamou", chips por intenção e as últimas 6 respostas com Abrir conversa e Passar ao Atendimento.
+123. Gestor tem "Ler respostas agora" (`POST /api/ia/ler-respostas`) sem esperar o carteiro.
+124. Selo ✨ da intenção em cada mensagem (resumo da IA no `title`), botão "Passar ao Atendimento" no cartão e filtro "lidas pela IA" / por intenção na tela Mensagens.
+
+IA sugerindo e resumindo
+
+125. Campanha › passo 1: **"IA, quem devo chamar?"** — a IA olha os números (sem nome de cliente) e sugere UM segmento existente + valor + motivo + mensagem; o servidor já devolve quantos clientes caem nele.
+126. Segmento inventado pela IA é recusado, valor numérico arredondado, segmento sem valor fica sem valor, mensagem sugerida passa pela mesma validação.
+127. "Usar sugestão" escolhe o segmento e leva a mensagem pronta para o passo 2 — o atendente confirma tudo.
+128. **Resumo da semana** no Início: um parágrafo da IA (o que funcionou, quem respondeu, o que fazer), gerado sob demanda e guardado **6 h** em `posvenda_config.ia_resumo`; "Atualizar" força um novo.
+129. O resumo recebe `whatsapp_parado` do vigia — só fala de WhatsApp parado quando está mesmo (na verificação real apontou a chave do CodeWords recusada, certo).
+
+Conectividade
+
+130. "Abrir conversa" abre o cliente direto: `https://indycar-atendimento.onrender.com/?tel=<telefone sem 55>` (Mensagens, Início e ficha).
+131. Ficha do cliente com links para **Conversa, CRM e Agenda** (`?cliente=<id>&tel=<telefone>`).
+132. O que o carteiro envia **aparece no histórico da conversa do Atendimento**: linha em `whatsapp_mensagens` (saída, enviado, `gerada_por_ia=false`, cliente/lead/agendamento) — só depois de sair de verdade (falha não grava).
+133. Marca de origem: `posvenda_envios.mensagem_id` aponta a linha (e evita gravar duas vezes); a linha fica sem `wamid` para a sincronia do Atendimento "adotar" quando o aparelho devolver — sem duplicar (gêmea testada no banco).
+134. Só grava quando a conversa já existe — um parabéns não abre conversa, lead nem entra na fila de consultor.
+135. Mensagem automática não "atende" a conversa: a espera do consultor e as não lidas voltam como estavam depois da linha de saída.
+136. Selo "💬 no histórico" no cartão da mensagem.
+137. **Alguém atendendo agora** → a régua espera 3 h: conversa esperando consultor ou última mensagem do cliente sem resposta nas últimas 2 h (motivo visível no cartão: "adiado: …").
+138. Lembrete e avaliação não esperam (horário e resposta são agora); pós-venda, revisão, reativação, orçamento, não fechou, aniversário e campanha esperam.
+139. **Feriados nacionais 2026–2027** (26 datas, com Carnaval, Sexta-feira Santa e Corpus Christi): pós-venda, revisão, reativação, orçamento e não fechou passam para o próximo dia útil (pula domingo se não envia), na hora de envio.
+140. Teste de ponta a ponta no banco real em bloco revertido (`scripts/sql/teste-ciclo-comunicar.sql`): concluído há 2 dias → prévia do pós-venda → envio simulado → saída no histórico (aceita pelo `tocar_conversa`, sem duplicar) → "não ficou bom" → resposta negativa → satisfação negativa automática → aguardando consultor. `TESTE_REVERTIDO ok`, nada ficou no banco.
+
+Carteiro
+
+141. **Limite de envios por hora** configurável (Réguas › Envio, 1–500, padrão 60): o carteiro conta o que saiu na última hora e para no limite com aviso.
+142. **Reenvio automático de falha passageira**: até 3 tentativas, esperando 5 e depois 15 min; número inválido/sem WhatsApp falha de vez na hora.
+143. Erro estrutural (chave/aparelho) devolve a mensagem à fila **sem gastar tentativa**.
+144. Reenviar manual zera as tentativas; envio com sucesso limpa o "adiado: …".
+145. A rodada devolve `adiados`, `reagendados`, `feriado` e o resultado da leitura da IA (`ia`).
+146. **`CARTEIRO_DESLIGADO=1`**: servidor local de conferência sem setInterval/setTimeout e sem rodada (nem gera, nem envia, nem grava) — `/api/rodar` e "Rodar agora" respondem o aviso.
+
+Tela
+
+147. **Prévia de celular fiel ao WhatsApp** (como o cliente vê): topo com a conta da oficina, fundo com textura, selo "HOJE", balão recebido com rabinho, hora, link azul e formatação `*negrito*` `_itálico_` `~riscado~` — nas réguas, na campanha e nas opções da IA; cores próprias no tema claro (verde do WhatsApp) e no escuro.
+148. **Relatório por régua** (📊 em cada régua e no "Por régua" do Início): 8 semanas em barras (enviadas, responderam, agendaram), taxa de resposta e de agendamento, intenções lidas pela IA, seletor de régua, `aria-label` com os números.
+149. **Exportar CSV** do histórico com os filtros da tela (status, tipo, busca, período, intenção): `;` + BOM (abre no Excel), datas no fuso de SP, fórmulas neutralizadas, até 5.000 linhas.
+150. **Filtro por data** (de/até, no fuso da oficina) em Mensagens, com "limpar período" e aviso se "de" vier depois do "até".
+151. **Desfazer cancelamento**: o toast "Mensagem cancelada" traz Desfazer (`POST /api/envios/:id/desfazer-cancelamento`), que devolve à fila no mesmo horário.
+152. Toast com ação (botão dentro do recado).
+153. Régua Aniversário com **"Puxar do CRM"**: quantos clientes da base compartilhada têm data (barra de progresso), aniversariantes dos próximos 30 dias e atendidos recentes sem data, com "Pôr data" direto.
+154. **Ajuda curta** (botão "?" no topo e tecla `?`): réguas, IA, respeito ao cliente, falhas, Atendimento e atalhos.
+155. Selo "✨ IA" em degradê, botão IA roxo e "pensando" com três pontos (respeita `prefers-reduced-motion`).
+156. Em 375 px: opções da IA em coluna, período e CSV em linhas cheias, gráfico compacto — zero rolagem lateral (conferido).
+
+API e testes
+
+157. Rotas novas: `/api/ia/status`, `/api/ia/escrever`, `/api/ia/publico`, `/api/ia/resumo` (GET cache · POST gera), `/api/ia/ler-respostas`, `/api/intencoes`, `/api/relatorio`, `/api/aniversarios`, `/api/envios.csv`, `/api/envios/:id/encaminhar`, `/api/envios/:id/desfazer-cancelamento`; `/api/envios` aceita `de`, `ate`, `intencao`.
+158. `ia.js` novo com o cliente da IA **injetável** (`definirClienteIA`) — 16 testes com IA falsa, sem gastar API (validação, correção, delimitador, 3 variações, leitura automática × confirmar, 401, público, resumo, repetição com `auto`, prompt caching).
+159. `scripts/testes-rodada2.mjs`: 9 testes (feriados e móveis, próximo dia útil, falha transitória × definitiva, limite por hora, conversa ocupada, semanas do relatório no fuso de SP, CSV, aniversários). `npm test` = 35 testes passando.
+160. `scripts/conferir-banco.mjs`: conferência só-leitura contra o banco real (16 consultas) e, com `--ia`/`--tudo`, as poucas chamadas reais de verificação.
+161. Mock (`npm run mock`) com todas as rotas novas usando as funções REAIS do `ia.js` com cliente falso, intenções de exemplo e `?ia=off` para ver a IA fora do ar.
+162. README atualizado (IA, conectividade, carteiro, `CARTEIRO_DESLIGADO`, testes).
+
+### Como foi verificado (09/10/2026, rodada 2)
+
+- `npm test`: 35/35. `npm run check` limpo.
+- Banco real: migração `comunicar_v1_2` aplicada (cópia em `scripts/sql/`), advisors de segurança sem WARN novo; ciclo de ponta a ponta em bloco revertido (`TESTE_REVERTIDO ok`, conferido que nada ficou); 16 leituras reais pelo `conferir-banco.mjs`.
+- IA real (poucas chamadas): escrever pós-venda (sonnet, 3/3 nas regras), quem chamar (sonnet), resumo da semana (sonnet), 3 classificações (haiku: reclamação, quer_agendar e uma tentativa de injeção tratada como dado → quer_orcamento).
+- Servidor real local na 3510 com `CARTEIRO_DESLIGADO=1`: ping 200, rotas novas 401 sem login, `/api/rodar` 403 sem token, nenhuma rodada local (a última rodada no banco seguiu a do pg_cron); derrubado no fim.
+- Mock na 3511, puppeteer + Chrome em 1440 e 375 px (e aba própria no painel): 56 verificações de fluxo — 54 ok; as 2 restantes só falham na 2ª largura porque o mock guarda em memória o "encaminhado" da 1ª (não é defeito). Zero erro de console, zero rolagem lateral.

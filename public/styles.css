@@ -993,3 +993,168 @@ body.deslogado .sidebar,body.deslogado .main,body.deslogado main{visibility:hidd
   *,*::before,*::after{animation-duration:.01ms!important;animation-delay:0s!important;
     animation-iteration-count:1!important;transition-duration:.01ms!important}
 }
+
+/* ============================================================================
+   RODADA 2 — IA, celular do WhatsApp, relatório, filtros, ajuda
+   ============================================================================ */
+:root{
+  --wa-fundo:#0b141a; --wa-topo:#202c33; --wa-topo-txt:#e9edef; --wa-rec:#202c33; --wa-rec-txt:#e9edef;
+  --wa-hora:#8696a0; --wa-link:#53bdeb; --wa-dia:#182229; --wa-dia-txt:#8696a0; --wa-padrao:rgba(255,255,255,.025);
+  --ia:#8b5cf6; --ia-2:#ec4899; --ia-soft:rgba(139,92,246,.13); --ia-txt:#c4b5fd;
+}
+:root[data-tema="claro"]{
+  --wa-fundo:#efeae2; --wa-topo:#008069; --wa-topo-txt:#ffffff; --wa-rec:#ffffff; --wa-rec-txt:#111b21;
+  --wa-hora:#667781; --wa-link:#027eb5; --wa-dia:#ffffff; --wa-dia-txt:#54656f; --wa-padrao:rgba(0,0,0,.035);
+  --ia-soft:rgba(139,92,246,.10); --ia-txt:#6d28d9;
+}
+
+/* topo: botão de ajuda */
+.topo-acoes{display:flex;align-items:center;gap:10px;flex-shrink:0}
+.topo-ajuda{width:38px;height:38px;border-radius:12px;font-weight:800;font-size:16px;color:var(--muted)}
+
+/* ---- celular do WhatsApp (como o cliente vê) ---- */
+.celular{align-self:flex-start;width:min(100%,360px);border-radius:18px;overflow:hidden;border:1px solid var(--border-2);
+  box-shadow:0 14px 30px -18px rgba(0,0,0,.6);background:var(--wa-fundo)}
+.celular.mini{width:100%;border-radius:14px}
+.cel-topo{display:flex;align-items:center;gap:9px;padding:9px 12px;background:var(--wa-topo);color:var(--wa-topo-txt)}
+.cel-voltar{font-size:22px;line-height:1;opacity:.9;margin-right:-2px}
+.cel-av{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;font-size:11px;font-weight:800;
+  background:linear-gradient(135deg,var(--red-2),var(--red));color:#fff;flex-shrink:0}
+.cel-quem{display:flex;flex-direction:column;min-width:0;line-height:1.2}
+.cel-quem b{font-size:13px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cel-quem small{font-size:10.5px;opacity:.8}
+.celular.mini .cel-topo{padding:7px 10px} .celular.mini .cel-av{width:24px;height:24px;font-size:9.5px}
+.cel-fundo{display:flex;flex-direction:column;gap:8px;padding:12px 12px 14px;min-height:92px;
+  background-color:var(--wa-fundo);
+  background-image:radial-gradient(var(--wa-padrao) 1.2px,transparent 1.3px),radial-gradient(var(--wa-padrao) 1.2px,transparent 1.3px);
+  background-size:22px 22px;background-position:0 0,11px 11px}
+.cel-dia{align-self:center;font-size:10.5px;font-weight:600;letter-spacing:.3px;padding:4px 10px;border-radius:8px;
+  background:var(--wa-dia);color:var(--wa-dia-txt);box-shadow:0 1px .5px rgba(0,0,0,.13)}
+.bolha.wa-rec{align-self:flex-start;max-width:88%;background:var(--wa-rec);color:var(--wa-rec-txt);
+  border-radius:0 9px 9px 9px;padding:7px 9px 6px;font-size:13.5px;line-height:1.42;box-shadow:0 1px .5px rgba(0,0,0,.13);
+  font-family:'Segoe UI',Helvetica,Arial,system-ui,sans-serif;margin-left:7px}
+.bolha.wa-rec::before{content:"";position:absolute;left:-7px;top:0;border-top:8px solid var(--wa-rec);border-left:8px solid transparent}
+.bolha.wa-rec .hora{display:inline-block;float:right;margin:6px 0 -3px 10px;font-size:10.5px;color:var(--wa-hora);opacity:1}
+.bolha.wa-rec .wa-link{color:var(--wa-link);text-decoration:underline;text-underline-offset:2px;overflow-wrap:anywhere}
+.bolha.wa-rec.vazia{font-style:italic;color:var(--wa-hora)}
+
+/* ---- IA: selo, botões e painel embutido ---- */
+.ia-selo{display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:800;letter-spacing:.6px;padding:3px 7px;border-radius:7px;
+  color:#fff;background:linear-gradient(120deg,var(--ia),var(--ia-2));text-transform:uppercase;white-space:nowrap}
+.btn.ia{border-color:rgba(139,92,246,.45);color:var(--ia-txt);background:linear-gradient(120deg,var(--ia-soft),rgba(236,72,153,.08))}
+.btn.ia:hover{background:linear-gradient(120deg,rgba(139,92,246,.22),rgba(236,72,153,.14))}
+.var-chip.ia-chip{border-color:rgba(139,92,246,.45);color:var(--ia-txt);background:var(--ia-soft);font-weight:800}
+.ia-box{margin-top:8px}
+.ia-painel{display:flex;flex-direction:column;gap:10px;padding:12px;border-radius:14px;border:1px solid rgba(139,92,246,.35);
+  background:linear-gradient(160deg,var(--ia-soft),transparent 70%)}
+.ia-topo{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.ia-topo b{font-size:13.5px} .ia-topo small{font-size:11.5px;color:var(--muted)}
+.ia-linha{display:flex;gap:8px;flex-wrap:wrap}
+.ia-linha .inp{flex:1 1 220px;min-width:0}
+.ia-opcoes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.ia-opcao{display:flex;flex-direction:column;gap:7px;min-width:0;padding:8px;border-radius:12px;background:var(--surface-3);border:1px solid var(--border)}
+.ia-opcao.com-problema{border-style:dashed}
+.ia-op-topo{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px}
+.ia-opcao .btn{justify-content:center}
+.ia-pensando{display:flex;align-items:center;gap:9px;font-size:12.5px;color:var(--muted);padding:6px 2px}
+.ia-pontos{display:inline-flex;gap:4px}
+.ia-pontos i{width:6px;height:6px;border-radius:50%;background:var(--ia);animation:iaPonto 1s infinite ease-in-out}
+.ia-pontos i:nth-child(2){animation-delay:.15s;background:#b06ef3} .ia-pontos i:nth-child(3){animation-delay:.3s;background:var(--ia-2)}
+@keyframes iaPonto{0%,80%,100%{transform:translateY(0);opacity:.5}40%{transform:translateY(-4px);opacity:1}}
+.ia-sugere{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.ia-sugestao{display:flex;flex-direction:column;gap:8px;padding:12px;margin-bottom:12px;border-radius:14px;border:1px solid rgba(139,92,246,.35);
+  background:linear-gradient(160deg,var(--ia-soft),transparent 70%)}
+.ia-sug-topo{display:flex;align-items:center;gap:8px;flex-wrap:wrap} .ia-sug-topo b{font-size:14px}
+.ia-motivo{font-size:12.5px;color:var(--muted);line-height:1.5}
+.ia-sugestao .btn{align-self:flex-start}
+
+/* ---- Início: linha da IA ---- */
+.ia-cols{grid-template-columns:1fr 1.15fr}
+.ia-texto{font-size:14px;line-height:1.65;color:var(--text);transition:opacity .2s}
+.ia-texto.carregando{opacity:.45}
+.ia-vazio{display:flex;flex-direction:column;align-items:flex-start;gap:10px}
+.ia-vazio p{font-size:13px;color:var(--muted);line-height:1.5;display:flex;align-items:center;gap:8px}
+.ia-rodape{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;border-top:1px solid var(--border);padding-top:10px}
+.ia-rodape small{font-size:11.5px;line-height:1.4}
+.ia-manchete{font-size:15px;font-weight:700;line-height:1.4}
+.ia-manchete .verde{color:var(--green-txt)} .ia-manchete .laranja{color:var(--orange-txt)} .ia-manchete .vermelho{color:var(--red-txt)}
+.chips-linha{display:flex;gap:6px;flex-wrap:wrap}
+.lista-intencoes{display:flex;flex-direction:column;gap:8px}
+.li-int{display:flex;flex-direction:column;gap:5px;padding:9px 11px;border-radius:12px;background:var(--surface-3);border:1px solid var(--border)}
+.li-topo{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.li-topo .cli-nome b{font-size:13.5px}
+.li-topo small{margin-left:auto;font-size:11.5px}
+.li-resp{font-size:12.5px;color:var(--muted);line-height:1.45;overflow-wrap:anywhere}
+.li-acoes{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.badge-pill.intencao{white-space:nowrap}
+.selo-hist{display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:700;color:var(--muted);padding:3px 8px;border-radius:7px;background:var(--surface-2)}
+.panel-head .btn-mini{margin-left:auto}
+.panel-head .panel-sub + .btn-mini{margin-left:8px}
+
+/* ---- Mensagens: período, intenção e CSV ---- */
+.filtros-linha{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:-6px}
+.periodo{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;color:var(--muted)}
+.periodo .inp{width:auto;padding:7px 9px;font-size:12.5px}
+.filtros-linha select.inp{padding:7px 9px;font-size:12.5px}
+
+/* ---- toast com ação ---- */
+.toast-acao{flex-shrink:0;margin-left:6px;border:1px solid var(--border-2);background:var(--surface-2);color:var(--text);
+  font:inherit;font-weight:800;font-size:12.5px;padding:5px 11px;border-radius:9px;cursor:pointer}
+.toast-acao:hover{background:var(--surface)}
+
+/* ---- ficha: links do ecossistema ---- */
+.eco-links{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
+.eco-links a{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:700;text-decoration:none;color:var(--text);
+  padding:4px 9px;border-radius:8px;border:1px solid var(--border-2);background:var(--surface)}
+.eco-links a:hover{background:var(--surface-2)}
+.eco-links svg{width:12px;height:12px}
+
+/* ---- relatório (gráfico simples) e aniversários ---- */
+.rel-nums{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.rel-nums div{display:flex;flex-direction:column;gap:2px;padding:10px 12px;border-radius:12px;background:var(--surface-3);border:1px solid var(--border)}
+.rel-nums b{font-family:var(--font-num);font-size:30px;line-height:1;color:var(--text-forte)}
+.rel-nums small{font-size:11.5px;color:var(--muted);font-weight:600}
+.rel-nums .b b{color:var(--blue-txt)} .rel-nums .g b{color:var(--green-txt)}
+.grafico{display:grid;grid-template-columns:repeat(var(--n,8),minmax(0,1fr));grid-auto-flow:column;gap:8px;align-items:end;height:190px;
+  padding:12px 6px 0;border-bottom:1px solid var(--border-2)}
+.g-sem{display:flex;flex-direction:column;align-items:center;gap:6px;height:100%;min-width:0}
+.g-barras{flex:1;width:100%;display:flex;align-items:flex-end;justify-content:center;gap:3px}
+.g-barras i{display:block;width:30%;max-width:14px;min-height:2px;border-radius:4px 4px 0 0;transition:height .5s var(--ease-out)}
+.b-env{background:var(--muted-2)} .b-resp{background:var(--blue)} .b-ag{background:var(--green)}
+.g-rot{font-size:10.5px;color:var(--muted);font-weight:600;padding-bottom:6px}
+.g-legenda{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);font-weight:600}
+.g-legenda span{display:inline-flex;align-items:center;gap:6px}
+.g-legenda i{width:10px;height:10px;border-radius:3px;display:inline-block}
+.barra-prog{height:8px;border-radius:6px;background:var(--surface-2);overflow:hidden}
+.barra-prog i{display:block;height:100%;background:linear-gradient(90deg,var(--green),var(--wa));border-radius:6px}
+
+/* ---- ajuda ---- */
+.ajuda{gap:12px}
+.ajuda-item{display:flex;gap:12px;align-items:flex-start}
+.ajuda-item > span{font-size:20px;line-height:1.2;flex-shrink:0;width:28px;text-align:center}
+.ajuda-item b{font-size:14px}
+.ajuda-item p{font-size:13px;color:var(--muted);line-height:1.55;margin-top:2px}
+kbd{font-family:inherit;font-size:11.5px;font-weight:800;padding:1px 6px;border-radius:5px;border:1px solid var(--border-2);background:var(--surface-2)}
+
+@media (max-width:1024px){
+  .ia-cols{grid-template-columns:1fr}
+}
+@media (max-width:760px){
+  .ia-opcoes{grid-template-columns:1fr}
+}
+@media (max-width:640px){
+  .topo-acoes{width:100%} .topo-acoes .btn-novo{flex:1;justify-content:center}
+  .filtros-linha #btnCSV{margin-left:0!important;flex:1 1 100%;justify-content:center}
+  .periodo{flex:1 1 calc(50% - 8px)} .periodo .inp{flex:1;min-width:0}
+  .filtros-linha select.inp{flex:1 1 100%}
+  .grafico{gap:4px;height:160px} .g-rot{font-size:9px}
+  .rel-nums b{font-size:24px}
+  .li-topo small{margin-left:0}
+  .celular{width:100%}
+}
+@media (prefers-reduced-motion:reduce){
+  .ia-pontos i{animation:none}
+  .g-barras i{transition:none}
+}
+.panel-head h2 + .panel-sub{margin-left:auto}
+.celular.mini .cel-topo,.celular.mini .cel-dia{display:none} .celular.mini .cel-fundo{min-height:0;padding:10px 8px}

@@ -20,8 +20,40 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   renderTemplate, REGUAS, ROTULO_TIPO, SEGMENTOS, prazoDeRetorno, quandoRelativo,
-  classificarResposta, hoje, somarDias,
+  classificarResposta, hoje, somarDias, paraCSV, COLUNAS_CSV_ENVIOS, montarRelatorio, montarAniversarios,
+  instanteSP, dataBanco,
 } from '../dados.js';
+import * as ia from '../ia.js';
+
+/* IA de MENTIRA: o mock usa as funções REAIS do ia.js (validação, correção de
+   vocabulário, prévia) com um cliente falso — nada vai para a Anthropic. */
+const VARIACOES_FALSAS = {
+  lembrete: ['Oi {primeiro_nome}! Passando para lembrar do seu horário {quando} para {servico}. Confirma pra mim? Se precisar remarcar, é só responder. 🏁',
+    'Oi {primeiro_nome}, tudo certo? Seu horário na IndyCar é {quando}. Posso confirmar?', 'Lembrete: {quando} tem {servico} do seu veículo aqui na IndyCar. Confirma? 🔧'],
+  posvenda: ['Oi {primeiro_nome}! Ficou tudo certo com o {carro} depois do {servico}? Qualquer coisa é só responder aqui. 🔧',
+    'Oi {primeiro_nome}, aqui é da IndyCar! Como o {carro} está rodando depois do serviço? Me conta por aqui.', 'Prezado {nome}, como ficou o serviço?'],
+  campanha: ['Oi {primeiro_nome}! Que tal um check-up no {carro} antes das férias? O diagnóstico digital é gratuito, leva uns 30 min. Quer agendar? 🏁',
+    'Oi {primeiro_nome}, tudo bem? A IndyCar está com horários livres esta semana para o {carro}. Posso reservar um pra você?', 'Oi {primeiro_nome}! Troca de óleo por R$ 199 só esta semana!'],
+};
+let IA_LIGADA = true;
+ia.definirClienteIA({
+  async criar(args) {
+    await new Promise((r) => setTimeout(r, 650));
+    if (!IA_LIGADA) throw Object.assign(new Error('A chave da IA foi recusada (401).'), { status: 401 });
+    const pedido = args.mensagens?.[0]?.content || '';
+    const nome = args.escolha?.name;
+    if (nome === 'propor_mensagens') {
+      const regua = (pedido.match(/régua "(\w+)"/) || [])[1] || 'campanha';
+      const base = VARIACOES_FALSAS[regua] || VARIACOES_FALSAS.campanha.map((t) => t.replace('{carro}', '{carro}'));
+      const extra = regua === 'avaliacao' ? ['Que bom que gostou, {primeiro_nome}! 🙌 Uma avaliação rápida no Google ajuda demais: {link_avaliacao}', 'Obrigado pela confiança, {primeiro_nome}! Se puder, deixa sua nota: {link_avaliacao}', 'Valeu, {primeiro_nome}! Avalia a gente? {link_avaliacao}'] : base;
+      return { conteudo: [{ type: 'tool_use', name: nome, input: { variacoes: extra } }], uso: {}, modelo: args.modelo, ms: 650 };
+    }
+    if (nome === 'sugerir') {
+      return { conteudo: [{ type: 'tool_use', name: nome, input: { segmento: 'sem_voltar', valor: 6, motivo: '4 clientes estão há mais de 6 meses sem voltar e 2 das últimas campanhas de revisão viraram agendamento.', mensagem: 'Oi {primeiro_nome}! Faz um tempinho que o {carro} não passa aqui. Que tal um diagnóstico digital gratuito, uns 30 min com scanner? É só responder para agendar. 🏁' } }], uso: {}, modelo: args.modelo, ms: 650 };
+    }
+    return { conteudo: [{ type: 'text', text: 'Semana boa no Comunicar: 9 mensagens saíram e 5 clientes responderam (56%). A campanha de freios na chuva foi a que mais rendeu — um cliente já pediu horário para sábado. O ponto de atenção é o pós-venda do Donizetti, que reclamou de barulho na roda: vale ligar hoje. Para esta semana, ligue a régua Reativação: há 4 clientes sumidos há mais de 6 meses.' }], uso: {}, modelo: args.modelo, ms: 650 };
+  },
+});
 
 const PUBLIC = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 const PORT = Number(process.env.PORT || 3511);
@@ -74,6 +106,7 @@ const CFG = {
   dias_posvenda:2, meses_retorno:6, horas_lembrete:20, dias_orcamento:3, dias_nao_fechou:7, meses_reativacao:12,
   intervalo_minimo_dias:7, janela_inicio:8, janela_fim:20, hora_envio:'09:30', link_avaliacao:'https://g.page/r/indycar-taubate/review',
   envia_domingo:false, pausa_geral:false, telefone_teste:'12988887777', carteiro_configurado:true, updated_at: diasAtras(3),
+  limite_por_hora:60, ia_resumo:null, ia_resumo_em:null,
 };
 
 // ---- regras de retorno e modelos (iguais ao SQL da migração) ---------------
@@ -133,7 +166,7 @@ let ENVIOS = [
   env(C(10), 'lembrete', { corpo: renderTemplate(CFG.msg_lembrete, { nome:C(10).nome, carro:C(10).carro, servico:'diagnóstico com scanner', quando: quandoRelativo(hoje(), '15:30') }), ...enviado(3, { resposta:'Confirmado, obrigado!', respondido_em: horasAtras(2.5) }) }),
   env(C(1), 'posvenda', { corpo: renderTemplate(CFG.msg_posvenda, { nome:C(1).nome, carro:C(1).carro, servico:'troca de óleo de câmbio' }), ...enviado(26, { resposta:'Ficou ótimo, carro tá outro! 👍', respondido_em: horasAtras(25) }) }),
   env(C(1), 'avaliacao', { corpo: renderTemplate(CFG.msg_avaliacao, { nome:C(1).nome, link_avaliacao: CFG.link_avaliacao }), criado_por:'gatilho', ...enviado(24.9) }),
-  env(C(2), 'posvenda', { corpo: renderTemplate(CFG.msg_posvenda, { nome:C(2).nome, carro:C(2).carro, servico:'pastilha de freio' }), ...enviado(27, { resposta:'Não ficou bom, continua com barulho na roda', respondido_em: horasAtras(26) }) }),
+  env(C(2), 'posvenda', { corpo: renderTemplate(CFG.msg_posvenda, { nome:C(2).nome, carro:C(2).carro, servico:'pastilha de freio' }), ...enviado(27, { resposta:'Não ficou bom, continua com barulho na roda', respondido_em: horasAtras(26), intencao:'reclamacao', intencao_resumo:'barulho na roda voltou depois da pastilha', intencao_em: horasAtras(25.8), mensagem_id: uuid() }) }),
   env(C(3), 'nao_fechou', { ...enviado(50) }),
   env(C(5), 'retorno', { corpo: renderTemplate(REGRAS[5].mensagem, { nome:C(5).nome, carro:C(5).carro, meses:24, servico:'correia dentada' }), ...enviado(72, { agendou_depois_id: uuid() }) }),
   env(C(8), 'retorno', { corpo: renderTemplate(CFG.msg_retorno, { nome:C(8).nome, carro:C(8).carro, meses:12, servico:'troca de amortecedores' }), ...enviado(96, { agendou_depois_id: uuid() }) }),
@@ -141,11 +174,12 @@ let ENVIOS = [
   env(C(6), 'aniversario', { status:'pulado', motivo_pulado:'cliente pediu para não receber mensagens' }),
   env(C(9), 'reativacao', { status:'falhou', erro:'O CodeWords respondeu 500: device offline', tentativas:2, enviar_em: diasAtras(1), created_at: diasAtras(1) }),
   env(C(4), 'campanha', { corpo: renderTemplate(MODELOS[2].corpo, { nome:C(4).nome, carro:C(4).carro }), criado_por:'João Pedro', ...enviado(120) }),
-  env(C(7), 'campanha', { corpo: renderTemplate(MODELOS[2].corpo, { nome:C(7).nome, carro:C(7).carro }), criado_por:'João Pedro', ...enviado(120, { resposta:'Quero sim, pode ser sábado?', respondido_em: horasAtras(118), agendou_depois_id: uuid() }) }),
+  env(C(7), 'campanha', { corpo: renderTemplate(MODELOS[2].corpo, { nome:C(7).nome, carro:C(7).carro }), criado_por:'João Pedro', ...enviado(120, { resposta:'Quero sim, pode ser sábado?', respondido_em: horasAtras(118), agendou_depois_id: uuid(), intencao:'quer_agendar', intencao_resumo:'quer horário no sábado', intencao_em: horasAtras(117.8), encaminhado_em: horasAtras(117.8) }) }),
   env(C(10), 'campanha', { corpo: renderTemplate(MODELOS[2].corpo, { nome:C(10).nome, carro:C(10).carro }), criado_por:'João Pedro', ...enviado(120, { resposta:'PARAR', respondido_em: horasAtras(119) }) }),
   env(C(3), 'campanha', { corpo: renderTemplate(MODELOS[0].corpo, { nome:C(3).nome, carro:C(3).carro }), criado_por:'Leonardo', status:'cancelado', enviar_em: diasAtras(9), created_at: diasAtras(9) }),
   env(C(8), 'campanha', { corpo: renderTemplate(MODELOS[0].corpo, { nome:C(8).nome, carro:C(8).carro }), criado_por:'Leonardo', ...enviado(216) }),
-  env(C(1), 'campanha', { corpo: renderTemplate(MODELOS[0].corpo, { nome:C(1).nome, carro:C(1).carro }), criado_por:'Leonardo', ...enviado(216, { resposta:'Obrigado, por enquanto não', respondido_em: horasAtras(210) }) }),
+  env(C(1), 'campanha', { corpo: renderTemplate(MODELOS[0].corpo, { nome:C(1).nome, carro:C(1).carro }), criado_por:'Leonardo', ...enviado(216, { resposta:'Obrigado, por enquanto não', respondido_em: horasAtras(210), intencao:'agradecimento', intencao_em: horasAtras(209.8) }) }),
+  env(C(9), 'retorno', { corpo: renderTemplate(CFG.msg_retorno, { nome:C(9).nome, carro:C(9).carro, meses:6, servico:'troca de óleo' }), ...enviado(30, { resposta:'Quanto fica a revisão completa?', respondido_em: horasAtras(28), intencao:'quer_orcamento', intencao_resumo:'pergunta o preço da revisão', intencao_em: horasAtras(27.9), mensagem_id: uuid() }) }),
   env(C(11), 'avulsa', { corpo:'Oi Bruno! Sua peça chegou, pode trazer o carro amanhã de manhã. 🏁', criado_por:'Leonardo', ...enviado(5) }),
   env(null, 'avulsa', { telefone:'12988887777', nome:'Teste (João Pedro)', corpo:'Teste do IndyCar Comunicar: se você recebeu isto, o WhatsApp está saindo. 🏁', criado_por:'João Pedro', ...enviado(30) }),
   env(C(10), 'orcamento', { status:'pendente', enviar_em: horasAtras(3), created_at: horasAtras(4) }),
@@ -254,6 +288,15 @@ function segmentar(filtro, valor) {
   }
 }
 
+/** Filtros novos da fila: período (fuso de SP) e intenção lida pela IA. */
+function filtrarExtra(l, sp) {
+  const de = dataBanco(sp.get('de')), ate = dataBanco(sp.get('ate')), int = sp.get('intencao');
+  if (de) l = l.filter((e) => e.enviar_em >= instanteSP(de, '00:00').toISOString());
+  if (ate) l = l.filter((e) => e.enviar_em < instanteSP(somarDias(ate, 1), '00:00').toISOString());
+  if (int && int !== 'todas') l = l.filter((e) => (int === 'qualquer' ? !!e.intencao : e.intencao === int));
+  return l;
+}
+
 const json = (res, code, obj) => { res.writeHead(code, { 'Content-Type':'application/json; charset=utf-8', 'Cache-Control':'no-store' }); res.end(JSON.stringify(obj)); };
 const DUBLE_SUPABASE = `<script>window.supabase={createClient:()=>({auth:{
   getSession:async()=>({data:{session:{access_token:'mock'}}}),
@@ -267,6 +310,7 @@ http.createServer(async (req, res) => {
     if (p === '/' || p === '/index.html') {
       if (url.searchParams.has('papel')) PAPEL = url.searchParams.get('papel') === 'atendente' ? 'atendente' : 'admin';
       if (url.searchParams.has('saude')) SAUDE_OK = url.searchParams.get('saude') === 'ok';
+      if (url.searchParams.has('ia')) IA_LIGADA = url.searchParams.get('ia') !== 'off';
       const html = fs.readFileSync(path.join(PUBLIC, 'index.html'), 'utf8')
         .replace(/<script src="https:\/\/cdn\.jsdelivr\.net\/npm\/@supabase[^"]*"><\/script>/, DUBLE_SUPABASE);
       res.writeHead(200, { 'Content-Type': MIME['.html'] }); return res.end(html);
@@ -319,8 +363,74 @@ http.createServer(async (req, res) => {
     if (st && st !== 'todas') l = l.filter((e) => e.status === st);
     if (tipo && tipo !== 'todos') l = l.filter((e) => e.tipo === tipo);
     if (q) l = l.filter((e) => [e.nome, e.corpo, e.telefone].some((x) => String(x || '').toLowerCase().includes(q)));
+    l = filtrarExtra(l, url.searchParams);
     l.sort((a, b) => (a.enviar_em < b.enviar_em ? 1 : -1));
     return json(res, 200, l.slice(0, Number(url.searchParams.get('limite')) || 300));
+  }
+  if (p === '/api/envios.csv' && m === 'GET') {
+    let l = filtrarExtra(ENVIOS.slice(), url.searchParams);
+    const st = url.searchParams.get('status'), tipo = url.searchParams.get('tipo');
+    if (st && st !== 'todas') l = l.filter((e) => e.status === st);
+    if (tipo && tipo !== 'todos') l = l.filter((e) => e.tipo === tipo);
+    res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="comunicar-mensagens-${hoje()}.csv"` });
+    return res.end(paraCSV(l.sort((a, b) => (a.enviar_em < b.enviar_em ? 1 : -1)), COLUNAS_CSV_ENVIOS));
+  }
+  if ((mm = p.match(/^\/api\/envios\/([0-9a-f-]+)\/desfazer-cancelamento$/)) && m === 'POST') {
+    const e = ENVIOS.find((x) => x.id === mm[1]);
+    if (!e || e.status !== 'cancelado') return json(res, 400, { erro:'Essa mensagem não está cancelada.' });
+    e.status = 'pendente'; return json(res, 200, e);
+  }
+  if ((mm = p.match(/^\/api\/envios\/([0-9a-f-]+)\/encaminhar$/)) && m === 'POST') {
+    const e = ENVIOS.find((x) => x.id === mm[1]);
+    if (!e) return json(res, 404, { erro:'Não encontrado' });
+    e.encaminhado_em = agora(); return json(res, 200, { ok:true });
+  }
+  if (p === '/api/relatorio') {
+    const regua = url.searchParams.get('regua');
+    const l = ENVIOS.filter((e) => !regua || regua === 'todas' || e.tipo === regua);
+    return json(res, 200, montarRelatorio(l, regua || null, 8));
+  }
+  if (p === '/api/intencoes') {
+    const dias = Number(url.searchParams.get('dias')) || 7;
+    const lista = ENVIOS.filter((e) => e.intencao && e.respondido_em >= diasAtras(dias)).sort((a, b) => (a.respondido_em < b.respondido_em ? 1 : -1));
+    const contagem = {}; for (const e of lista) contagem[e.intencao] = (contagem[e.intencao] || 0) + 1;
+    return json(res, 200, { contagem, lista });
+  }
+  if (p === '/api/aniversarios') {
+    const ags = AG.filter((a) => a.status === 'concluido').map((a) => ({ cliente_id: a.cliente.id, data: a.data }));
+    return json(res, 200, await montarAniversarios(CLIENTES.filter((c) => c.nascimento), CLIENTES.filter((c) => c.telefone).length, ags, hoje(), async (ids) => ids.map(porId).filter(Boolean)));
+  }
+
+  // ---- IA (cliente falso, funções reais)
+  if (p === '/api/ia/status') return json(res, 200, { ativo: IA_LIGADA, temChave: true, autonomia: 'confirmar', chamadasHoje: 3, limite: 2000 });
+  if (p === '/api/ia/escrever' && m === 'POST') {
+    try {
+      const regua = String(body.regua || 'campanha');
+      const r = await ia.escreverMensagem({ regua, pedido: body.pedido, textoAtual: body.texto }, { chave:'falsa', modelos: ia.MODELOS_RESERVA });
+      const ex = { nome:'Maria Aparecida Souza', carro:'HB20 2019', placa:'FHR6F16', servico:'troca de óleo', quando:'amanhã às 09:00', meses:6, detalhe:'sábado até 12h', link_avaliacao: CFG.link_avaliacao, ...(body.exemplo || {}) };
+      return json(res, 200, { variacoes: r.variacoes.map((v) => ({ ...v, previa: renderTemplate(v.texto, ex) })), modelo: r.modelo });
+    } catch (e) { return json(res, 502, { erro: `A IA não respondeu agora: ${e.message}` }); }
+  }
+  if (p === '/api/ia/publico' && m === 'POST') {
+    try {
+      const r = await ia.sugerirPublico({ numeros: resumo(), segmentos: SEGMENTOS }, { chave:'falsa', modelos: ia.MODELOS_RESERVA });
+      const l = segmentar(r.segmento, r.valor) || [];
+      delete r.uso;
+      return json(res, 200, { ...r, previa: { total: l.length, amostra: l.slice(0, 8).map((c) => ({ id:c.id, nome:c.nome, carro:c.carro })) } });
+    } catch (e) { return json(res, 502, { erro: `A IA não respondeu agora: ${e.message}` }); }
+  }
+  if (p === '/api/ia/resumo' && m === 'GET') return json(res, 200, { texto: CFG.ia_resumo, em: CFG.ia_resumo_em, valido: !!CFG.ia_resumo });
+  if (p === '/api/ia/resumo' && m === 'POST') {
+    if (!body.forcar && CFG.ia_resumo) return json(res, 200, { texto: CFG.ia_resumo, em: CFG.ia_resumo_em, valido: true, cache: true });
+    try {
+      const r = await ia.resumirSemana({ numeros: resumo() }, { chave:'falsa', modelos: ia.MODELOS_RESERVA });
+      CFG.ia_resumo = r.texto; CFG.ia_resumo_em = agora();
+      return json(res, 200, { texto: r.texto, em: CFG.ia_resumo_em, valido: true, cache: false });
+    } catch (e) { return json(res, 502, { erro: `A IA não respondeu agora: ${e.message}` }); }
+  }
+  if (p === '/api/ia/ler-respostas' && m === 'POST') {
+    if (!ehGestor()) return json(res, 403, { erro:'Só gestor dispara a leitura agora.' });
+    return json(res, 200, { lidas: 0, chamaram: 0, propostas: 0, erros: 0, porIntencao: {} });
   }
   if (p === '/api/envios' && m === 'POST') {
     const corpo = String(body.corpo ?? '').trim();
