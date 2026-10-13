@@ -2,12 +2,14 @@
 -- tudo roda dentro de um bloco DO que termina com RAISE EXCEPTION (auto-reverte).
 --   concluído há 2 dias → entra na prévia do pós-venda → envio simulado →
 --   linha no histórico do Atendimento (gatilho tocar_conversa aceita a saída) →
---   cliente responde "não ficou bom" → satisfação negativa → aguardando consultor.
+--   cliente responde "não ficou bom" → satisfação negativa → TAREFA para o dono da
+--   conversa + notificação aos gestores (rodada 3) → aguardando consultor.
 -- Resultado esperado: ERROR "TESTE_REVERTIDO ok | ..." (o "ok" é o sucesso).
 do $$
 declare
   v_tel text := '12900009' || lpad((floor(random()*1000))::int::text, 3, '0');
   v_cli uuid; v_ag uuid; v_env uuid; v_conv uuid; v_msg uuid; v_n int; v_e record; v_sat record; v_c record;
+  v_dono uuid; v_t record; v_notif int; v_gestores int;
 begin
   insert into public.clientes (nome, telefone, origem) values ('Teste Ciclo Comunicar', v_tel, 'organico') returning id into v_cli;
 
@@ -53,6 +55,11 @@ begin
   select count(*) into v_n from public.whatsapp_mensagens where conversa_id = v_conv and direcao = 'saida' and corpo like 'Oi Teste! Ficou tudo certo%';
   if v_n <> 1 then raise exception 'FALHOU: saída duplicou (% linhas)', v_n; end if;
 
+  -- (rodada 3) a conversa tem dono: um atendente ativo, se houver
+  select id into v_dono from public.perfis where ativo and papel = 'atendente' order by created_at limit 1;
+  if v_dono is not null then update public.conversas set atribuida_a = v_dono where id = v_conv; end if;
+  select count(*) into v_gestores from public.comunicar_gestores('reclamacao');
+
   -- 5) o cliente responde "não ficou bom"
   insert into public.whatsapp_mensagens (telefone, corpo, direcao, status, conversa_id)
   values (v_tel, 'Não ficou bom, continua o barulho no freio', 'entrada', 'recebido', v_conv);
@@ -64,12 +71,32 @@ begin
   select satisfeito, origem into v_sat from public.posvenda_respostas where envio_id = v_env;
   if v_sat.satisfeito is distinct from false or v_sat.origem <> 'whatsapp' then raise exception 'FALHOU: satisfação não registrada como negativa'; end if;
 
+  -- 6b) (rodada 3) tarefa para o dono da conversa (ou o gestor) e aviso imediato aos gestores
+  select t.id, t.responsavel_id, t.origem, t.prioridade, t.status, t.cliente_id, t.conversa_id into v_t
+    from public.posvenda_envios e join public.tarefas t on t.id = e.tarefa_id where e.id = v_env;
+  if v_t.id is null then raise exception 'FALHOU: nenhuma tarefa nasceu da resposta negativa'; end if;
+  if v_t.responsavel_id is distinct from coalesce(v_dono, (select x from public.comunicar_gestores() x limit 1)) then
+    raise exception 'FALHOU: tarefa foi para a pessoa errada'; end if;
+  if v_t.origem <> 'comunicar' or v_t.prioridade <> 1 or v_t.status <> 'aberta' or v_t.cliente_id <> v_cli or v_t.conversa_id <> v_conv then
+    raise exception 'FALHOU: tarefa com dados errados'; end if;
+  select count(*) into v_notif from public.notificacoes where chave = 'reclamacao:' || v_env and tipo = 'reclamacao' and app = 'comunicar';
+  if v_notif <> v_gestores or v_notif = 0 then raise exception 'FALHOU: % notificações de reclamação para % gestores', v_notif, v_gestores; end if;
+  -- o responsável também recebe "Nova tarefa" (gatilho notificar_tarefa da base)
+  select count(*) into v_n from public.notificacoes where chave = 'tarefa:' || v_t.id and perfil_id = v_t.responsavel_id;
+  if v_n <> 1 then raise exception 'FALHOU: responsável não foi avisado da tarefa'; end if;
+  -- e uma segunda resposta negativa não cria outra tarefa
+  update public.posvenda_envios set resposta_tipo = 'neutra' where id = v_env;
+  update public.posvenda_envios set resposta_tipo = 'negativa' where id = v_env;
+  select count(*) into v_n from public.tarefas where cliente_id = v_cli and origem = 'comunicar';
+  if v_n <> 1 then raise exception 'FALHOU: tarefa duplicou (%)', v_n; end if;
+
   -- 7) a IA lê "reclamacao" e passa ao consultor (o que chamarConsultor + gravarIntencao fazem)
   update public.posvenda_envios set intencao = 'reclamacao', intencao_em = now(), intencao_resumo = 'barulho no freio voltou', encaminhado_em = now() where id = v_env;
   update public.conversas set aguardando_consultor = true, aguardando_desde = now() where id = v_conv and not aguardando_consultor;
   select aguardando_consultor, aguardando_desde into v_c from public.conversas where id = v_conv;
   if not v_c.aguardando_consultor or v_c.aguardando_desde is null then raise exception 'FALHOU: conversa não ficou aguardando consultor'; end if;
 
-  raise exception 'TESTE_REVERTIDO ok | conversa % | saída % no histórico | resposta % | satisfeito=% | aguardando=%',
-    v_conv, v_msg, v_e.resposta_tipo, v_sat.satisfeito, v_c.aguardando_consultor;
+  raise exception 'TESTE_REVERTIDO ok | conversa % | saída % no histórico | resposta % | satisfeito=% | tarefa p/ % | % notificação(ões) de reclamação | aguardando=%',
+    v_conv, v_msg, v_e.resposta_tipo, v_sat.satisfeito, case when v_dono is not null then 'dono da conversa' else 'gestor' end,
+    v_notif, v_c.aguardando_consultor;
 end $$;

@@ -1,9 +1,9 @@
 // Service Worker do IndyCar Comunicar — torna o site instalável (PWA)
 // e mantém a casca do app em cache para abrir rápido.
-const CACHE = 'comunicar-v1';
+const CACHE = 'comunicar-v3';
 /* Se QUALQUER item desta lista faltar, o addAll rejeita e o service worker
    NÃO instala. Mantenha só o que existe de verdade. */
-const CORE = ['/', '/styles.css', '/app.js', '/manifest.json', '/icon-192.png', '/icon-512.png', '/logo.png'];
+const CORE = ['/', '/styles.css', '/conta.js', '/app.js', '/manifest.json', '/icon-192.png', '/icon-512.png', '/logo.png'];
 
 /* NUNCA entra no cache: a API (dado de cliente muda a cada minuto e carrega
    token), qualquer coisa que não seja GET e o que não é deste domínio (o

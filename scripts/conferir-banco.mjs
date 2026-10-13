@@ -32,6 +32,19 @@ const iac = await t('iaConfig', dados.iaConfig, (c) => `ativo=${c.ativo}, autono
 const chave = await t('chaveIA (env ou agenda_ia_config)', dados.chaveIA, (k) => (k ? `presente (${process.env.ANTHROPIC_API_KEY ? 'env' : 'banco'})` : 'AUSENTE'));
 await t('chamadasIAHoje', dados.chamadasIAHoje, (n) => `${n}`);
 
+// ---- rodada 3: equipe (só leitura) ----
+const gest = await t('gestores() pela rpc comunicar_gestores', () => dados.gestores(null), (l) => `${l.length} gestor(es)/admin(s)`);
+await t('gestores("reclamacao") respeita preferências', () => dados.gestores('reclamacao'), (l) => `${l.length}`);
+if (gest?.[0]) {
+  await t('perfilCompleto (papel, apps, troca de senha)', () => dados.perfilCompleto(gest[0]), (p) => `papel=${p.papel}, apps=${(p.apps || []).length}, trocar=${p.precisa_trocar_senha}`);
+  await t('minhasNotificacoes', () => dados.minhasNotificacoes(gest[0]), (r) => `${r.lista.length} (${r.naoLidas} não lidas)`);
+  await t('minhasTarefas (com o nome do cliente)', () => dados.minhasTarefas(gest[0]), (l) => `${l.length} abertas`);
+}
+await t('listarCampanhas (aprovação)', () => dados.listarCampanhas({ status: 'todas' }), (l) => `${l.length} campanhas, ${l.filter((c) => c.status === 'aguardando').length} aguardando`);
+await t('falhasPorTipo (24 h)', () => dados.falhasPorTipo(new Date(Date.now() - 86400000).toISOString()), (r) => JSON.stringify(Object.fromEntries(Object.entries(r).map(([k, v]) => [k, v.total]))));
+await t('ultimoResumoEquipe', dados.ultimoResumoEquipe, (x) => x || 'nunca');
+if (tel) await t('donoDaConversa', () => dados.donoDaConversa({ telefone: tel }), (r) => `conversa=${!!r.conversaId}, dono=${r.dono ? 'sim' : 'ninguém'}`);
+
 if (process.argv.includes('--ia') && chave) {
   const ctx = { chave, modelos: iac.modelos };
   const e = await t('IA real: escrever (posvenda, sonnet)', () => ia.escreverMensagem({ regua: 'posvenda', pedido: 'mais curta e calorosa' }, ctx),

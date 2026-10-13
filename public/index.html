@@ -84,10 +84,12 @@
           <span class="tema-ico" id="temaIco" aria-hidden="true">🌙</span>
           <span class="tema-txt" id="temaTxt">Escuro</span>
         </button>
-        <div class="avatar-bottom" id="avatarPerfil" title="Sua conta">IC</div>
+        <button type="button" class="avatar-bottom" id="avatarPerfil" title="Sua conta" aria-label="Abrir o menu da sua conta" aria-haspopup="true" aria-expanded="false" aria-controls="contaPop">IC</button>
       </div>
     </aside>
     <div class="eco-pop" id="ecoPop" role="menu" aria-label="Ecossistema IndyCar" hidden></div>
+    <!-- Menu da conta (avatar): perfil, senha, duas etapas, tema, sair -->
+    <div class="eco-pop conta-pop" id="contaPop" role="menu" aria-label="Sua conta" hidden></div>
 
     <!-- ===================== CONTEÚDO ===================== -->
     <main class="main">
@@ -112,6 +114,12 @@
           </div>
         </div>
         <div class="topo-acoes">
+        <button class="icon-btn topo-ico" id="btnTarefas" type="button" aria-label="Minhas tarefas" title="Minhas tarefas" aria-haspopup="dialog" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11l3 3 8-8"/><path d="M20 12v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h9"/></svg>
+          <em class="topo-cont" id="contTarefas" hidden>0</em></button>
+        <button class="icon-btn topo-ico" id="btnSino" type="button" aria-label="Notificações" title="Notificações" aria-haspopup="true" aria-expanded="false" aria-controls="sinoPop" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+          <em class="topo-cont" id="contSino" hidden>0</em></button>
         <button class="icon-btn topo-ajuda" id="btnAjuda" type="button" aria-label="Ajuda: como o Comunicar funciona" title="Ajuda (tecla ?)">?</button>
         <button class="btn-novo" id="btnNova" type="button" title="Atalho: tecla N">
           <svg viewBox="0 0 24 24"><path d="M3 11l18-7-7 18-2.5-7.5z"/></svg>
@@ -120,6 +128,7 @@
         </div>
       </header>
 
+      <div class="sino-pop" id="sinoPop" role="dialog" aria-label="Notificações" hidden></div>
       <section class="view" id="view"><!-- preenchido por app.js --></section>
     </main>
   </div>
@@ -139,26 +148,87 @@
 
   <!-- ============ LOGIN ============
        O Comunicar guarda nome, telefone e histórico de mensagens dos clientes.
-       Publicado na internet, tudo passa por aqui primeiro. -->
+       Publicado na internet, tudo passa por aqui primeiro. Um painel por vez:
+       entrar · esqueci a senha · nova senha · código de duas etapas · sem acesso.
+       A lógica mora em conta.js. -->
   <div id="telaLogin" class="login-capa">
-    <form id="formLogin" class="login-caixa" autocomplete="on">
+    <form id="formLogin" class="login-caixa" autocomplete="on" data-painel novalidate>
       <img src="/logo.png" alt="IndyCar Centro Automotivo" class="login-logo" />
       <h1>Comunicar</h1>
       <p class="login-sub">Central de comunicação com o cliente. Entre com o mesmo e-mail e senha da Agenda, do CRM e do Atendimento.</p>
       <label>E-mail
-        <input name="loginEmail" type="email" required autocomplete="username"
+        <input name="loginEmail" id="loginEmail" type="email" required autocomplete="username"
                placeholder="voce@indycartaubate.com" />
       </label>
       <label>Senha
-        <input name="loginSenha" type="password" required autocomplete="current-password"
-               placeholder="••••••••" />
+        <span class="senha-campo">
+          <input name="loginSenha" id="loginSenha" type="password" required autocomplete="current-password" placeholder="••••••••" />
+          <button type="button" class="olho" data-olho="loginSenha" aria-label="Mostrar senha" aria-pressed="false">👁</button>
+        </span>
       </label>
+      <p class="login-caps" id="capsLogin" role="status" hidden>⇪ Caps Lock ligado</p>
+      <div class="login-linha">
+        <label class="lembrar"><input type="checkbox" id="lembrarEmail" /> Lembrar meu e-mail</label>
+        <button type="button" class="login-link" id="linkEsqueci">Esqueci a senha</button>
+      </div>
       <button type="submit" class="btn-entrar" id="btnEntrar">ENTRAR</button>
-      <p class="login-erro" id="erroLogin" hidden></p>
+      <p class="login-erro" id="erroLogin" role="alert" hidden></p>
     </form>
+
+    <form id="formEsqueci" class="login-caixa" data-painel hidden novalidate>
+      <h1>Esqueci a senha</h1>
+      <p class="login-sub">Mandamos um link para o seu e-mail. Abra o link neste aparelho e escolha a senha nova.</p>
+      <label>E-mail
+        <input id="esqueciEmail" type="email" required autocomplete="username" placeholder="voce@indycartaubate.com" />
+      </label>
+      <button type="submit" class="btn-entrar" id="btnEsqueci">MANDAR O LINK</button>
+      <p class="login-ok" id="okEsqueci" role="status" hidden></p>
+      <p class="login-erro" id="erroEsqueci" role="alert" hidden></p>
+      <p class="login-nota">O envio de e-mail do plano gratuito é limitado (poucos por hora). Se não chegar, peça ao administrador uma <b>senha temporária</b>.</p>
+      <button type="button" class="login-link" data-voltar-login>← Voltar para o login</button>
+    </form>
+
+    <form id="formNovaSenha" class="login-caixa" data-painel hidden novalidate>
+      <h1 id="novaSenhaTitulo">Escolha uma senha nova</h1>
+      <p class="login-sub" id="novaSenhaSub">Mínimo de 8 caracteres e diferente do seu e-mail.</p>
+      <label>Senha nova
+        <span class="senha-campo">
+          <input id="novaSenha" type="password" required minlength="8" autocomplete="new-password" />
+          <button type="button" class="olho" data-olho="novaSenha" aria-label="Mostrar senha" aria-pressed="false">👁</button>
+        </span>
+      </label>
+      <label>Repita a senha
+        <input id="novaSenha2" type="password" required minlength="8" autocomplete="new-password" />
+      </label>
+      <p class="login-caps" id="capsNova" role="status" hidden>⇪ Caps Lock ligado</p>
+      <div class="forca" id="forcaSenha" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+      <button type="submit" class="btn-entrar" id="btnNovaSenha">SALVAR SENHA</button>
+      <p class="login-erro" id="erroNovaSenha" role="alert" hidden></p>
+      <button type="button" class="login-link" data-sair>Sair</button>
+    </form>
+
+    <form id="formMfa" class="login-caixa" data-painel hidden novalidate>
+      <h1>Verificação em duas etapas</h1>
+      <p class="login-sub">Digite o código de 6 números do seu app autenticador (Google Authenticator, Microsoft Authenticator…).</p>
+      <label>Código
+        <input id="mfaCodigo" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="000000" class="codigo" />
+      </label>
+      <button type="submit" class="btn-entrar" id="btnMfa">CONFIRMAR</button>
+      <p class="login-erro" id="erroMfa" role="alert" hidden></p>
+      <button type="button" class="login-link" data-sair>Sair</button>
+    </form>
+
+    <div id="painelSemAcesso" class="login-caixa" data-painel hidden role="alert">
+      <img src="/logo.png" alt="IndyCar Centro Automotivo" class="login-logo" />
+      <h1>Você não tem acesso a este app</h1>
+      <p class="login-sub" id="semAcessoTxt">Peça ao administrador para liberar o Comunicar no seu perfil.</p>
+      <div class="sem-acesso-apps" id="semAcessoApps"></div>
+      <button type="button" class="login-link" data-sair>Entrar com outra conta</button>
+    </div>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+  <script src="/conta.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

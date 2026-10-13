@@ -1,0 +1,550 @@
+// -----------------------------------------------------------------------------
+// API do IndyCar Comunicar — o porteiro de TODAS as rotas e os seus handlers.
+// `criarApi(deps)` não conhece o banco nem o WhatsApp diretamente: recebe tudo
+// por parâmetro (deps.dados, deps.whatsapp, deps.carteiro, deps.autenticar…).
+// O server.js passa o de verdade; os testes (`npm test`) passam falsos e
+// conferem papéis, aprovação, auditoria e limites sem banco e sem rede.
+//
+// Ordem de cada chamada: rota existe? (404/405) → CORS → limite por IP →
+// login (401) → acesso ao app (403) → segundo fator (401) → troca de senha
+// obrigatória (403) → permissão do papel (403) → limite por usuário (429) →
+// JSON válido (400/413) → handler. Erro inesperado = 500 sem detalhe interno.
+// -----------------------------------------------------------------------------
+import { randomUUID } from 'node:crypto';
+import * as A from './acesso.js';
+import * as auto from './automacoes.js';
+
+const LIMITE_CORPO = 2_000_000; // importação de planilha pode ser grande
+
+/* Cliente de exemplo para a prévia das variações da IA. */
+const EXEMPLO_PREVIA = { nome: 'Maria Aparecida Souza', carro: 'HB20 2019', placa: 'FHR6F16', servico: 'troca de óleo', quando: 'amanhã às 09:00', meses: 6, detalhe: 'sábado até 12h' };
+
+function lerCorpo(req, limite = LIMITE_CORPO) {
+  return new Promise((resolve) => {
+    let raw = '', estourou = false;
+    req.on('data', (c) => {
+      if (estourou) return;
+      raw += c;
+      if (raw.length > limite) { estourou = true; raw = ''; resolve({ __grande: true }); req.resume(); }
+    });
+    req.on('end', () => { if (!estourou) resolve(A.lerJson(raw)); });
+    req.on('error', () => resolve({ __invalido: true }));
+  });
+}
+
+const mascararTel = (t) => { const d = String(t || '').replace(/\D/g, ''); return d ? `…${d.slice(-4)}` : null; };
+
+export function criarApi(deps) {
+  const {
+    dados, ia = null, whatsapp = {}, carteiro = {}, autenticar, versao = 'dev',
+    runnerToken = '', relogio = () => Date.now(), https = false, origensExtras = [],
+    supabase = { url: '', anon: '', configurado: false }, log = console,
+  } = deps;
+  const seguros = A.cabecalhosSeguros({ https });
+  const limIp = deps.limiteIp || A.criarLimitador({ janelaMs: 60_000, max: 300, relogio });
+  const limCaro = deps.limiteCaro || A.criarLimitador({ janelaMs: 60_000, max: 20, relogio });
+  const limAvulsa = deps.limiteAvulsa || A.criarLimitador({ janelaMs: 3_600_000, max: 30, relogio });
+  const marcarAcesso = A.criarMarcadorDeAcesso({ relogio });
+
+  // ---- respostas ---------------------------------------------------------------
+  function send(res, status, data, headers = {}) {
+    const body = typeof data === 'string' ? data : JSON.stringify(data);
+    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...seguros, ...(res.__cors || {}), ...headers });
+    res.end(body);
+  }
+  const ok = (res, d) => send(res, 200, d);
+  const bad = (res, msg, extra = {}) => send(res, 400, { erro: msg, ...extra });
+  const naoAchou = (res) => send(res, 404, { erro: 'Não encontrado.' });
+  const proibido = (res, perm) => send(res, 403, { erro: A.motivo403(perm), codigo: 'sem_permissao' });
+
+  const auditar = (u, acao, tabela, registro, detalhes) =>
+    Promise.resolve(dados.auditar?.(u?.id || null, acao, tabela, registro, detalhes)).catch(() => null);
+
+  /** Enfileira a campanha (já aprovada ou feita por gestor). */
+  async function executarCampanha({ corpo, detalhe, destinos, enviarEm, criador, campanhaId = null }) {
+    const porteiro = await dados.carregarPorteiro({ intervalo_minimo_dias: 0 });
+    const lote = randomUUID();
+    const linhas = [];
+    let pulados = 0;
+    for (const d of destinos) {
+      const clienteId = d.cliente_id ?? d.id ?? null;
+      const v = porteiro.podeReceber({ cliente_id: clienteId, telefone: d.telefone, tipo: 'campanha' });
+      if (!v.ok) { pulados++; continue; }
+      linhas.push({
+        cliente_id: clienteId, telefone: d.telefone, nome: d.nome ?? null, tipo: 'campanha',
+        corpo: dados.renderTemplate(corpo, { nome: d.nome, carro: d.carro, placa: d.placa, detalhe: detalhe || '' }),
+        enviar_em: enviarEm, criado_por: criador?.nome || null, criado_por_id: criador?.id || null, lote, campanha_id: campanhaId,
+      });
+    }
+    const enfileirados = linhas.length ? await dados.enfileirarVarios(linhas) : 0;
+    return { enfileirados, pulados, lote };
+  }
+
+  const segmentoValido = (f) => (dados.SEGMENTOS || []).some((s) => s.id === f);
+
+  async function resolverDestinos(body) {
+    let destinos = Array.isArray(body.destinos) ? body.destinos.slice(0, 2000) : [];
+    destinos = destinos.filter((d) => d && typeof d === 'object');
+    if (!destinos.length && body.segmento?.filtro) {
+      if (!segmentoValido(body.segmento.filtro)) return null;
+      const l = await dados.segmentar(String(body.segmento.filtro), body.segmento.valor);
+      destinos = l || [];
+    }
+    return destinos;
+  }
+
+  /** Atendente só mexe no que ele mesmo mandou; gestor em tudo. */
+  async function podeMexerNoEnvio(usuario, id) {
+    if (A.ehGestor(usuario)) return true;
+    const e = await dados.obterEnvio(id);
+    return !!e && e.criado_por_id === usuario.id;
+  }
+
+  // ---- handlers (chave = "MÉTODO padrão" de acesso.ROTAS) ------------------------
+  const H = {};
+  const rota = (metodo, padrao, fn) => { H[`${metodo} ${padrao}`] = fn; };
+  const U = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}';
+  const idDe = (pathname) => (pathname.match(new RegExp(U)) || [])[0];
+
+  rota('GET', '/api/config', ({ res }) => ok(res, {
+    supabaseUrl: supabase.url, supabaseAnonKey: supabase.anon, configurado: !!supabase.configurado,
+    app: 'IndyCar Comunicar', versao,
+  }));
+  rota('GET', '/api/ping', ({ res }) => ok(res, { ok: true, versao }));
+  rota('POST', '/api/rodar', async ({ req, res, url }) => {
+    const t = req.headers['x-runner-token'] || url.searchParams.get('t') || '';
+    if (!runnerToken || t !== runnerToken) return send(res, 403, { erro: 'Token do carteiro inválido.' });
+    return ok(res, await carteiro.rodar());
+  });
+
+  // ---- conta: perfil, sino, tarefas ----
+  rota('GET', '/api/perfil', ({ res, usuario }) => ok(res, {
+    id: usuario.id, nome: usuario.nome || '', email: usuario.email, papel: usuario.papel,
+    cargo: usuario.cargo || '', telefone: usuario.telefone || '', avatar_cor: usuario.avatar_cor || null,
+    apps: usuario.apps || [], precisa_trocar_senha: !!usuario.precisa_trocar_senha,
+    notificacoes: usuario.preferencias?.notificacoes || {},
+    pode: Object.fromEntries(Object.keys(A.PERMISSOES).map((p) => [p, A.pode(usuario, p)])),
+  }));
+  rota('PUT', '/api/perfil', async ({ res, usuario, body }) => {
+    const { campos, erro } = A.camposDoMeuPerfil(body);
+    if (erro) return bad(res, erro);
+    const p = await dados.atualizarMeuPerfil(usuario.id, campos);
+    deps.esquecerSessao?.(usuario.id);
+    return ok(res, { ok: true, nome: p?.nome, cargo: p?.cargo, telefone: p?.telefone, avatar_cor: p?.avatar_cor, notificacoes: p?.preferencias?.notificacoes || {} });
+  });
+  rota('POST', '/api/perfil/senha-trocada', async ({ res, usuario }) => {
+    await dados.senhaTrocada(usuario.id);
+    deps.esquecerSessao?.(usuario.id);
+    auditar(usuario, 'senha_trocada', 'perfis', usuario.id, null);
+    return ok(res, { ok: true });
+  });
+  rota('GET', '/api/notificacoes', async ({ res, usuario, url }) =>
+    ok(res, await dados.minhasNotificacoes(usuario.id, Number(url.searchParams.get('limite')) || 30)));
+  rota('POST', '/api/notificacoes/lidas', async ({ res, usuario }) => ok(res, { ok: true, marcadas: await dados.marcarTodasLidas(usuario.id) }));
+  rota('POST', `/api/notificacoes/${U}/lida`, async ({ res, usuario, url }) => {
+    const r = await dados.marcarNotificacaoLida(usuario.id, idDe(url.pathname));
+    return r ? ok(res, r) : naoAchou(res);
+  });
+  rota('GET', '/api/tarefas', async ({ res, usuario }) => ok(res, await dados.minhasTarefas(usuario.id)));
+  rota('POST', '/api/tarefas', async ({ res, usuario, body }) => {
+    const titulo = String(body.titulo || '').trim();
+    if (titulo.length < 2) return bad(res, 'Escreva o que precisa ser feito.');
+    if (titulo.length > 200) return bad(res, 'Título longo demais (até 200 letras).');
+    let vence = null;
+    if (body.vence_em) { const d = new Date(body.vence_em); if (Number.isNaN(d.getTime())) return bad(res, 'Prazo inválido.'); vence = d.toISOString(); }
+    for (const k of ['cliente_id', 'conversa_id', 'lead_id', 'agendamento_id', 'responsavel_id'])
+      if (body[k] != null && body[k] !== '' && !dados.ehUuid(body[k])) return bad(res, 'Identificador inválido.');
+    const t = await dados.criarTarefa({
+      titulo, descricao: body.descricao, prioridade: body.prioridade, vence_em: vence, origem: 'comunicar',
+      responsavel_id: body.responsavel_id || usuario.id, criado_por: usuario.id,
+      cliente_id: body.cliente_id, conversa_id: body.conversa_id, lead_id: body.lead_id, agendamento_id: body.agendamento_id,
+    });
+    return t ? ok(res, t) : bad(res, 'Não consegui criar a tarefa.');
+  });
+  rota('POST', `/api/tarefas/${U}/concluir`, async ({ res, usuario, url }) => {
+    const id = idDe(url.pathname);
+    const t = await dados.obterTarefa(id);
+    if (!t) return naoAchou(res);
+    if (!A.ehGestor(usuario) && t.responsavel_id !== usuario.id && t.criado_por !== usuario.id)
+      return send(res, 403, { erro: 'Essa tarefa é de outra pessoa.', codigo: 'sem_permissao' });
+    const r = await dados.concluirTarefa(id, usuario.id);
+    return r ? ok(res, r) : bad(res, 'Essa tarefa já foi concluída.');
+  });
+
+  // ---- painel ----
+  rota('GET', '/api/resumo', async ({ res }) => ok(res, await dados.resumo()));
+  rota('GET', '/api/saude', async ({ res }) => {
+    const s = await dados.saude();
+    const ur = carteiro.ultimaRodada?.();
+    return ok(res, { ...s, versao, ultimaRodada: ur?.em ? ur : s.ultimaRodada });
+  });
+  rota('GET', '/api/whatsapp/status', async ({ res }) => ok(res, await whatsapp.status()));
+
+  // ---- clientes ----
+  rota('GET', '/api/clientes', async ({ res, url }) => ok(res, await dados.listarClientes(String(url.searchParams.get('q') || '').slice(0, 80) || undefined)));
+  rota('PUT', `/api/clientes/${U}`, async ({ res, usuario, body, url }) => {
+    const id = idDe(url.pathname);
+    const mudaAceite = body.aceita_mensagens === true || body.aceita_mensagens === false;
+    if (body.aceita_mensagens === true && !A.pode(usuario, 'optout_religar')) return proibido(res, 'optout_religar');
+    const antes = mudaAceite ? await dados.obterCliente(id) : null;
+    const c = await dados.atualizarCliente(id, body, usuario.nome || usuario.email);
+    if (!c) return naoAchou(res);
+    if (mudaAceite && antes && antes.aceita_mensagens !== c.aceita_mensagens) {
+      auditar(usuario, c.aceita_mensagens ? 'cliente_optin' : 'cliente_optout', 'clientes', id,
+        { aceita_mensagens: c.aceita_mensagens, motivo: body.motivo ? String(body.motivo).slice(0, 120) : null });
+    }
+    return ok(res, c);
+  });
+  rota('GET', `/api/clientes/${U}/ficha`, async ({ res, url }) => {
+    const f = await dados.fichaCliente(idDe(url.pathname));
+    return f ? ok(res, f) : naoAchou(res);
+  });
+  rota('POST', '/api/clientes/importar', async ({ res, usuario, body }) => {
+    const linhas = Array.isArray(body.linhas) ? body.linhas.slice(0, 2000) : [];
+    if (!linhas.length) return bad(res, 'Nenhuma linha para importar.');
+    const r = await dados.importarClientes(linhas);
+    auditar(usuario, 'clientes_importados', 'clientes', null, { linhas: linhas.length, criados: r?.criados, atualizados: r?.atualizados, ignorados: r?.ignorados });
+    return ok(res, r);
+  });
+
+  // ---- segmentos ----
+  rota('GET', '/api/segmentos', ({ res }) => ok(res, dados.SEGMENTOS));
+  rota('GET', '/api/segmentos/previa', async ({ res, url }) => {
+    const filtro = url.searchParams.get('filtro') || 'todos';
+    if (!segmentoValido(filtro)) return bad(res, 'Segmento desconhecido.');
+    const lista = await dados.segmentar(filtro, url.searchParams.get('valor'));
+    return ok(res, { total: lista.length, amostra: lista.slice(0, 12).map((c) => ({ id: c.id, nome: c.nome, telefone: c.telefone, carro: c.carro })) });
+  });
+
+  // ---- fila ----
+  const filtrosEnvios = (sp, limite) => ({
+    status: sp.get('status') || undefined, tipo: sp.get('tipo') || undefined, q: String(sp.get('q') || '').slice(0, 80) || undefined,
+    de: sp.get('de') || undefined, ate: sp.get('ate') || undefined, intencao: sp.get('intencao') || undefined, limite,
+  });
+  rota('GET', '/api/envios', async ({ res, url }) =>
+    ok(res, await dados.listarEnvios(filtrosEnvios(url.searchParams, Math.min(Number(url.searchParams.get('limite')) || 300, 1000)))));
+
+  /* Avulsa (1 cliente, qualquer um da equipe), campanha (gestor: sai direto) ou
+     proposta (atendente com 2+ clientes: espera o gestor aprovar). */
+  rota('POST', '/api/envios', async ({ res, usuario, body }) => {
+    const corpo = String(body.corpo ?? '').trim();
+    if (!corpo) return bad(res, 'Escreva a mensagem.');
+    if (corpo.length > 2000) return bad(res, 'Mensagem longa demais (máximo 2.000 caracteres).');
+    const enviarEm = body.enviar_em ? new Date(body.enviar_em) : new Date(relogio());
+    if (Number.isNaN(enviarEm.getTime())) return bad(res, 'Data de envio inválida.');
+    const destinos = await resolverDestinos(body);
+    if (destinos === null) return bad(res, 'Segmento desconhecido.');
+    if (!destinos.length) return bad(res, 'Escolha pelo menos um cliente.');
+    const detalhe = body.detalhe ? String(body.detalhe).slice(0, 200) : '';
+    const caminho = auto.destinoDoPedido(usuario, destinos.length);
+
+    if (caminho === 'proposta') {
+      const segmento = !Array.isArray(body.destinos) || !body.destinos.length ? { filtro: String(body.segmento.filtro), valor: body.segmento.valor ?? null } : null;
+      const camp = await dados.criarPropostaCampanha({
+        corpo, detalhe, segmento,
+        destinos: segmento ? null : destinos.map((d) => ({ cliente_id: d.cliente_id ?? d.id ?? null, telefone: d.telefone, nome: d.nome ?? null, carro: d.carro ?? null, placa: d.placa ?? null })),
+        total_previsto: destinos.length, enviar_em: body.enviar_em ? enviarEm.toISOString() : null,
+        criado_por: usuario.id, criado_por_nome: usuario.nome || usuario.email,
+      });
+      const avisados = await auto.avisarPropostaDeCampanha({ campanha: camp, loja: dados }).catch(() => 0);
+      auditar(usuario, 'campanha_proposta', 'comunicar_campanhas', camp?.id, { total: destinos.length, segmento });
+      return ok(res, { ok: true, aguardando: true, campanha: camp, avisados, enfileirados: 0, pulados: 0 });
+    }
+
+    if (caminho === 'avulsa') {
+      if (!A.ehGestor(usuario) && !limAvulsa.tentar(`avulsa:${usuario.id}`).ok)
+        return send(res, 429, { erro: 'Muitas mensagens avulsas nesta hora. Para muita gente, monte uma campanha.' });
+      const d = destinos[0];
+      const porteiro = await dados.carregarPorteiro({ intervalo_minimo_dias: 0 });
+      const v = porteiro.podeReceber({ cliente_id: d.cliente_id ?? d.id ?? null, telefone: d.telefone, tipo: 'avulsa' });
+      if (!v.ok) return ok(res, { ok: true, enfileirados: 0, pulados: 1, motivo: v.motivo || 'cliente fora da lista' });
+      const criado = await dados.enfileirar({
+        cliente_id: d.cliente_id ?? d.id ?? null, telefone: d.telefone, nome: d.nome ?? null, tipo: 'avulsa',
+        corpo: dados.renderTemplate(corpo, { nome: d.nome, carro: d.carro, placa: d.placa, detalhe }),
+        enviar_em: enviarEm.toISOString(), criado_por: usuario.nome || usuario.email, criado_por_id: usuario.id,
+      });
+      auditar(usuario, 'mensagem_avulsa', 'posvenda_envios', criado?.id, { cliente_id: d.cliente_id ?? d.id ?? null });
+      return ok(res, { ok: true, enfileirados: criado ? 1 : 0, pulados: 0, envio: criado });
+    }
+
+    const r = await executarCampanha({ corpo, detalhe, destinos, enviarEm: enviarEm.toISOString(), criador: usuario });
+    auditar(usuario, 'campanha_enviada', 'posvenda_envios', r.lote, { total: destinos.length, enfileirados: r.enfileirados, pulados: r.pulados, segmento: body.segmento || null });
+    return ok(res, { ok: true, ...r });
+  });
+
+  const mexerNoEnvio = (fn, erro, acao) => async ({ res, usuario, url }) => {
+    const id = idDe(url.pathname);
+    if (!(await podeMexerNoEnvio(usuario, id))) return proibido(res, 'cancelar_qualquer');
+    const r = await fn(id);
+    if (!r) return bad(res, erro);
+    if (acao) auditar(usuario, acao, 'posvenda_envios', id, null);
+    return ok(res, r);
+  };
+  rota('POST', `/api/envios/${U}/cancelar`, mexerNoEnvio((id) => dados.cancelarEnvio(id), 'Só dá para cancelar mensagem que ainda não saiu.', 'envio_cancelado'));
+  rota('POST', `/api/envios/${U}/reenviar`, mexerNoEnvio((id) => dados.reenfileirar(id), 'Só dá para reenviar mensagem que falhou, foi cancelada ou pulada.', 'envio_reenviado'));
+  rota('POST', `/api/envios/${U}/desfazer-cancelamento`, mexerNoEnvio((id) => dados.desfazerCancelamento(id), 'Essa mensagem não está cancelada.', null));
+  rota('POST', `/api/envios/${U}/encaminhar`, async ({ res, usuario, url }) => {
+    const r = await dados.encaminharEnvio(idDe(url.pathname), usuario);
+    if (!r) return naoAchou(res);
+    return r.ok ? ok(res, r) : bad(res, r.erro);
+  });
+
+  /* Teste real: manda AGORA para o telefone de teste, fora da fila e da janela. */
+  rota('POST', '/api/envios/teste', async ({ res, usuario, body }) => {
+    const cfg = await dados.obterConfig();
+    const telefone = dados.soDigitos(body.telefone || cfg.telefone_teste);
+    if (telefone.length < 10) return bad(res, 'Informe um telefone de teste (em Réguas › Envio).');
+    const corpo = dados.renderTemplate(String(body.corpo || 'Teste do IndyCar Comunicar: se você recebeu isto, o WhatsApp está saindo. 🏁').slice(0, 2000),
+      { nome: usuario.nome || 'Equipe', carro: 'seu carro' });
+    const r = await whatsapp.enviar(telefone, corpo);
+    await dados.enfileirar({
+      telefone, nome: `Teste (${usuario.nome || 'gestor'})`, tipo: 'avulsa', corpo, criado_por: usuario.nome || usuario.email,
+      criado_por_id: usuario.id, status: r.ok ? 'enviado' : 'falhou',
+    }).then((e) => e && r.ok && dados.marcarEnvio(e.id, 'enviado', null, 1)).catch(() => {});
+    auditar(usuario, 'envio_teste', 'posvenda_envios', null, { telefone: mascararTel(telefone), ok: !!r.ok });
+    return r.ok ? ok(res, { ok: true }) : send(res, 502, { erro: r.erro });
+  });
+
+  rota('GET', '/api/envios.csv', async ({ res, usuario, url }) => {
+    const filtros = filtrosEnvios(url.searchParams, 5000);
+    const lista = await dados.listarEnvios(filtros);
+    auditar(usuario, 'exportar_csv', 'posvenda_envios', null, { linhas: lista.length, filtros: { ...filtros, limite: undefined } });
+    const nome = `comunicar-mensagens-${dados.hoje()}.csv`;
+    res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="${nome}"`, 'Cache-Control': 'no-store', ...seguros, ...(res.__cors || {}) });
+    return res.end(dados.paraCSV(lista, dados.COLUNAS_CSV_ENVIOS));
+  });
+
+  // ---- campanhas com aprovação ----
+  rota('GET', '/api/campanhas/aprovacao', async ({ res, usuario, url }) => {
+    const gestor = A.ehGestor(usuario);
+    const status = url.searchParams.get('status') || 'todas';
+    const lista = await dados.listarCampanhas({ status, criadoPor: gestor ? null : usuario.id, limite: 40 });
+    return ok(res, { lista, aguardando: lista.filter((c) => c.status === 'aguardando').length, gestor });
+  });
+  rota('POST', `/api/campanhas/${U}/aprovar`, async ({ res, usuario, url }) => {
+    const id = idDe(url.pathname);
+    const c = await dados.obterCampanha(id);
+    if (!c) return naoAchou(res);
+    if (c.status !== 'aguardando') return send(res, 409, { erro: 'Essa campanha já foi decidida.' });
+    const destinos = c.segmento?.filtro ? (segmentoValido(c.segmento.filtro) ? await dados.segmentar(c.segmento.filtro, c.segmento.valor) : []) : (c.destinos || []);
+    const marcada = await dados.decidirCampanha(id, { status: 'aprovada', decidido_por: usuario.id, decidido_por_nome: usuario.nome || usuario.email, decidido_em: new Date(relogio()).toISOString() });
+    if (!marcada) return send(res, 409, { erro: 'Outra pessoa decidiu essa campanha agora há pouco.' });
+    const quando = c.enviar_em && new Date(c.enviar_em).getTime() > relogio() ? c.enviar_em : new Date(relogio()).toISOString();
+    const r = await executarCampanha({ corpo: c.corpo, detalhe: c.detalhe, destinos: destinos || [], enviarEm: quando,
+      criador: { id: c.criado_por, nome: c.criado_por_nome }, campanhaId: id });
+    const final = await dados.completarCampanha(id, { lote: r.lote, enfileirados: r.enfileirados, pulados: r.pulados }) || { ...marcada, ...r };
+    await auto.avisarDecisaoDeCampanha({ campanha: final, loja: dados }).catch(() => null);
+    auditar(usuario, 'campanha_aprovada', 'comunicar_campanhas', id, { enfileirados: r.enfileirados, pulados: r.pulados, criado_por: c.criado_por });
+    return ok(res, { ok: true, campanha: final, ...r });
+  });
+  rota('POST', `/api/campanhas/${U}/recusar`, async ({ res, usuario, url, body }) => {
+    const id = idDe(url.pathname);
+    const motivo = String(body.motivo || '').trim().slice(0, 200) || null;
+    const c = await dados.decidirCampanha(id, { status: 'recusada', decidido_por: usuario.id, decidido_por_nome: usuario.nome || usuario.email, decidido_em: new Date(relogio()).toISOString(), motivo_recusa: motivo });
+    if (!c) return (await dados.obterCampanha(id)) ? send(res, 409, { erro: 'Essa campanha já foi decidida.' }) : naoAchou(res);
+    await auto.avisarDecisaoDeCampanha({ campanha: c, loja: dados }).catch(() => null);
+    auditar(usuario, 'campanha_recusada', 'comunicar_campanhas', id, { motivo, criado_por: c.criado_por });
+    return ok(res, { ok: true, campanha: c });
+  });
+  rota('POST', `/api/campanhas/${U}/cancelar`, async ({ res, usuario, url }) => {
+    const id = idDe(url.pathname);
+    const c0 = await dados.obterCampanha(id);
+    if (!c0) return naoAchou(res);
+    if (!A.ehGestor(usuario) && c0.criado_por !== usuario.id) return send(res, 403, { erro: 'Só quem propôs (ou um gestor) cancela essa campanha.', codigo: 'sem_permissao' });
+    const c = await dados.decidirCampanha(id, { status: 'cancelada', decidido_por: usuario.id, decidido_por_nome: usuario.nome || usuario.email, decidido_em: new Date(relogio()).toISOString() });
+    if (!c) return send(res, 409, { erro: 'Essa campanha já foi decidida.' });
+    auditar(usuario, 'campanha_cancelada', 'comunicar_campanhas', id, null);
+    return ok(res, { ok: true, campanha: c });
+  });
+
+  // ---- carteiro e prévia ----
+  rota('POST', '/api/rodar-agora', async ({ res, usuario }) => {
+    const r = await carteiro.rodar();
+    auditar(usuario, 'carteiro_manual', 'posvenda_envios', null, { enviados: r?.enviados ?? 0, falhas: r?.falhas ?? 0 });
+    return ok(res, r);
+  });
+  rota('GET', '/api/previa', async ({ res, url }) => {
+    const so = url.searchParams.get('regua') || null;
+    if (so && !dados.REGUAS.includes(so)) return bad(res, 'Régua desconhecida.');
+    return ok(res, await dados.gerarTudo({ simular: true, so }));
+  });
+
+  // ---- configuração (o caminho antigo /api/posvenda/config continua) ----
+  const lerConfig = async ({ res }) => ok(res, await dados.obterConfig());
+  const salvarConfig = async ({ res, usuario, body }) => {
+    const antes = await dados.obterConfig();
+    const depois = await dados.salvarConfig(body);
+    for (const r of dados.REGUAS) {
+      const k = `ativo_${r}`;
+      if (antes[k] !== depois[k]) auditar(usuario, depois[k] ? 'regua_ligada' : 'regua_desligada', 'posvenda_config', r, { regua: r });
+    }
+    if (antes.pausa_geral !== depois.pausa_geral) auditar(usuario, depois.pausa_geral ? 'pausa_geral_ligada' : 'pausa_geral_desligada', 'posvenda_config', 'pausa_geral', null);
+    const mudou = Object.keys(depois).filter((k) => !/^ativo_|^pausa_geral$|^updated_at$|^ia_resumo/.test(k) && JSON.stringify(antes[k]) !== JSON.stringify(depois[k]));
+    if (mudou.length) auditar(usuario, 'reguas_alteradas', 'posvenda_config', null, { campos: mudou });
+    return ok(res, depois);
+  };
+  rota('GET', '/api/comunicar/config', lerConfig);
+  rota('GET', '/api/posvenda/config', lerConfig);
+  rota('PUT', '/api/comunicar/config', salvarConfig);
+  rota('PUT', '/api/posvenda/config', salvarConfig);
+
+  // ---- regras de retorno ----
+  rota('GET', '/api/regras-retorno', async ({ res }) => ok(res, await dados.listarRegras()));
+  rota('POST', '/api/regras-retorno', async ({ res, usuario, body }) => {
+    try {
+      const r = await dados.criarRegra(body);
+      auditar(usuario, 'regra_retorno_criada', 'comunicar_regras_retorno', r?.id, { rotulo: r?.rotulo, meses: r?.meses });
+      return ok(res, r);
+    } catch (e) { return bad(res, e.message); }
+  });
+  rota('PUT', `/api/regras-retorno/${U}`, async ({ res, usuario, body, url }) => {
+    const id = idDe(url.pathname);
+    const r = await dados.atualizarRegra(id, body);
+    if (!r) return naoAchou(res);
+    auditar(usuario, 'regra_retorno_alterada', 'comunicar_regras_retorno', id, { campos: Object.keys(body || {}) });
+    return ok(res, r);
+  });
+  rota('DELETE', `/api/regras-retorno/${U}`, async ({ res, usuario, url }) => {
+    const id = idDe(url.pathname);
+    const okk = await dados.removerRegra(id);
+    if (okk) auditar(usuario, 'regra_retorno_apagada', 'comunicar_regras_retorno', id, null);
+    return ok(res, { ok: okk });
+  });
+
+  // ---- relatórios ----
+  rota('GET', '/api/relatorio', async ({ res, url }) => {
+    const regua = url.searchParams.get('regua');
+    if (regua && regua !== 'todas' && !dados.TIPOS_ENVIO.includes(regua)) return bad(res, 'Régua desconhecida.');
+    return ok(res, await dados.relatorioRegua(regua || null, Math.min(Math.max(Number(url.searchParams.get('semanas')) || 8, 2), 26)));
+  });
+  rota('GET', '/api/intencoes', async ({ res, url }) => ok(res, await dados.intencoesRecentes(Math.min(Math.max(Number(url.searchParams.get('dias')) || 7, 1), 60))));
+  rota('GET', '/api/aniversarios', async ({ res }) => ok(res, await dados.aniversariosDaBase()));
+
+  // ---- IA ----
+  const chamadaIA = deps.chamadaIA || (async (res) => send(res, 503, { erro: 'A IA não está disponível neste servidor.' }));
+  rota('GET', '/api/ia/status', async ({ res }) => {
+    const [cfg, chave, hojeN] = await Promise.all([dados.iaConfig(), dados.chaveIA(), dados.chamadasIAHoje()]);
+    return ok(res, { ativo: cfg.ativo, temChave: !!chave, autonomia: cfg.autonomia, chamadasHoje: hojeN, limite: cfg.limite });
+  });
+  rota('POST', '/api/ia/escrever', async ({ res, usuario, body }) => {
+    const regua = String(body.regua || 'campanha');
+    if (!ia?.VARIAVEIS_POR_REGUA?.[regua]) return bad(res, 'Régua desconhecida.');
+    const pedido = String(body.pedido || '').slice(0, 500), texto = String(body.texto || '').slice(0, 1500);
+    return chamadaIA(res, usuario, 'escrever_mensagem', (r) => `${r.variacoes.length} variações para ${dados.ROTULO_TIPO[regua] || regua}`, async (ctx) => {
+      const r = await ia.escreverMensagem({ regua, pedido, textoAtual: texto, quantidade: 3 }, ctx);
+      const ex = body.exemplo && typeof body.exemplo === 'object' ? body.exemplo : {};
+      const exemplo = {
+        ...EXEMPLO_PREVIA,
+        nome: String(ex.nome || EXEMPLO_PREVIA.nome).slice(0, 80), carro: String(ex.carro || EXEMPLO_PREVIA.carro).slice(0, 60),
+        placa: String(ex.placa || EXEMPLO_PREVIA.placa).slice(0, 10),
+        link_avaliacao: (await dados.obterConfig()).link_avaliacao || 'https://g.page/r/indycar',
+      };
+      const variacoes = r.variacoes.map((v) => ({ ...v, previa: dados.renderTemplate(v.texto, exemplo) }));
+      return { variacoes, modelo: r.modelo, uso: r.uso, __log: { regua, pedido: pedido || null, variacoes: variacoes.map((v) => ({ texto: v.texto, ok: v.ok, problemas: v.problemas })) } };
+    });
+  });
+  rota('POST', '/api/ia/publico', async ({ res, usuario }) =>
+    chamadaIA(res, usuario, 'sugerir_publico', (r) => `Sugeriu ${r.rotulo}${r.valor ? ` (${r.valor})` : ''}`, async (ctx) => {
+      const numeros = await dados.numerosDaSemana();
+      const r = await ia.sugerirPublico({ numeros, segmentos: dados.SEGMENTOS }, ctx);
+      const lista = segmentoValido(r.segmento) ? await dados.segmentar(r.segmento, r.valor).catch(() => []) : [];
+      return { ...r, previa: { total: (lista || []).length, amostra: (lista || []).slice(0, 8).map((c) => ({ id: c.id, nome: c.nome, carro: c.carro })) }, __log: { segmento: r.segmento, valor: r.valor, motivo: r.motivo, mensagem: r.mensagem } };
+    }));
+  const idadeResumoH = (cfg) => (cfg.ia_resumo_em ? (relogio() - new Date(cfg.ia_resumo_em).getTime()) / 36e5 : null);
+  rota('GET', '/api/ia/resumo', async ({ res }) => {
+    const cfg = await dados.obterConfig();
+    const h = idadeResumoH(cfg);
+    return ok(res, { texto: cfg.ia_resumo, em: cfg.ia_resumo_em, valido: h !== null && h < 6 });
+  });
+  rota('POST', '/api/ia/resumo', async ({ res, usuario, body }) => {
+    const cfg = await dados.obterConfig();
+    const h = idadeResumoH(cfg);
+    if (!body.forcar && cfg.ia_resumo && h !== null && h < 6) return ok(res, { texto: cfg.ia_resumo, em: cfg.ia_resumo_em, valido: true, cache: true });
+    return chamadaIA(res, usuario, 'resumo_semana', 'Resumo da semana do Comunicar', async (ctx) => {
+      const numeros = await dados.numerosDaSemana();
+      const r = await ia.resumirSemana({ numeros }, ctx);
+      if (!r.texto) throw new Error('a IA voltou sem texto');
+      const salvo = await dados.salvarResumoIA(r.texto).catch(() => null);
+      return { texto: r.texto, em: salvo?.ia_resumo_em || new Date(relogio()).toISOString(), valido: true, cache: false, modelo: r.modelo, uso: r.uso, __log: { texto: r.texto } };
+    });
+  });
+  rota('POST', '/api/ia/ler-respostas', async ({ res }) => {
+    const r = await carteiro.lerRespostas();
+    return r?.erro ? send(res, 503, r) : ok(res, r);
+  });
+
+  // ---- modelos e satisfação ----
+  rota('GET', '/api/modelos', async ({ res }) => ok(res, await dados.listarModelos()));
+  rota('GET', '/api/satisfacao', async ({ res }) => ok(res, await dados.listarRespostas()));
+  rota('POST', '/api/satisfacao', async ({ res, usuario, body }) => {
+    if (!dados.ehUuid(body.cliente_id)) return bad(res, 'Escolha o cliente.');
+    if (body.satisfeito !== true && body.satisfeito !== false) return bad(res, 'Diga se o cliente ficou satisfeito ou não.');
+    return ok(res, await dados.registrarResposta({ ...body, registrado_por: usuario.nome || usuario.email }));
+  });
+  rota('DELETE', `/api/satisfacao/${U}`, async ({ res, usuario, url }) => {
+    const id = idDe(url.pathname);
+    await dados.removerResposta(id);
+    auditar(usuario, 'satisfacao_apagada', 'posvenda_respostas', id, null);
+    return ok(res, { ok: true });
+  });
+
+  // ---- o porteiro ------------------------------------------------------------------
+  async function api(req, res, url) {
+    const { pathname } = url;
+    const m = req.method;
+
+    // CORS: só o ecossistema; outro site não lê nada daqui
+    const origem = req.headers.origin;
+    if (origem) {
+      if (!A.origemPermitida(origem, origensExtras)) return send(res, 403, { erro: 'Origem não permitida.' });
+      res.__cors = { 'Access-Control-Allow-Origin': origem, Vary: 'Origin', 'Access-Control-Allow-Credentials': 'false' };
+      if (m === 'OPTIONS') {
+        res.writeHead(204, { ...res.__cors, 'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE', 'Access-Control-Allow-Headers': 'Authorization,Content-Type,X-Runner-Token', 'Access-Control-Max-Age': '600', ...seguros });
+        return res.end();
+      }
+    }
+
+    const regra = A.regraDaRota(m, pathname);
+    if (!regra) return naoAchou(res);
+    if (regra.metodoErrado) return send(res, 405, { erro: 'Método não permitido.' });
+    const fn = H[`${regra.metodo} ${regra.padrao}`];
+    if (!fn) return naoAchou(res); // rota sem handler: fecha
+
+    const ip = A.ipDe(req);
+    const li = limIp.tentar(`ip:${ip}`);
+    if (!li.ok) return send(res, 429, { erro: 'Muitas requisições. Espere um pouco.' }, { 'Retry-After': String(li.esperaS) });
+
+    let usuario = null;
+    if (!regra.publica) {
+      const a = await autenticar(req);
+      if (!a?.usuario) return send(res, a?.status || 401, { erro: a?.erro || 'Faça login para usar o Comunicar.', codigo: a?.codigo || 'sem_login', apps: a?.apps });
+      usuario = a.usuario;
+      if (usuario.precisa_trocar_senha && regra.perm !== 'conta')
+        return send(res, 403, { erro: 'Troque sua senha para continuar.', codigo: 'trocar_senha' });
+      if (!A.pode(usuario, regra.perm)) return proibido(res, regra.perm);
+      if (regra.caro) {
+        const lc = limCaro.tentar(`u:${usuario.id}`);
+        if (!lc.ok) return send(res, 429, { erro: `Calma: muitas ações seguidas. Tente de novo em ${lc.esperaS} s.` }, { 'Retry-After': String(lc.esperaS) });
+      }
+      if (marcarAcesso(usuario.id)) Promise.resolve(dados.marcarAcesso?.(usuario.id)).catch(() => {});
+    }
+
+    let body = {};
+    if (m === 'POST' || m === 'PUT' || m === 'PATCH') {
+      body = await lerCorpo(req);
+      if (body.__grande) return send(res, 413, { erro: 'Conteúdo grande demais.' });
+      if (body.__invalido) return bad(res, 'O corpo da requisição não é um JSON válido.');
+    }
+    return fn({ req, res, url, usuario, body });
+  }
+
+  /** Chamado pelo servidor quando algo explode: nada de detalhe interno na resposta. */
+  function erroInterno(res, e) {
+    const ref = randomUUID().slice(0, 8);
+    log.error?.(`[${ref}]`, e?.stack || e);
+    if (!res.headersSent) send(res, 500, { erro: `Algo deu errado aqui dentro. Tente de novo (ref. ${ref}).` });
+    else res.end();
+  }
+
+  return { api, erroInterno, handlers: H, send };
+}

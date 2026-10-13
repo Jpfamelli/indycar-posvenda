@@ -385,6 +385,12 @@ export async function lerRespostas({ loja, ctx, autonomia = 'confirmar', limite 
         if (ok) { campos.encaminhado_em = new Date().toISOString(); saida.chamaram++; }
       } else if (chama) saida.propostas++;
       await loja.gravarIntencao(e.id, campos);
+      // rodada 3: a equipe fica sabendo (tarefa para o dono da conversa; reclamação avisa os gestores)
+      if (loja.depoisDaLeitura) {
+        const eq = await loja.depoisDaLeitura(e, r).catch((err) => ({ erro: String(err?.message || err) }));
+        if (eq?.tarefa && !e.tarefa_id) saida.tarefas = (saida.tarefas || 0) + 1;
+        if (eq?.avisados) saida.avisados = (saida.avisados || 0) + eq.avisados;
+      }
       await loja.registrar({
         tipo: 'ler_resposta', status: executa ? 'executada' : (chama ? 'proposta' : 'executada'),
         cliente_id: e.cliente_id || null, lead_id: e.lead_id || null, conversa_id: e.conversa_id || null,

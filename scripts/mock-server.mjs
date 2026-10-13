@@ -5,6 +5,10 @@
 //   npm run mock   (ou  node scripts/mock-server.mjs)  → http://localhost:3511
 //   abra  http://localhost:3511/?papel=atendente  para ver o modo "só olha"
 //   abra  http://localhost:3511/?saude=ok         para esconder a faixa de saúde
+//   rodada 3 — ?papel= admin | gestor | atendente | atendente2 | agenda | desativado |
+//   sem_app | trocar_senha | mfa   (o porteiro é o acesso.js REAL: mesmas regras do
+//   servidor) · ?logado=0 abre a tela de login (senha "errada" simula erro;
+//   código de duas etapas de teste: 123456)
 //
 // Serve a pasta public/ de verdade (o mesmo index.html, app.js e styles.css que
 // vão para produção) e responde /api/* com dados inventados, guardados na
@@ -24,6 +28,8 @@ import {
   instanteSP, dataBanco,
 } from '../dados.js';
 import * as ia from '../ia.js';
+import * as A from '../acesso.js';
+import * as auto from '../automacoes.js';
 
 /* IA de MENTIRA: o mock usa as funções REAIS do ia.js (validação, correção de
    vocabulário, prévia) com um cliente falso — nada vai para a Anthropic. */
@@ -67,6 +73,25 @@ const horasAtras = (h) => new Date(Date.now() - h * 3600000).toISOString();
 const diasAtras = (d) => new Date(Date.now() - d * 86400000).toISOString();
 const hojeAs = (hm) => new Date(`${hoje()}T${hm}:00-03:00`).toISOString();
 const mes = hoje().slice(5, 7);
+
+// ---- perfis de mentira (rodada 3) ------------------------------------------
+const PID = (n) => `00000000-0000-4000-9000-${String(n).padStart(12, '0')}`;
+const TODOS_APPS = ['atendimento', 'crm', 'agenda', 'comunicar', 'orcador', 'ads'];
+const PERFIS = {
+  admin:        { id: PID(1), nome:'João Pedro Famelli', email:'joao@indycartaubate.com', papel:'admin', ativo:true, apps: TODOS_APPS, cargo:'Dono' },
+  gestor:       { id: PID(2), nome:'Gisele Prado', email:'gisele@indycartaubate.com', papel:'gestor', ativo:true, apps:['comunicar', 'crm', 'atendimento'], cargo:'Gerente' },
+  atendente:    { id: PID(3), nome:'Leonardo', email:'leonardo@indycartaubate.com', papel:'atendente', ativo:true, apps:['comunicar', 'atendimento', 'crm', 'agenda'], cargo:'Consultor' },
+  atendente2:   { id: PID(4), nome:'Bia Ramos', email:'bia@indycartaubate.com', papel:'atendente', ativo:true, apps:['comunicar', 'atendimento'] },
+  agenda:       { id: PID(5), nome:'Franklin', email:'franklin@indycartaubate.com', papel:'agenda', ativo:true, apps:['agenda'] },
+  sem_app:      { id: PID(6), nome:'Carla', email:'carla@indycartaubate.com', papel:'atendente', ativo:true, apps:['atendimento', 'crm'] },
+  desativado:   { id: PID(7), nome:'Ex-funcionário', email:'ex@indycartaubate.com', papel:'atendente', ativo:false, apps:['comunicar'] },
+  trocar_senha: { id: PID(8), nome:'Nova Atendente', email:'nova@indycartaubate.com', papel:'atendente', ativo:true, apps:['comunicar'], precisa_trocar_senha:true },
+  mfa:          { id: PID(9), nome:'Marina Duas Etapas', email:'marina@indycartaubate.com', papel:'gestor', ativo:true, apps:['comunicar'], mfa:true },
+};
+let PAPEL = 'admin', LOGADO = true;
+const perfil = () => PERFIS[PAPEL] || PERFIS.admin;
+const ehGestor = () => A.ehGestor(perfil());
+const nomeDe = (id) => Object.values(PERFIS).find((x) => x.id === id)?.nome || null;
 
 // ---- clientes -------------------------------------------------------------
 const cli = (o) => ({ id: uuid(), telefone:'12999990000', carro:null, carro_modelo:null, placa:null, email:null, nascimento:null,
@@ -161,7 +186,7 @@ const env = (c, tipo, extra = {}) => {
   return e;
 };
 const enviado = (h, extra = {}) => ({ status:'enviado', enviado_em: horasAtras(h), enviar_em: horasAtras(h + 0.2), created_at: horasAtras(h + 1), tentativas:1, ...extra });
-let ENVIOS = [
+const ENVIOS_SEMENTE = [
   env(C(0), 'lembrete', { corpo: renderTemplate(CFG.msg_lembrete, { nome:C(0).nome, carro:C(0).carro, servico:'revisão de freios', quando: quandoRelativo(somarDias(hoje(), 1), '09:00') }), enviar_em: horasAtras(-2) }),
   env(C(10), 'lembrete', { corpo: renderTemplate(CFG.msg_lembrete, { nome:C(10).nome, carro:C(10).carro, servico:'diagnóstico com scanner', quando: quandoRelativo(hoje(), '15:30') }), ...enviado(3, { resposta:'Confirmado, obrigado!', respondido_em: horasAtras(2.5) }) }),
   env(C(1), 'posvenda', { corpo: renderTemplate(CFG.msg_posvenda, { nome:C(1).nome, carro:C(1).carro, servico:'troca de óleo de câmbio' }), ...enviado(26, { resposta:'Ficou ótimo, carro tá outro! 👍', respondido_em: horasAtras(25) }) }),
@@ -185,6 +210,49 @@ let ENVIOS = [
   env(C(10), 'orcamento', { status:'pendente', enviar_em: horasAtras(3), created_at: horasAtras(4) }),
 ];
 
+const PERFIS_BASE = JSON.parse(JSON.stringify(PERFIS));
+let ENVIOS;
+const semearEnvios = () => { ENVIOS = ENVIOS_SEMENTE.map((e) => ({ ...e, criado_por_id: e.criado_por === 'Leonardo' ? PID(3) : (e.criado_por === 'João Pedro' ? PID(1) : null) })); };
+semearEnvios();
+
+// ---- rodada 3: notificações, tarefas e campanhas aguardando aprovação ---------------
+let NOTIFS = [], TAREFAS = [], CAMPANHAS = [];
+const notif = (perfilId, tipo, titulo, corpo, link, horas, lida = false) => ({ id: uuid(), perfil_id: perfilId, tipo, titulo, corpo, link, app:'comunicar', lida_em: lida ? horasAtras(horas - 0.1) : null, created_at: horasAtras(horas) });
+const tarefa = (resp, titulo, descricao, cliente, prioridade, venceH, extra = {}) => ({ id: uuid(), titulo, descricao, responsavel_id: resp, criado_por: null, cliente_id: cliente?.id || null,
+  cliente_nome: cliente?.nome || null, cliente_telefone: cliente?.telefone || null, origem:'comunicar', prioridade, vence_em: horasAtras(-venceH), status:'aberta', created_at: horasAtras(26), ...extra });
+/** Semente da rodada 3 — `/?semente=1` volta tudo ao começo (os testes de navegador usam). */
+function semearR3() {
+  NOTIFS = []; TAREFAS = []; CAMPANHAS = [];
+  for (const k of Object.keys(PERFIS)) PERFIS[k] = JSON.parse(JSON.stringify(PERFIS_BASE[k]));
+  for (const k of ['admin', 'gestor', 'mfa']) {
+    const id = PERFIS[k].id;
+    NOTIFS.push(notif(id, 'reclamacao', 'Donizetti Ferreira reclamou', 'barulho na roda voltou depois da pastilha', `/?cliente=${C(2).id}`, 25.8));
+    NOTIFS.push(notif(id, 'resumo_semanal', 'Resumo da semana do Comunicar', '9 mensagens saíram, 5 responderam (56%) · 2 agendaram pela mensagem · 1 reclamação.', '/', 30, true));
+  }
+  NOTIFS.push(notif(PID(3), 'tarefa', 'Nova tarefa: Reclamou: Donizetti Ferreira', 'Prazo: hoje', null, 25.7));
+  NOTIFS.push(notif(PID(3), 'campanha', 'Campanha recusada por Gisele Prado', 'Esta semana não: o pátio está cheio.', '/?tela=campanhas', 50, true));
+  NOTIFS.push({ ...notif(PID(3), 'aguardando', 'Marcos Vinícius está esperando um consultor', 'Quanto fica a revisão completa?', `/?conversa=${uuid()}`, 2), app:'atendimento' });
+  TAREFAS.push(tarefa(PID(3), 'Reclamou: Donizetti Ferreira', 'Respondeu à mensagem de Pós-venda: "Não ficou bom, continua com barulho na roda"\nLeitura da IA: barulho na roda voltou depois da pastilha\nLigue ou responda hoje.', C(2), 1, -1));
+  TAREFAS.push(tarefa(PID(3), 'Quer orçamento: Marcos Vinícius', 'Respondeu à mensagem de Revisão: "Quanto fica a revisão completa?"\nMonte o orçamento ou chame para o diagnóstico gratuito.', C(9), 2, 3));
+  TAREFAS.push(tarefa(PID(1), 'Conferir a chave do CodeWords', 'Régua Reativação: 3 mensagens falharam.', null, 2, 20, { origem:'manual' }));
+  CAMPANHAS.push({ id: uuid(), status:'aguardando', corpo: MODELOS[0].corpo, detalhe:null, segmento:{ filtro:'todos', valor:null }, destinos:null, total_previsto: 10,
+    enviar_em:null, criado_por: PID(3), criado_por_nome:'Leonardo', decidido_por:null, decidido_por_nome:null, decidido_em:null, motivo_recusa:null, created_at: horasAtras(3) });
+  CAMPANHAS.push({ id: uuid(), status:'recusada', corpo: MODELOS[1].corpo, detalhe:null, segmento:{ filtro:'sem_voltar', valor:6 }, destinos:null, total_previsto: 4,
+    enviar_em:null, criado_por: PID(3), criado_por_nome:'Leonardo', decidido_por: PID(2), decidido_por_nome:'Gisele Prado', decidido_em: horasAtras(50), motivo_recusa:'Esta semana não: o pátio está cheio.', created_at: horasAtras(52) });
+}
+semearR3();
+
+/** O mesmo papel de notificar do banco: dedupe por (perfil, chave). */
+const lojaMock = {
+  gestores: async (tipo) => Object.values(PERFIS).filter((x) => x.ativo && (x.papel === 'admin' || (x.papel === 'gestor' && x.apps.includes('comunicar')))
+    && (!tipo || x.preferencias?.notificacoes?.[tipo] !== false)).map((x) => x.id),
+  notificar: async (n) => {
+    if (n.chave && NOTIFS.some((x) => x.perfil_id === n.perfil && x.chave === n.chave)) return null;
+    const x = { id: uuid(), perfil_id: n.perfil, tipo: n.tipo, titulo: n.titulo, corpo: n.corpo, link: n.link, app: n.app || 'comunicar', chave: n.chave, lida_em: null, created_at: agora() };
+    NOTIFS.unshift(x); return x.id;
+  },
+};
+
 // ---- satisfação -----------------------------------------------------------
 let RESPOSTAS = [
   { id: uuid(), cliente_id:C(1).id, envio_id: ENVIOS[2].id, satisfeito:true, nota:null, comentario:'Ficou ótimo, carro tá outro! 👍', registrado_por:'WhatsApp (automático)', origem:'whatsapp', created_at: horasAtras(25) },
@@ -197,8 +265,7 @@ let RESPOSTAS = [
 // ---- saúde e carteiro -------------------------------------------------------
 let SAUDE_OK = false;
 const ultimaRodada = { em: horasAtras(0.4), resultado:{ ok:true, gerado:{ criados:3, pulados:1 }, enviados:3, falhas:0 } };
-let PAPEL = 'admin';
-const ehGestor = () => ['admin', 'gestor'].includes(PAPEL);
+
 
 const lerCliente = (c) => c && ({ ...c });
 const digitos = (t) => String(t ?? '').replace(/\D/g, '');
@@ -298,21 +365,37 @@ function filtrarExtra(l, sp) {
 }
 
 const json = (res, code, obj) => { res.writeHead(code, { 'Content-Type':'application/json; charset=utf-8', 'Cache-Control':'no-store' }); res.end(JSON.stringify(obj)); };
-const DUBLE_SUPABASE = `<script>window.supabase={createClient:()=>({auth:{
-  getSession:async()=>({data:{session:{access_token:'mock'}}}),
-  signInWithPassword:async()=>({error:null}),signOut:async()=>({error:null}),
-  onAuthStateChange:()=>({data:{subscription:{unsubscribe(){}}}})}})};</script>`;
+/* Dublê do supabase-js: sessão, login (senha "errada" falha), esqueci a senha,
+   senha nova, sair e duas etapas (código 123456). Nada sai daqui. */
+const dubleSupabase = () => `<script>window.__MOCK=${JSON.stringify({ logado: LOGADO, mfa: !!perfil().mfa, email: perfil().email })};
+(function(){var M=window.__MOCK,aal2=!M.mfa,sessao=M.logado,fatores=M.mfa?[{id:'f1',status:'verified',friendly_name:'Celular',created_at:'2026-10-01T12:00:00Z'}]:[];
+var tok=function(){return aal2?'mock-aal2':'mock-aal1'};
+window.supabase={createClient:function(){return{auth:{
+  getSession:async function(){return{data:{session:sessao?{access_token:tok(),user:{email:M.email}}:null}}},
+  refreshSession:async function(){return{data:{session:sessao?{access_token:tok()}:null}}},
+  signInWithPassword:async function(c){if(c.password==='errada')return{error:{message:'Invalid login credentials'}};sessao=true;return{error:null}},
+  signOut:async function(){sessao=false;return{error:null}},
+  resetPasswordForEmail:async function(){return{error:null}},
+  updateUser:async function(d){if(d&&d.password==='senha-fraca')return{error:{message:'Password is known to be weak'}};return{data:{},error:null}},
+  onAuthStateChange:function(){return{data:{subscription:{unsubscribe:function(){}}}}},
+  mfa:{getAuthenticatorAssuranceLevel:async function(){return{data:{currentLevel:aal2?'aal2':'aal1',nextLevel:fatores.some(function(f){return f.status==='verified'})?'aal2':'aal1'}}},
+    listFactors:async function(){return{data:{totp:fatores,all:fatores},error:null}},
+    challengeAndVerify:async function(a){if(a.code!=='123456')return{error:{message:'Invalid TOTP code entered'}};aal2=true;fatores.forEach(function(f){if(f.id===a.factorId)f.status='verified'});return{data:{},error:null}},
+    enroll:async function(){var f={id:'f'+(fatores.length+2),status:'unverified',friendly_name:'Comunicar'};fatores.push(f);return{data:{id:f.id,totp:{qr_code:'data:image/svg+xml;utf8,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="180" height="180"><rect width="180" height="180" fill="#fff"/><rect x="20" y="20" width="40" height="40"/><rect x="120" y="20" width="40" height="40"/><rect x="20" y="120" width="40" height="40"/><rect x="80" y="80" width="20" height="20"/></svg>'),secret:'JBSWY3DPEHPK3PXP'}},error:null}},
+    unenroll:async function(a){fatores=fatores.filter(function(f){return f.id!==a.factorId});return{data:{},error:null}}}}}}};})();</script>`;
 
 http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const p = url.pathname, m = req.method;
   if (!p.startsWith('/api/')) {
     if (p === '/' || p === '/index.html') {
-      if (url.searchParams.has('papel')) PAPEL = url.searchParams.get('papel') === 'atendente' ? 'atendente' : 'admin';
+      if (url.searchParams.has('papel')) { const k = url.searchParams.get('papel'); PAPEL = PERFIS[k] ? k : 'admin'; }
+      LOGADO = url.searchParams.get('logado') !== '0';
+      if (url.searchParams.get('semente') === '1') { semearEnvios(); semearR3(); }
       if (url.searchParams.has('saude')) SAUDE_OK = url.searchParams.get('saude') === 'ok';
       if (url.searchParams.has('ia')) IA_LIGADA = url.searchParams.get('ia') !== 'off';
       const html = fs.readFileSync(path.join(PUBLIC, 'index.html'), 'utf8')
-        .replace(/<script src="https:\/\/cdn\.jsdelivr\.net\/npm\/@supabase[^"]*"><\/script>/, DUBLE_SUPABASE);
+        .replace(/<script src="https:\/\/cdn\.jsdelivr\.net\/npm\/@supabase[^"]*"><\/script>/, dubleSupabase());
       res.writeHead(200, { 'Content-Type': MIME['.html'] }); return res.end(html);
     }
     if (p === '/sw.js') { res.writeHead(200, { 'Content-Type': MIME['.js'] }); return res.end('/* sem service worker no modo de teste */'); }
@@ -328,9 +411,86 @@ http.createServer(async (req, res) => {
   const naoGestor = () => json(res, 403, { erro:'Só gestor altera as réguas.' });
   let mm;
 
-  if (p === '/api/config') return json(res, 200, { configurado:true, supabaseUrl:'http://mock.local', supabaseAnonKey:'mock', app:'IndyCar Comunicar', versao:'2.0.0-mock' });
-  if (p === '/api/ping') return json(res, 200, { ok:true, versao:'2.0.0-mock' });
-  if (p === '/api/perfil') return json(res, 200, { id:'u1', nome: PAPEL === 'atendente' ? 'Leonardo' : 'João Pedro Famelli', email:'teste@indycartaubate.com', papel:PAPEL });
+  if (p === '/api/config') return json(res, 200, { configurado:true, supabaseUrl:'http://mock.local', supabaseAnonKey:'mock', app:'IndyCar Comunicar', versao:'3.0.0-mock' });
+  if (p === '/api/ping') return json(res, 200, { ok:true, versao:'3.0.0-mock' });
+
+  /* Porteiro: as MESMAS regras do servidor (acesso.js) — rota, acesso ao app,
+     segundo fator, troca de senha obrigatória e permissão do papel. */
+  const regra = A.regraDaRota(m, p);
+  if (regra?.metodoErrado) return json(res, 405, { erro:'Método não permitido.' });
+  const eu = perfil();
+  if (regra && !regra.publica) {
+    if (!/^Bearer mock/.test(req.headers.authorization || '')) return json(res, 401, { erro:'Faça login para usar o Comunicar.', codigo:'sem_login' });
+    const v = A.verificarAcesso(eu);
+    if (!v.ok) return json(res, v.status, { erro: v.erro, codigo: v.codigo, apps: v.apps });
+    if (eu.mfa && req.headers.authorization !== 'Bearer mock-aal2') return json(res, 401, { erro:'Digite o código do seu app autenticador.', codigo:'mfa_pendente' });
+    if (eu.precisa_trocar_senha && regra.perm !== 'conta') return json(res, 403, { erro:'Troque sua senha para continuar.', codigo:'trocar_senha' });
+    if (!A.pode(eu, regra.perm)) return json(res, 403, { erro: A.motivo403(regra.perm), codigo:'sem_permissao' });
+  }
+
+  // ---- conta: perfil, sino, tarefas
+  if (p === '/api/perfil' && m === 'GET') return json(res, 200, {
+    id: eu.id, nome: eu.nome, email: eu.email, papel: eu.papel, cargo: eu.cargo || '', telefone: eu.telefone || '', avatar_cor: eu.avatar_cor || null,
+    apps: eu.apps, precisa_trocar_senha: !!eu.precisa_trocar_senha, notificacoes: eu.preferencias?.notificacoes || {},
+    pode: Object.fromEntries(Object.keys(A.PERMISSOES).map((k) => [k, A.pode(eu, k)])) });
+  if (p === '/api/perfil' && m === 'PUT') {
+    const { campos, erro } = A.camposDoMeuPerfil(body);
+    if (erro) return json(res, 400, { erro });
+    if (campos.preferencias) campos.preferencias = { notificacoes: { ...(eu.preferencias?.notificacoes || {}), ...campos.preferencias.notificacoes } };
+    Object.assign(eu, campos);
+    return json(res, 200, { ok:true, nome: eu.nome, cargo: eu.cargo, telefone: eu.telefone, avatar_cor: eu.avatar_cor, notificacoes: eu.preferencias?.notificacoes || {} });
+  }
+  if (p === '/api/perfil/senha-trocada' && m === 'POST') { eu.precisa_trocar_senha = false; return json(res, 200, { ok:true }); }
+  if (p === '/api/notificacoes' && m === 'GET') {
+    const minhas = NOTIFS.filter((n) => n.perfil_id === eu.id).sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+    return json(res, 200, { lista: minhas.slice(0, 30), naoLidas: minhas.filter((n) => !n.lida_em).length });
+  }
+  if (p === '/api/notificacoes/lidas' && m === 'POST') { let n = 0; for (const x of NOTIFS) if (x.perfil_id === eu.id && !x.lida_em) { x.lida_em = agora(); n++; } return json(res, 200, { ok:true, marcadas:n }); }
+  if ((mm = p.match(/^\/api\/notificacoes\/([0-9a-f-]+)\/lida$/)) && m === 'POST') {
+    const x = NOTIFS.find((n) => n.id === mm[1] && n.perfil_id === eu.id); if (!x) return json(res, 404, { erro:'Não encontrado.' });
+    x.lida_em = agora(); return json(res, 200, x);
+  }
+  if (p === '/api/tarefas' && m === 'GET') return json(res, 200, TAREFAS.filter((t) => t.responsavel_id === eu.id && t.status === 'aberta')
+    .sort((a, b) => a.prioridade - b.prioridade || String(a.vence_em || 'z').localeCompare(String(b.vence_em || 'z'))));
+  if (p === '/api/tarefas' && m === 'POST') {
+    const titulo = String(body.titulo || '').trim();
+    if (titulo.length < 2) return json(res, 400, { erro:'Escreva o que precisa ser feito.' });
+    const c = porId(body.cliente_id);
+    const t = tarefa(body.responsavel_id || eu.id, titulo, body.descricao || null, c, [1, 2, 3].includes(Number(body.prioridade)) ? Number(body.prioridade) : 2, 0,
+      { vence_em: body.vence_em || null, criado_por: eu.id, created_at: agora() });
+    TAREFAS.unshift(t); return json(res, 200, t);
+  }
+  if ((mm = p.match(/^\/api\/tarefas\/([0-9a-f-]+)\/concluir$/)) && m === 'POST') {
+    const t = TAREFAS.find((x) => x.id === mm[1]); if (!t) return json(res, 404, { erro:'Não encontrado.' });
+    if (!ehGestor() && t.responsavel_id !== eu.id && t.criado_por !== eu.id) return json(res, 403, { erro:'Essa tarefa é de outra pessoa.', codigo:'sem_permissao' });
+    if (t.status !== 'aberta') return json(res, 400, { erro:'Essa tarefa já foi concluída.' });
+    t.status = 'feita'; return json(res, 200, t);
+  }
+
+  // ---- campanhas com aprovação
+  if (p === '/api/campanhas/aprovacao' && m === 'GET') {
+    const st = url.searchParams.get('status');
+    const l = CAMPANHAS.filter((c) => (ehGestor() || c.criado_por === eu.id) && (!st || st === 'todas' || c.status === st));
+    return json(res, 200, { lista: l, aguardando: l.filter((c) => c.status === 'aguardando').length, gestor: ehGestor() });
+  }
+  if ((mm = p.match(/^\/api\/campanhas\/([0-9a-f-]+)\/(aprovar|recusar|cancelar)$/)) && m === 'POST') {
+    const c = CAMPANHAS.find((x) => x.id === mm[1]); if (!c) return json(res, 404, { erro:'Não encontrado.' });
+    if (c.status !== 'aguardando') return json(res, 409, { erro:'Essa campanha já foi decidida.' });
+    if (mm[2] === 'cancelar' && !ehGestor() && c.criado_por !== eu.id) return json(res, 403, { erro:'Só quem propôs (ou um gestor) cancela essa campanha.', codigo:'sem_permissao' });
+    Object.assign(c, { decidido_por: eu.id, decidido_por_nome: eu.nome, decidido_em: agora() });
+    if (mm[2] === 'recusar') { c.status = 'recusada'; c.motivo_recusa = String(body.motivo || '').slice(0, 200) || null; }
+    if (mm[2] === 'cancelar') c.status = 'cancelada';
+    let r = { enfileirados:0, pulados:0 };
+    if (mm[2] === 'aprovar') {
+      c.status = 'aprovada';
+      const lista = c.segmento ? (segmentar(c.segmento.filtro, c.segmento.valor) || []) : (c.destinos || []).map((d) => porId(d.cliente_id)).filter(Boolean);
+      const lote = uuid();
+      for (const cli of lista) { ENVIOS.unshift(env(cli, 'campanha', { lote, campanha_id: c.id, corpo: renderTemplate(c.corpo, { nome: cli.nome, carro: cli.carro, placa: cli.placa }), enviar_em: agora(), created_at: agora(), criado_por: c.criado_por_nome, criado_por_id: c.criado_por })); r.enfileirados++; }
+      Object.assign(c, { lote, enfileirados: r.enfileirados, pulados: 0 });
+    }
+    if (mm[2] !== 'cancelar') await auto.avisarDecisaoDeCampanha({ campanha: c, loja: lojaMock });
+    return json(res, 200, { ok:true, campanha: c, ...r });
+  }
   if (p === '/api/resumo') return json(res, 200, resumo());
   if (p === '/api/saude') return json(res, 200, SAUDE_OK
     ? { ok:true, problema:null, desde:null, checado_em: agora(), resumo:null, whatsappParado:false, versao:'2.0.0-mock', ultimaRodada }
@@ -438,14 +598,23 @@ http.createServer(async (req, res) => {
     let destinos = Array.isArray(body.destinos) ? body.destinos : [];
     if (!destinos.length && body.segmento?.filtro) destinos = (segmentar(body.segmento.filtro, body.segmento.valor) || []).map((c) => ({ cliente_id:c.id, telefone:c.telefone, nome:c.nome, carro:c.carro, placa:c.placa }));
     if (!destinos.length) return json(res, 400, { erro:'Escolha pelo menos um cliente.' });
-    const tipo = body.tipo === 'avulsa' || destinos.length === 1 ? 'avulsa' : 'campanha';
-    const lote = tipo === 'campanha' ? uuid() : null;   // proposta: o servidor marca o lote da campanha
+    const caminho = auto.destinoDoPedido(eu, destinos.length);
+    if (caminho === 'proposta') {
+      const c = { id: uuid(), status:'aguardando', corpo, detalhe: body.detalhe || null, segmento: body.segmento?.filtro ? { filtro: body.segmento.filtro, valor: body.segmento.valor ?? null } : null,
+        destinos: body.segmento?.filtro ? null : destinos, total_previsto: destinos.length, enviar_em: body.enviar_em || null,
+        criado_por: eu.id, criado_por_nome: eu.nome, decidido_por:null, decidido_por_nome:null, decidido_em:null, motivo_recusa:null, created_at: agora() };
+      CAMPANHAS.unshift(c);
+      const avisados = await auto.avisarPropostaDeCampanha({ campanha: c, loja: lojaMock });
+      return json(res, 200, { ok:true, aguardando:true, campanha:c, avisados, enfileirados:0, pulados:0 });
+    }
+    const tipo = caminho === 'avulsa' ? 'avulsa' : 'campanha';
+    const lote = tipo === 'campanha' ? uuid() : null;
     let enfileirados = 0, pulados = 0;
     for (const d of destinos) {
       const c = porId(d.cliente_id);
       if (c?.aceita_mensagens === false) { pulados++; continue; }
       ENVIOS.unshift(env(c, tipo, { lote, telefone:d.telefone, nome:d.nome, corpo: renderTemplate(corpo, { nome:d.nome, carro:d.carro, placa:d.placa, detalhe:'' }),
-        enviar_em: body.enviar_em || agora(), created_at: agora(), criado_por: PAPEL === 'atendente' ? 'Leonardo' : 'João Pedro' }));
+        enviar_em: body.enviar_em || agora(), created_at: agora(), criado_por: eu.nome, criado_por_id: eu.id }));
       enfileirados++;
     }
     return json(res, 200, { ok:true, enfileirados, pulados });
@@ -455,6 +624,8 @@ http.createServer(async (req, res) => {
     if (!SAUDE_OK) return json(res, 502, { erro:'A chave do CodeWords foi recusada (401). Gere uma nova em runtime.codewords.ai e cole em Atendimento › Configurações › Integrações.' });
     return json(res, 200, { ok:true });
   }
+  if ((mm = p.match(/^\/api\/envios\/([0-9a-f-]+)\/(cancelar|reenviar|desfazer-cancelamento)$/)) && m === 'POST' && !ehGestor()
+      && ENVIOS.find((x) => x.id === mm[1])?.criado_por_id !== eu.id) return json(res, 403, { erro: A.motivo403('cancelar_qualquer'), codigo:'sem_permissao' });
   if ((mm = p.match(/^\/api\/envios\/([0-9a-f-]+)\/cancelar$/)) && m === 'POST') {
     const e = ENVIOS.find((x) => x.id === mm[1]);
     if (!e || e.status !== 'pendente') return json(res, 400, { erro:'Só dá para cancelar mensagem que ainda não saiu.' });
@@ -535,6 +706,7 @@ http.createServer(async (req, res) => {
   }
   if ((mm = p.match(/^\/api\/clientes\/([0-9a-f-]+)$/)) && m === 'PUT') {
     const c = porId(mm[1]); if (!c) return json(res, 404, { erro:'Não encontrado' });
+    if (body.aceita_mensagens === true && !A.pode(eu, 'optout_religar')) return json(res, 403, { erro: A.motivo403('optout_religar'), codigo:'sem_permissao' });
     if (body.nascimento !== undefined) {
       const t = String(body.nascimento).trim(); let v = null;
       let x = t.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/); if (x) v = `${x[3]}-${x[2].padStart(2, '0')}-${x[1].padStart(2, '0')}`;
@@ -543,7 +715,7 @@ http.createServer(async (req, res) => {
     }
     if (body.aceita_mensagens === true || body.aceita_mensagens === false) {
       c.aceita_mensagens = body.aceita_mensagens; c.aceita_mensagens_em = agora();
-      c.aceita_mensagens_motivo = body.aceita_mensagens ? null : `desligado no painel por João Pedro${body.motivo ? `: ${body.motivo}` : ''}`;
+      c.aceita_mensagens_motivo = body.aceita_mensagens ? null : `desligado no painel por ${eu.nome}${body.motivo ? `: ${body.motivo}` : ''}`;
     }
     return json(res, 200, lerCliente(c));
   }
@@ -554,11 +726,11 @@ http.createServer(async (req, res) => {
     if (!porId(body.cliente_id)) return json(res, 400, { erro:'Escolha o cliente.' });
     if (body.satisfeito !== true && body.satisfeito !== false) return json(res, 400, { erro:'Diga se o cliente ficou satisfeito ou não.' });
     const r = { id: uuid(), cliente_id: body.cliente_id, envio_id:null, satisfeito: body.satisfeito, nota: body.nota || null, comentario: body.comentario || null,
-      registrado_por: PAPEL === 'atendente' ? 'Leonardo' : 'João Pedro', origem:'manual', created_at: agora() };
+      registrado_por: eu.nome, origem:'manual', created_at: agora() };
     RESPOSTAS.unshift(r); return json(res, 200, r);
   }
   if ((mm = p.match(/^\/api\/satisfacao\/([0-9a-f-]+)$/)) && m === 'DELETE') { RESPOSTAS = RESPOSTAS.filter((r) => r.id !== mm[1]); return json(res, 200, { ok:true }); }
 
   if (m === 'GET') return json(res, 200, []);
   return json(res, 200, { ok:true });
-}).listen(PORT, () => console.log(`Comunicar (dados de MENTIRA) em http://localhost:${PORT}  ·  modo só-olha: /?papel=atendente  ·  sem alerta: /?saude=ok`));
+}).listen(PORT, () => console.log(`Comunicar (dados de MENTIRA) em http://localhost:${PORT}  ·  papéis: /?papel=admin|gestor|atendente|agenda|desativado|sem_app|trocar_senha|mfa  ·  login: /?logado=0  ·  sem alerta: /?saude=ok`));

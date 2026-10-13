@@ -1,4 +1,6 @@
-# Testes das funções puras do Comunicar a cada push (sem banco, sem segredo).
+# Testes do Comunicar a cada push (sem banco, sem segredo): sintaxe, testes
+# (funções puras, IA falsa, papéis, aprovação, automações, API com dados falsos),
+# varredura de segredos e npm audit.
 name: testes
 on:
   push:
@@ -11,10 +13,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 200
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - name: Sintaxe
-        run: node --check server.js && node --check dados.js && node --check supabase.js
+        run: npm run check
       - name: Testes
-        run: node --test scripts/testes.mjs
+        run: npm test
+      - name: Segredos no repositório
+        run: npm run segredos
+      - name: Dependências (npm audit)
+        run: npm audit --audit-level=high

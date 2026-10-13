@@ -15,7 +15,7 @@
 
 import {
   selecionar, selecionarUm, selecionarTudo,
-  inserirUm, atualizar, atualizarUm, remover, contar,
+  inserir, inserirUm, atualizar, atualizarUm, remover, contar, rpc,
 } from './supabase.js';
 
 const T = {
@@ -515,7 +515,7 @@ export async function listarEnvios({ status, tipo, q, de, ate, intencao, limite 
 export async function enfileirar({
   cliente_id = null, agendamento_id = null, lead_id = null, telefone, nome = null,
   tipo, corpo, enviar_em = null, chave_unica = null, criado_por = null,
-  status = 'pendente', motivo_pulado = null, lote = null,
+  status = 'pendente', motivo_pulado = null, lote = null, criado_por_id = null, campanha_id = null,
 }) {
   const tel = soDigitos(telefone);
   if (!tel || !corpo || !tipo) return null;
@@ -527,6 +527,7 @@ export async function enfileirar({
       telefone: tel, nome, tipo, corpo: String(corpo).slice(0, 2000),
       enviar_em: enviar_em || new Date().toISOString(),
       chave_unica, criado_por, status, motivo_pulado, lote: uuidOuNulo(lote),
+      criado_por_id: uuidOuNulo(criado_por_id), campanha_id: uuidOuNulo(campanha_id),
     }, 'select=*');
   } catch (e) {
     if (e?.status === 409) return null; // chave_unica repetida: já estava na fila
@@ -1083,7 +1084,7 @@ export async function resumo() {
   return {
     pendentes, vencidos, enviadosHoje, falhas, ultimoErro, intencoes7,
     limitePorHora: cfg.limite_por_hora,
-    semana: { enviadas: enviados7.length, respondidas: enviados7.filter((e) => e.respondido_em).length },
+    semana: { enviadas: enviados7.length, respondidas: enviados7.filter((e) => e.respondido_em).length, agendaram: enviados7.filter((e) => e.agendou_depois_id).length },
     mes30: { enviadas: enviados30.filter((e) => e.status === 'enviado').length, respondidas: respondidas30, agendaram, concluidos, receita },
     porRegua,
     reguasLigadas: REGUAS.filter((r) => cfg[`ativo_${r}`]),
@@ -1331,7 +1332,7 @@ export async function chamarConsultor(envio) {
 /** A "loja" que a leitura das respostas usa (ia.js › lerRespostas). */
 export const lojaRespostas = {
   async pendentes(limite = 20) {
-    const p = new URLSearchParams('select=id,tipo,corpo,resposta,resposta_tipo,respondido_em,cliente_id,lead_id,agendamento_id,conversa_id,telefone,intencao');
+    const p = new URLSearchParams('select=id,tipo,corpo,resposta,resposta_tipo,respondido_em,cliente_id,lead_id,agendamento_id,conversa_id,telefone,intencao,nome,tarefa_id');
     p.set('respondido_em', `gte.${new Date(Date.now() - 72 * 3600000).toISOString()}`);
     p.set('intencao', 'is.null');
     p.set('resposta_tipo', 'neq.parar');
@@ -1509,4 +1510,210 @@ export async function montarAniversarios(comData, total, recentes, h, buscarClie
   const semDataIds = [...new Set(recentes.map((a) => a.cliente_id).filter((id) => id && !comDataIds.has(id)))].slice(0, 12);
   const semData = semDataIds.length ? await buscarClientes(semDataIds) : [];
   return { total, comData: comData.length, proximos: proximos.slice(0, 40), semDataRecentes: semData.slice(0, 12) };
+}
+
+// ============================================================================
+// RODADA 3 (13/10/2026) — equipe: perfil, último acesso, sino, tarefas,
+// gestores, auditoria, campanhas com aprovação, falhas por régua
+// ============================================================================
+
+T.tarefas = 'tarefas';
+T.notificacoes = 'notificacoes';
+T.campanhas = 'comunicar_campanhas';
+
+const CAMPOS_PERFIL = 'id,nome,email,papel,ativo,apps,cargo,telefone,avatar_cor,preferencias,precisa_trocar_senha,ultimo_acesso_em,ultimo_app';
+
+/** Perfil completo (porteiro da rodada 3: papel, apps, troca de senha). */
+export async function perfilCompleto(id) {
+  if (!ehUuid(id)) return null;
+  return selecionarUm(T.perfis, `select=${CAMPOS_PERFIL}&id=eq.${id}`);
+}
+
+/** A própria pessoa muda nome/cargo/telefone/cor/preferências (as preferências dos outros apps ficam). */
+export async function atualizarMeuPerfil(id, campos) {
+  if (!ehUuid(id) || !campos || !Object.keys(campos).length) return perfilCompleto(id);
+  const c = { ...campos };
+  if (c.preferencias) {
+    const atual = (await selecionarUm(T.perfis, `select=preferencias&id=eq.${id}`))?.preferencias || {};
+    c.preferencias = { ...atual, notificacoes: { ...(atual.notificacoes || {}), ...(c.preferencias.notificacoes || {}) } };
+  }
+  return atualizarUm(T.perfis, `id=eq.${id}&select=${CAMPOS_PERFIL}`, c);
+}
+
+export async function marcarAcesso(id) {
+  if (!ehUuid(id)) return null;
+  return atualizarUm(T.perfis, `id=eq.${id}&select=id`, { ultimo_acesso_em: new Date().toISOString(), ultimo_app: 'comunicar' });
+}
+
+export async function senhaTrocada(id) {
+  if (!ehUuid(id)) return null;
+  return atualizarUm(T.perfis, `id=eq.${id}&select=id,precisa_trocar_senha`, { precisa_trocar_senha: false });
+}
+
+// ---- sino --------------------------------------------------------------------
+export async function minhasNotificacoes(perfilId, limite = 30) {
+  if (!ehUuid(perfilId)) return { lista: [], naoLidas: 0 };
+  const [lista, naoLidas] = await Promise.all([
+    selecionar(T.notificacoes, `select=id,tipo,titulo,corpo,link,app,lida_em,created_at&perfil_id=eq.${perfilId}&order=created_at.desc&limit=${Math.min(Number(limite) || 30, 100)}`),
+    contar(T.notificacoes, `perfil_id=eq.${perfilId}&lida_em=is.null`),
+  ]);
+  return { lista, naoLidas };
+}
+export async function marcarNotificacaoLida(perfilId, id) {
+  if (!ehUuid(perfilId) || !ehUuid(id)) return null;
+  return atualizarUm(T.notificacoes, `id=eq.${id}&perfil_id=eq.${perfilId}&select=id,lida_em`, { lida_em: new Date().toISOString() });
+}
+export async function marcarTodasLidas(perfilId) {
+  if (!ehUuid(perfilId)) return 0;
+  return (await atualizar(T.notificacoes, `perfil_id=eq.${perfilId}&lida_em=is.null&select=id`, { lida_em: new Date().toISOString() })).length;
+}
+
+// ---- tarefas -----------------------------------------------------------------
+const CAMPOS_TAREFA = 'id,titulo,descricao,responsavel_id,criado_por,cliente_id,lead_id,conversa_id,agendamento_id,origem,prioridade,vence_em,status,created_at';
+export async function minhasTarefas(perfilId, limite = 50) {
+  if (!ehUuid(perfilId)) return [];
+  const p = new URLSearchParams(`select=${CAMPOS_TAREFA},clientes(nome,telefone)`);
+  p.set('responsavel_id', `eq.${perfilId}`);
+  p.set('status', 'eq.aberta');
+  p.set('order', 'prioridade.asc,vence_em.asc.nullslast,created_at.desc');
+  p.set('limit', String(limite));
+  return (await selecionar(T.tarefas, p)).map(({ clientes, ...t }) => ({ ...t, cliente_nome: clientes?.nome ?? null, cliente_telefone: clientes?.telefone ?? null }));
+}
+export async function obterTarefa(id) {
+  if (!ehUuid(id)) return null;
+  return selecionarUm(T.tarefas, `select=${CAMPOS_TAREFA}&id=eq.${id}`);
+}
+export async function criarTarefa(t) {
+  const titulo = String(t.titulo || '').trim().slice(0, 200);
+  if (!titulo) return null;
+  return inserirUm(T.tarefas, {
+    titulo, descricao: t.descricao ? String(t.descricao).slice(0, 2000) : null,
+    responsavel_id: uuidOuNulo(t.responsavel_id), criado_por: uuidOuNulo(t.criado_por),
+    cliente_id: uuidOuNulo(t.cliente_id), lead_id: uuidOuNulo(t.lead_id), conversa_id: uuidOuNulo(t.conversa_id),
+    agendamento_id: uuidOuNulo(t.agendamento_id), origem: t.origem || 'comunicar',
+    prioridade: [1, 2, 3].includes(Number(t.prioridade)) ? Number(t.prioridade) : 2,
+    vence_em: t.vence_em || null,
+  }, `select=${CAMPOS_TAREFA}`);
+}
+export async function concluirTarefa(id, perfilId) {
+  if (!ehUuid(id)) return null;
+  return atualizarUm(T.tarefas, `id=eq.${id}&status=eq.aberta&select=${CAMPOS_TAREFA}`,
+    { status: 'feita', concluida_em: new Date().toISOString(), concluida_por: uuidOuNulo(perfilId) });
+}
+
+// ---- gestores, notificações e auditoria (rpc do banco, só service role) --------
+/** Quem recebe os avisos do Comunicar (admin sempre; gestor com o app), sem quem desligou esse tipo. */
+export async function gestores(tipo = null) {
+  const r = await rpc('comunicar_gestores', { p_tipo: tipo });
+  return (Array.isArray(r) ? r : []).map((x) => (typeof x === 'string' ? x : x?.comunicar_gestores)).filter(ehUuid);
+}
+export async function notificar({ perfil, tipo, titulo, corpo = null, link = null, app = 'comunicar', chave = null }) {
+  if (!ehUuid(perfil)) return null;
+  return rpc('notificar', { p_perfil: perfil, p_tipo: tipo, p_titulo: titulo, p_corpo: corpo, p_link: link, p_app: app, p_chave: chave });
+}
+export async function auditar(perfilId, acao, tabela = null, registro = null, detalhes = null) {
+  return rpc('registrar_auditoria', {
+    p_perfil: uuidOuNulo(perfilId), p_app: 'comunicar', p_acao: acao,
+    p_tabela: tabela, p_registro: registro == null ? null : String(registro), p_detalhes: detalhes,
+  }).catch((e) => { console.error('auditoria:', e?.message || e); return null; });
+}
+
+/** Dono da conversa do envio (perfil ativo da equipe) — para a tarefa ir para ele. */
+export async function donoDaConversa(envio) {
+  let conv = null;
+  if (ehUuid(envio?.conversa_id)) conv = await selecionarUm(T.conversas, `select=id,atribuida_a&id=eq.${envio.conversa_id}`);
+  if (!conv && envio?.telefone) conv = await conversaDoTelefone(envio.telefone).catch(() => null);
+  if (!conv) return { conversaId: null, dono: null };
+  let dono = conv.atribuida_a || null;
+  if (dono) {
+    const p = await selecionarUm(T.perfis, `select=id,ativo,papel&id=eq.${dono}`).catch(() => null);
+    if (!p?.ativo || !['admin', 'gestor', 'atendente'].includes(p.papel)) dono = null;
+  }
+  return { conversaId: conv.id, dono };
+}
+export async function ligarTarefaAoEnvio(envioId, tarefaId) {
+  if (!ehUuid(envioId) || !ehUuid(tarefaId)) return null;
+  return atualizarUm(T.envios, `id=eq.${envioId}&tarefa_id=is.null&select=id`, { tarefa_id: tarefaId });
+}
+
+/** Falhas definitivas por régua desde `desdeIso` (para o aviso "régua falhou 3 vezes"). */
+export async function falhasPorTipo(desdeIso) {
+  const p = new URLSearchParams('select=tipo,erro,enviar_em');
+  p.set('status', 'eq.falhou');
+  p.set('enviar_em', `gte.${desdeIso}`);
+  p.set('order', 'enviar_em.desc');
+  p.set('limit', '500');
+  const saida = {};
+  for (const e of await selecionar(T.envios, p)) {
+    const s = (saida[e.tipo] ||= { total: 0, ultimoErro: null });
+    s.total++;
+    if (!s.ultimoErro && e.erro) s.ultimoErro = String(e.erro).slice(0, 160);
+  }
+  return saida;
+}
+
+export async function ultimoResumoEquipe() {
+  return (await selecionarUm(T.config, `select=resumo_equipe_em&${LINHA_UNICA}`).catch(() => null))?.resumo_equipe_em || null;
+}
+export async function marcarResumoEquipe(iso) {
+  return atualizarUm(T.config, LINHA_UNICA, { resumo_equipe_em: iso }).catch(() => null);
+}
+
+/** A loja das automações da equipe (automacoes.js). */
+export const lojaEquipe = {
+  donoDaConversa, gestores, notificar,
+  criarTarefa: (t) => criarTarefa(t),
+  ligarTarefa: ligarTarefaAoEnvio,
+  falhasPorTipo, ultimoResumoEquipe, marcarResumoEquipe,
+  numerosDaSemana: () => numerosDaSemana(),
+};
+
+// ---- fila em lote (campanha grande sem 2.000 requisições) ----------------------
+export async function enfileirarVarios(linhas) {
+  const boas = linhas.filter((l) => soDigitos(l.telefone) && l.corpo && l.tipo).map((l) => ({
+    cliente_id: uuidOuNulo(l.cliente_id), agendamento_id: null, lead_id: null,
+    telefone: soDigitos(l.telefone), nome: l.nome ?? null, tipo: l.tipo, corpo: String(l.corpo).slice(0, 2000),
+    enviar_em: l.enviar_em || new Date().toISOString(), chave_unica: null, criado_por: l.criado_por ?? null,
+    status: 'pendente', motivo_pulado: null, lote: uuidOuNulo(l.lote),
+    criado_por_id: uuidOuNulo(l.criado_por_id), campanha_id: uuidOuNulo(l.campanha_id),
+  }));
+  let criados = 0;
+  for (let i = 0; i < boas.length; i += 200) criados += (await inserir(T.envios, boas.slice(i, i + 200), 'select=id')).length;
+  return criados;
+}
+
+export async function obterEnvio(id) {
+  if (!ehUuid(id)) return null;
+  return selecionarUm(T.envios, `select=id,tipo,status,criado_por,criado_por_id,cliente_id,telefone,nome&id=eq.${id}`);
+}
+
+// ---- campanhas com aprovação --------------------------------------------------
+const CAMPOS_CAMPANHA = 'id,status,corpo,detalhe,segmento,destinos,total_previsto,enviar_em,criado_por,criado_por_nome,decidido_por,decidido_por_nome,decidido_em,motivo_recusa,lote,enfileirados,pulados,created_at';
+export async function criarPropostaCampanha(c) {
+  return inserirUm(T.campanhas, {
+    status: 'aguardando', corpo: String(c.corpo).slice(0, 2000), detalhe: c.detalhe ? String(c.detalhe).slice(0, 200) : null,
+    segmento: c.segmento || null, destinos: c.destinos || null, total_previsto: Number.isInteger(c.total_previsto) ? c.total_previsto : null,
+    enviar_em: c.enviar_em || null, criado_por: uuidOuNulo(c.criado_por), criado_por_nome: c.criado_por_nome || null,
+  }, `select=${CAMPOS_CAMPANHA}`);
+}
+export async function listarCampanhas({ status = 'aguardando', criadoPor = null, limite = 50 } = {}) {
+  const p = new URLSearchParams(`select=${CAMPOS_CAMPANHA}`);
+  if (status && status !== 'todas') p.set('status', `eq.${status}`);
+  if (ehUuid(criadoPor)) p.set('criado_por', `eq.${criadoPor}`);
+  p.set('order', 'created_at.desc');
+  p.set('limit', String(Math.min(Number(limite) || 50, 200)));
+  return selecionar(T.campanhas, p);
+}
+export async function obterCampanha(id) {
+  if (!ehUuid(id)) return null;
+  return selecionarUm(T.campanhas, `select=${CAMPOS_CAMPANHA}&id=eq.${id}`);
+}
+/** Só decide o que ainda está aguardando (dois gestores clicando juntos: só um vence). */
+export async function decidirCampanha(id, campos) {
+  if (!ehUuid(id)) return null;
+  return atualizarUm(T.campanhas, `id=eq.${id}&status=eq.aguardando&select=${CAMPOS_CAMPANHA}`, { ...campos, updated_at: new Date().toISOString() });
+}
+export async function completarCampanha(id, campos) {
+  if (!ehUuid(id)) return null;
+  return atualizarUm(T.campanhas, `id=eq.${id}&select=${CAMPOS_CAMPANHA}`, { ...campos, updated_at: new Date().toISOString() });
 }

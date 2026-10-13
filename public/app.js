@@ -115,13 +115,23 @@ async function authCabecalhos() {
   return cab;
 }
 
-async function api(method, path, body) {
+/* Chamada à API do Comunicar. Recusa de sessão (401) e de acesso (403 sem_acesso /
+   trocar_senha) vão para a conta.js, que renova o token uma vez e repete, ou leva à
+   tela certa (login, código de duas etapas, sem acesso, senha nova). */
+async function api(method, path, body, _repetiu = false) {
   const opt = { method, headers: await authCabecalhos() };
   if (body !== undefined) opt.body = JSON.stringify(body);
-  const r = await fetch('/api' + path, opt);
+  let r;
+  try { r = await fetch('/api' + path, opt); }
+  catch { const e = new Error('Sem internet — confira a conexão e tente de novo.'); e.status = 0; throw e; }
   const data = await r.json().catch(() => ({}));
-  if (r.status === 401) { mostrarLogin('Sua sessão expirou. Entre de novo.'); throw new Error('Sessão expirada'); }
-  if (!r.ok) { const e = new Error(data.erro || 'Erro na requisição'); e.status = r.status; throw e; }
+  if (r.status === 401 || (r.status === 403 && ['sem_acesso', 'trocar_senha'].includes(data.codigo))) {
+    const acao = window.Conta ? await window.Conta.tratarRecusa(r.status, data, _repetiu) : 'parar';
+    if (acao === 'repetir' && !_repetiu) return api(method, path, body, true);
+    if (!window.Conta) mostrarLogin(data.erro || 'Sua sessão expirou. Entre de novo.');
+    const e = new Error(data.erro || 'Sessão expirada'); e.status = r.status; e.codigo = data.codigo; throw e;
+  }
+  if (!r.ok) { const e = new Error(data.erro || (r.status === 429 ? 'Muitas ações seguidas. Espere um pouco.' : 'Erro na requisição')); e.status = r.status; e.codigo = data.codigo; throw e; }
   return data;
 }
 
@@ -168,6 +178,9 @@ function relativo(ts) {
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 const plural = (n, um, varios) => `${n} ${n === 1 ? um : varios}`;
 const ehGestor = () => ['admin', 'gestor'].includes(state.perfil?.papel);
+/* O mapa de permissões vem do SERVIDOR (/api/perfil › pode) — a tela só esconde
+   o botão; quem barra de verdade é o servidor (403). */
+const pode = (p) => (state.perfil?.pode ? !!state.perfil.pode[p] : ehGestor());
 
 /** Mesma troca de variáveis do servidor (dados.js › renderTemplate) — para a prévia. */
 function renderTemplate(corpo, ctx = {}) {
@@ -314,9 +327,10 @@ async function renderInicio() {
       <div><div class="hero-data">${esc(dataTxt)}</div><h2 class="hero-titulo">${titulo}</h2></div>
       <div class="hero-acoes">
         <button type="button" class="btn" id="btnPrevia">${svg(I.olho)} Prévia de hoje</button>
-        <button type="button" class="btn primary" id="btnRodar">${svg(I.play)} Rodar agora</button>
+        ${pode('rodar') ? `<button type="button" class="btn primary" id="btnRodar">${svg(I.play)} Rodar agora</button>` : ''}
       </div>
     </div>
+    <div class="faixa-equipe" id="faixaEquipe" hidden></div>
 
     <div class="situacao${r.pausaGeral ? ' pausada' : ''}" role="status">
       ${r.pausaGeral ? `<span class="item"><span class="dot off"></span><b style="color:var(--red-txt)">PAUSA GERAL ligada</b></span><span class="sep"></span>` : ''}
@@ -374,8 +388,9 @@ async function renderInicio() {
   carregarLinhaIA();
   $('#btnRelatorio')?.addEventListener('click', () => abrirRelatorio('todas'));
   waPromise.then(wa => { const el = $('#waItem'); if (el) el.innerHTML = htmlWhatsapp(wa); });
-  $('#btnRodar').addEventListener('click', rodarAgora);
+  $('#btnRodar')?.addEventListener('click', rodarAgora);
   $('#btnPrevia').addEventListener('click', () => abrirPrevia());
+  pintarFaixaEquipe();
   $$('[data-ir]', view).forEach(b => b.addEventListener('click', () => route(b.dataset.ir)));
 }
 
@@ -724,7 +739,7 @@ async function renderMensagens({ quieto } = {}) {
       <select id="intMsg" class="inp" style="width:auto" aria-label="Filtrar pela intenção lida pela IA">
         <option value="todas">✨ Qualquer resposta</option><option value="qualquer" ${f.intencao === 'qualquer' ? 'selected' : ''}>✨ Lidas pela IA</option>
         ${Object.entries(INTENCAO).map(([k, x]) => `<option value="${k}" ${f.intencao === k ? 'selected' : ''}>${x[0]} ${esc(x[1])}</option>`).join('')}</select>
-      <button type="button" class="btn btn-mini" id="btnCSV" style="margin-left:auto">${svg(I.upload)} Exportar CSV</button>
+      ${pode('exportar') ? `<button type="button" class="btn btn-mini" id="btnCSV" style="margin-left:auto">${svg(I.upload)} Exportar CSV</button>` : ''}
     </div>
     <div class="pilulas" role="tablist">
       ${pilula('todas', 'Todas')}${pilula('pendente', '🕒 Na fila')}${pilula('enviado', '✅ Enviadas')}${pilula('falhou', '❌ Falharam')}${pilula('cancelado', 'Canceladas')}${pilula('pulado', '⏭ Puladas')}
@@ -742,7 +757,7 @@ async function renderMensagens({ quieto } = {}) {
   $('#deMsg').addEventListener('change', mudarPeriodo); $('#ateMsg').addEventListener('change', mudarPeriodo);
   $('#limparPeriodo').addEventListener('click', () => { $('#deMsg').value = ''; $('#ateMsg').value = ''; mudarPeriodo(); });
   $('#intMsg').addEventListener('change', e => { state.msg.intencao = e.target.value; route(null, { quieto:true }); });
-  $('#btnCSV').addEventListener('click', async (e) => {
+  $('#btnCSV')?.addEventListener('click', async (e) => {
     const b = e.currentTarget; b.disabled = true;
     try { await baixarCSV(state._qMsg || new URLSearchParams()); toast('CSV baixado — abre direto no Excel.'); }
     catch (err) { toast(err.message, 'err'); } finally { b.disabled = false; }
@@ -750,6 +765,14 @@ async function renderMensagens({ quieto } = {}) {
   ligarAcoesEnvio($('#listaEnvios'));
 }
 
+/* Quem mandou: nome de quem clicou (criado_por guarda o nome; criado_por_id, o perfil) ou 'automática'. */
+function quemMandou(e) {
+  if (e.criado_por && !['gerador', 'gatilho'].includes(e.criado_por)) {
+    const eu = e.criado_por_id && e.criado_por_id === state.perfil?.id;
+    return ` · <span class="por-quem" title="Quem mandou">✍ ${eu ? 'você' : esc(e.criado_por)}</span>`;
+  }
+  return REGUAS.includes(e.tipo) ? ' · <span class="por-quem auto">automática</span>' : '';
+}
 function cartaoEnvio(e) {
   const t = TIPO[e.tipo] || { rotulo:e.tipo, emoji:'✉️' };
   const quando = e.status === 'enviado' ? `enviada ${esc(dataHoraBR(e.enviado_em))}`
@@ -757,12 +780,13 @@ function cartaoEnvio(e) {
   const resposta = e.resposta ? `<div class="resposta ${esc(e.resposta_tipo || 'neutra')}"><span class="r-ico">💬</span>
       <span class="r-txt">${esc(e.resposta)}</span>
       <span class="r-tag">${e.resposta_tipo === 'positiva' ? 'gostou' : e.resposta_tipo === 'negativa' ? 'reclamou' : e.resposta_tipo === 'parar' ? 'pediu para parar' : 'respondeu'}${e.respondido_em ? ` · ${esc(horaBR(e.respondido_em))}` : ''}</span></div>` : '';
-  const podeCancelar = e.status === 'pendente', podeReenviar = ['falhou', 'cancelado', 'pulado'].includes(e.status);
+  const meu = pode('cancelar_qualquer') || (e.criado_por_id && e.criado_por_id === state.perfil?.id);
+  const podeCancelar = meu && e.status === 'pendente', podeReenviar = meu && ['falhou', 'cancelado', 'pulado'].includes(e.status);
   return `<article class="envio s-${esc(e.status)}" data-id="${esc(e.id)}">
     <div class="envio-topo">
       <div class="envio-quem"><span class="linha" style="gap:8px"><span class="tipo-ico" aria-hidden="true">${t.emoji}</span>
         ${e.cliente_id ? `<button type="button" class="cli-nome" data-ficha="${esc(e.cliente_id)}"><b>${esc(e.nome || e.telefone)}</b></button>` : `<b>${esc(e.nome || e.telefone)}</b>`}</span>
-        <small>${esc(telBR(e.telefone))}${e.criado_por && e.criado_por !== 'gerador' && e.criado_por !== 'gatilho' ? ` · por ${esc(e.criado_por)}` : ''}</small></div>
+        <small>${esc(telBR(e.telefone))}${quemMandou(e)}</small></div>
       <div class="envio-chips">${pillTipo(e.tipo)}${pillStatus(e.status)}${e.intencao ? pillIntencao(e.intencao, e.intencao_resumo) : ''}${e.agendou_depois_id ? `<span class="selo-agendou">${svg(I.calendar)} agendou depois</span>` : ''}${e.mensagem_id ? '<span class="selo-hist" title="Aparece no histórico da conversa do Atendimento">💬 no histórico</span>' : ''}</div>
     </div>
     <div class="envio-corpo">${esc(e.corpo)}</div>
@@ -833,6 +857,7 @@ async function renderCampanhas() {
       <div class="left"><h2>Campanhas</h2><span class="badge-pill bp-gray">${plural(lista.length, 'campanha', 'campanhas')}</span></div>
       <div class="right"><button type="button" class="btn primary" id="btnNovaCamp">${svg(I.megafone)} Nova campanha</button></div>
     </div>
+    <div id="aprovacoes"></div>
     <div class="panel"><div class="panel-head"><h2>${svg(I.megafone)} Histórico</h2><span class="panel-sub">agrupado por mensagem e dia</span></div>
       <div class="panel-body lista lista-anim">
         ${lista.length ? lista.map(g => `<article class="camp">
@@ -846,6 +871,7 @@ async function renderCampanhas() {
           : vazio(I.megafone, 'Nenhuma campanha ainda', 'Escolha um segmento (ou um cliente), escreva a mensagem e coloque na fila. Quem pediu para parar fica fora sozinho.')}
       </div></div>`;
   $('#btnNovaCamp').addEventListener('click', () => openCampanhaModal());
+  pintarAprovacoes();
 }
 
 function assinaturaCampanha(e) {
@@ -879,6 +905,8 @@ window.openCampanhaModal = async function (pre = {}) {
   const alvoResumo = () => c.alvo === 'cliente' ? (c.cliente ? c.cliente.nome : 'nenhum cliente escolhido')
     : `${c.previa?.total ?? '…'} cliente(s) · ${segmentos.find(s => s.id === c.filtro)?.rotulo || c.filtro}${c.valor ? ` (${c.valor})` : ''}`;
   const clienteDaPrevia = () => c.alvo === 'cliente' ? c.cliente : (c.previa?.amostra?.[0] || null);
+  /* atendente: campanha para um grupo vai para o gestor aprovar; avulsa sai direto */
+  const precisaAprovar = () => c.alvo === 'segmento' && !pode('campanha_aprovar');
 
   const atualizarSegPrevia = debounce(async () => {
     const box = $('#segPrevia'); if (!box) return;
@@ -1001,6 +1029,7 @@ window.openCampanhaModal = async function (pre = {}) {
         <div><span>Mensagem</span><b>${c.corpo.length} caracteres</b></div>
         <div><span>Quando</span><b id="campQuandoTxt">${c.quando === 'agora' ? 'agora, dentro da janela' : (c.enviar_em ? esc(dataHoraBR(c.enviar_em)) : 'escolha a data')}</b></div>
         ${quantos > 1 ? `<div class="dica">${quantos} mensagens de relacionamento: quem já recebeu outra há poucos dias pode ser pulado pelo intervalo mínimo.</div>` : ''}
+        ${precisaAprovar() ? `<div class="dica aprovacao">${svg(I.check)}<span>Campanha para um grupo passa pelo gestor: ela fica <b>aguardando aprovação</b> e só entra na fila quando ele aprovar. O gestor recebe o aviso no sino.</span></div>` : ''}
       </div>`;
     $$('[data-quando]', body).forEach(b => b.addEventListener('click', () => { c.quando = b.dataset.quando; passo3(); }));
     $('#campData').addEventListener('change', e => { c.enviar_em = e.target.value; $('#campQuandoTxt').textContent = c.enviar_em ? dataHoraBR(c.enviar_em) : 'escolha a data'; });
@@ -1010,7 +1039,7 @@ window.openCampanhaModal = async function (pre = {}) {
     c.passo = n;
     $$('.passo', modal).forEach(p => { const k = Number(p.dataset.passo); p.classList.toggle('ativo', k === n); p.classList.toggle('feito', k < n); });
     $('#campVoltar').hidden = n === 1;
-    $('#campAvancar').innerHTML = n === 3 ? `${svg(I.send)} Colocar na fila` : `Avançar ${svg(I.seta)}`;
+    $('#campAvancar').innerHTML = n === 3 ? (precisaAprovar() ? `${svg(I.check)} Pedir aprovação` : `${svg(I.send)} Colocar na fila`) : `Avançar ${svg(I.seta)}`;
     [passo1, passo2, passo3][n - 1]();
   };
   $('#campVoltar').addEventListener('click', () => ir(c.passo - 1));
@@ -1031,7 +1060,7 @@ window.openCampanhaModal = async function (pre = {}) {
       enviar_em = new Date(c.enviar_em).toISOString();
     }
     const quantos = c.alvo === 'cliente' ? 1 : c.previa.total;
-    if (quantos > 1 && !confirm(`Colocar ${quantos} mensagens na fila?`)) return;
+    if (quantos > 1 && !confirm(precisaAprovar() ? `Mandar esta campanha (${quantos} clientes) para o gestor aprovar?` : `Colocar ${quantos} mensagens na fila?`)) return;
     const btn = $('#campAvancar'); btn.disabled = true;
     try {
       const corpo = c.corpo.trim();
@@ -1039,6 +1068,11 @@ window.openCampanhaModal = async function (pre = {}) {
         ? { tipo:'avulsa', corpo, enviar_em, destinos:[{ cliente_id:c.cliente.id, telefone:c.cliente.telefone, nome:c.cliente.nome, carro:c.cliente.carro, placa:c.cliente.placa }] }
         : { corpo, enviar_em, segmento:{ filtro:c.filtro, valor: c.valor || segmentos.find(s => s.id === c.filtro)?.valor } };
       const r = await api('POST', '/envios', payload);
+      if (r.aguardando) {
+        toast('Campanha mandada para aprovação — o gestor foi avisado no sino.', 'ok', 5500);
+        closeModal(); state.route === 'campanhas' ? route(null, { quieto:true }) : route('campanhas');
+        return;
+      }
       toast(`${plural(r.enfileirados, 'mensagem', 'mensagens')} na fila${r.pulados ? ` · ${r.pulados} pulada(s) (pediu para parar ou recebeu outra há pouco)` : ''}.`, 'ok', 5000);
       closeModal(); refreshBadge();
       if (state.route === 'campanhas' || state.route === 'mensagens') route(null, { quieto:true });
@@ -1061,7 +1095,7 @@ async function renderClientes() {
         ${fora ? `<span class="badge-pill bp-red">🚫 ${fora} fora da lista</span>` : ''}</div>
       <div class="right">
         <div class="search">${svg(I.search)}<input id="qCli" placeholder="Nome, telefone ou placa…" value="${esc(state.cliQ)}" aria-label="Buscar clientes"></div>
-        <button type="button" class="btn" id="btnImportar">${svg(I.upload)} Importar planilha</button>
+        ${pode('importar') ? `<button type="button" class="btn" id="btnImportar">${svg(I.upload)} Importar planilha</button>` : ''}
       </div>
     </div>
     <div class="panel"><div class="panel-body lista lista-anim" id="cliLista">${linhasClientes(lista)}</div></div>`;
@@ -1072,9 +1106,11 @@ async function renderClientes() {
     const r = await api('GET', '/clientes' + (state.cliQ ? `?q=${encodeURIComponent(state.cliQ)}` : '')).catch(() => []);
     if ($('#cliLista')) { $('#cliLista').innerHTML = linhasClientes(r); ligarClientes($('#cliLista'), r); }
   }, 250));
-  $('#btnImportar').addEventListener('click', () => openImportarModal());
+  $('#btnImportar')?.addEventListener('click', () => openImportarModal());
   if (state.cliQ) { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); }
 }
+/* Quem saiu da lista só volta pela mão do gestor (o servidor também barra). */
+const travaReligar = (c) => (c.aceita_mensagens === false && !pode('optout_religar') ? 'disabled title="Só gestor volta a mandar para quem saiu da lista"' : '');
 function linhasClientes(lista) {
   if (!lista.length) return vazio(I.user, state.cliQ ? 'Ninguém com esse nome' : 'Nenhum cliente', state.cliQ ? 'Tente pelo telefone ou pela placa.' : 'A base é a mesma do CRM, da Agenda e do Atendimento.');
   return lista.map(c => `<div class="cli${c.aceita_mensagens === false ? ' fora' : ''}" data-id="${esc(c.id)}">
@@ -1083,7 +1119,7 @@ function linhasClientes(lista) {
     <span class="col carro">${svg(I.car)} ${esc(c.carro || '—')}${c.placa ? ` <b>${esc(c.placa)}</b>` : ''}</span>
     <span class="nasc">${c.nascimento ? `🎂 <b>${esc(nascBR(c.nascimento))}</b>` : '<span class="muted">sem aniversário</span>'}
       <button type="button" class="icon-btn" data-nasc="${esc(c.id)}" aria-label="Editar aniversário de ${esc(c.nome)}" title="Editar aniversário">${svg(I.edit)}</button></span></span>
-    <span class="acoes"><label class="sw" title="Recebe mensagens automáticas e campanhas"><input type="checkbox" data-aceita="${esc(c.id)}" ${c.aceita_mensagens === false ? '' : 'checked'} aria-label="Aceita mensagens: ${esc(c.nome)}"><span class="tr"></span><span class="sw-txt">Mensagens</span></label></span>
+    <span class="acoes"><label class="sw" title="Recebe mensagens automáticas e campanhas"><input type="checkbox" data-aceita="${esc(c.id)}" ${c.aceita_mensagens === false ? '' : 'checked'} ${travaReligar(c)} aria-label="Aceita mensagens: ${esc(c.nome)}"><span class="tr"></span><span class="sw-txt">Mensagens</span></label></span>
   </div>`).join('');
 }
 function ligarClientes(root, lista) {
@@ -1189,12 +1225,14 @@ async function abrirFicha(id, quieto = false) {
       ${f.agendamentos?.length ? `<div class="g-sec"><h4>Agendamentos <small>últimos ${f.agendamentos.length}</small></h4>${f.agendamentos.map(a => `<div class="ag-linha"><span class="d">${esc(dataCurta(a.data))}</span><span class="s">${esc(a.servico || '—')}</span>${pillAg(a.status)}</div>`).join('')}</div>` : ''}
     </div>
     <div class="gaveta-foot">
-      <label class="sw" style="margin-right:auto"><input type="checkbox" id="gAceita" ${c.aceita_mensagens === false ? '' : 'checked'}><span class="tr"></span><span class="sw-txt">Aceita mensagens</span></label>
+      <label class="sw" style="margin-right:auto"><input type="checkbox" id="gAceita" ${c.aceita_mensagens === false ? '' : 'checked'} ${travaReligar(c)}><span class="tr"></span><span class="sw-txt">Aceita mensagens</span></label>
       <button type="button" class="btn" id="gNasc">${svg(I.gift)} Aniversário</button>
+      <button type="button" class="btn" id="gTarefa" title="Criar uma tarefa ligada a este cliente">${svg(I.check)} Tarefa</button>
       <button type="button" class="btn primary" id="gMandar" ${c.aceita_mensagens === false || !c.telefone ? 'disabled' : ''}>${svg(I.send)} Mandar mensagem</button>
     </div>`;
   $('#gAceita').addEventListener('change', e => mudarAceite(c, e.target.checked, e.target));
   $('#gNasc').addEventListener('click', () => openNascimentoModal(c));
+  $('#gTarefa').addEventListener('click', () => window.Conta?.novaTarefa({ cliente_id: c.id, titulo: `Falar com ${c.nome}` }));
   $('#gMandar').addEventListener('click', () => { fecharGaveta(); openCampanhaModal({ cliente:c }); });
   if (!quieto) setTimeout(() => $('[data-fechar-gaveta]', g)?.focus({ preventScroll:true }), 30);
 }
@@ -1318,7 +1356,7 @@ async function renderSatisfacao() {
                   <span class="origem ${esc(r.origem || 'manual')}">${r.origem === 'whatsapp' ? '💬 WhatsApp automático' : '✍️ manual'}</span></div></div>
               ${r.comentario ? `<div class="envio-corpo">${esc(r.comentario)}</div>` : ''}
               <div class="envio-rodape"><div class="meta"><span>${svg(I.clock)} ${esc(dataHoraBR(r.created_at))}${r.registrado_por ? ` · ${esc(r.registrado_por)}` : ''}</span></div>
-                <div class="envio-acoes"><button type="button" class="icon-btn red" data-apagar="${esc(r.id)}" aria-label="Apagar registro">${svg(I.trash)}</button></div></div>
+                <div class="envio-acoes">${pode('satisfacao_apagar') ? `<button type="button" class="icon-btn red" data-apagar="${esc(r.id)}" aria-label="Apagar registro">${svg(I.trash)}</button>` : ''}</div></div>
             </article>`).join('') : vazio(I.smile, 'Nenhum retorno ainda', 'Com a régua Pós-venda ligada, a resposta do cliente aparece aqui sozinha.')}
         </div>
       </div>
@@ -1406,6 +1444,7 @@ $('#btnNova').addEventListener('click', () => openCampanhaModal());
 const digitando = (el) => el && (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) || el.isContentEditable);
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
+    if (window.Conta?.fecharPops()) return;
     if ($('#ecoPop') && !$('#ecoPop').hidden) return fecharEco();
     if (modalAberto()) return closeModal();
     if (gavetaAberta()) return fecharGaveta();
@@ -1485,8 +1524,10 @@ $('#btnEco')?.addEventListener('click', () => ($('#ecoPop').hidden ? abrirEco() 
 document.addEventListener('click', e => { const pop = $('#ecoPop'); if (!pop || pop.hidden) return; if (!pop.contains(e.target) && !e.target.closest('#btnEco')) fecharEco(); });
 window.addEventListener('resize', debounce(() => { if ($('#ecoPop') && !$('#ecoPop').hidden) abrirEco(); }, 120));
 
-/* ============================ LOGIN ============================ */
+/* ============================ LOGIN ============================
+   As telas de entrar, senha nova, duas etapas e "sem acesso" moram em conta.js. */
 function mostrarLogin(mensagem) {
+  if (window.Conta) { window.Conta.painel('formLogin'); window.Conta.aviso('erroLogin', mensagem || ''); return; }
   document.body.classList.add('deslogado');
   $('#telaLogin').hidden = false;
   const erro = $('#erroLogin');
@@ -1494,50 +1535,59 @@ function mostrarLogin(mensagem) {
 }
 function esconderLogin() { document.body.classList.remove('deslogado'); $('#telaLogin').hidden = true; $('#erroLogin').hidden = true; }
 
+let _appAberto = false;
 async function abrirApp() {
-  try {
-    const p = await api('GET', '/perfil'); state.perfil = p;
-    const el = $('#avatarPerfil'); el.textContent = iniciais(p.nome) || 'IC';
-    el.title = p.nome ? `${p.nome} · ${{ admin:'Administrador', gestor:'Gestor', atendente:'Atendente' }[p.papel] || p.papel}` : 'Sua conta';
-  } catch { /* segue com o padrão */ }
+  let p;
+  try { p = await api('GET', '/perfil'); }
+  catch (e) {
+    // 401/403 já levaram à tela certa (login, código, sem acesso, senha nova)
+    if (![401, 403].includes(e.status)) mostrarLogin(e.message || 'Não consegui abrir sua conta agora.');
+    return;
+  }
+  state.perfil = p;
+  if (window.Conta) await window.Conta.depoisDoPerfil(p); else esconderLogin();
+  if (_appAberto) return route(null, { quieto:true });
+  _appAberto = true;
   carregarSaude();
   await route('inicio');
   await abrirPorLink();
 }
 
-/* Link vindo de outro app (Atendimento, CRM, Agenda): ?cliente=<uuid> ou ?tel=<telefone>
-   abre a ficha do cliente. O telefone sai da barra de endereço logo depois. */
+/* Link vindo de outro app (Atendimento, CRM, Agenda) ou do sino:
+   ?cliente=<uuid> ou ?tel=<telefone> abre a ficha · ?campanha=<uuid> abre a
+   aprovação · ?tela=mensagens&status=falhou&tipo=posvenda abre a lista filtrada.
+   O telefone sai da barra de endereço logo depois. */
 async function abrirPorLink() {
   const p = new URLSearchParams(location.search);
-  const id = p.get('cliente'), tel = (p.get('tel') || '').replace(/[^0-9]/g, '');
-  if (!id && tel.length < 8) return;
+  if (![...p.keys()].some(k => ['cliente', 'tel', 'campanha', 'tela'].includes(k))) return;
   history.replaceState(null, '', location.pathname);
+  await abrirLinkInterno(p);
+}
+window.abrirLinkInterno = abrirLinkInterno;
+async function abrirLinkInterno(p) {
+  const id = p.get('cliente'), tel = (p.get('tel') || '').replace(/[^0-9]/g, '');
+  const camp = p.get('campanha'), tela = p.get('tela');
   try {
+    if (camp && /^[0-9a-f-]{36}$/i.test(camp)) { state.campanhaEmFoco = camp; return route('campanhas'); }
+    if (tela && ROUTES[tela]) {
+      if (tela === 'mensagens') {
+        const st = p.get('status'), tp = p.get('tipo');
+        if (st && STATUS_ENVIO[st]) state.msg.status = st;
+        if (tp && TIPO[tp]) state.msg.tipo = tp;
+      }
+      return route(tela);
+    }
+    if (!id && tel.length < 8) return;
     let alvo = /^[0-9a-f-]{36}$/i.test(id || '') ? id : null;
     if (!alvo && tel) {
       const lista = await api('GET', '/clientes?q=' + encodeURIComponent(tel.replace(/^55(?=[0-9]{10,11}$)/, '')));
       alvo = lista?.[0]?.id || null;
     }
     if (!alvo) return toast('Cliente desse link não encontrado no cadastro.', 'err');
-    await route('clientes');
+    if (state.route !== 'clientes') await route('clientes');
     await abrirFicha(alvo);
-  } catch (e) { toast(e.message || 'Não consegui abrir o cliente do link.', 'err'); }
+  } catch (e) { toast(e.message || 'Não consegui abrir o link.', 'err'); }
 }
-
-$('#formLogin').addEventListener('submit', async e => {
-  e.preventDefault();
-  const f = e.target, btn = $('#btnEntrar');
-  btn.disabled = true; btn.textContent = 'ENTRANDO…';
-  try {
-    if (!sb) throw new Error('Conexão com o Supabase não configurada.');
-    const { error } = await sb.auth.signInWithPassword({ email: f.loginEmail.value.trim(), password: f.loginSenha.value });
-    if (error) throw new Error(/invalid login/i.test(error.message) ? 'E-mail ou senha incorretos.' : error.message);
-    f.loginSenha.value = '';
-    esconderLogin();
-    await abrirApp();
-  } catch (err) { mostrarLogin(err.message); }
-  finally { btn.disabled = false; btn.textContent = 'ENTRAR'; }
-});
 
 /* ==================== TEMA CLARO / ESCURO ==================== */
 const TEMA_KEY = 'indycar_tema';
@@ -1781,6 +1831,7 @@ function abrirAjuda() {
       <div class="ajuda-item"><span>🤝</span><div><b>Respeito ao cliente</b><p>Quem responde PARAR sai de tudo. Se o cliente está conversando com alguém (mensagem sem resposta há menos de 2 h ou esperando consultor), a régua espera 3 h. Feriado nacional segura as réguas de relacionamento.</p></div></div>
       <div class="ajuda-item"><span>🔁</span><div><b>Falhas</b><p>Erro passageiro tenta de novo sozinho (até 3 vezes, com espera). Chave do WhatsApp recusada para a rodada e devolve a mensagem para a fila.</p></div></div>
       <div class="ajuda-item"><span>💬</span><div><b>Atendimento</b><p>O que sai daqui aparece no histórico da conversa. "Abrir conversa" leva direto ao cliente no Atendimento.</p></div></div>
+      <div class="ajuda-item"><span>👥</span><div><b>Equipe</b><p>Atendente manda mensagem para um cliente; campanha para um grupo vai para o gestor aprovar. Cliente que pediu horário, quer orçamento ou reclamou vira <b>tarefa</b> para quem cuida da conversa; reclamação avisa o gestor no 🔔 na hora. Réguas, teste, CSV e importar: só gestor.</p></div></div>
       <div class="ajuda-item"><span>⌨️</span><div><b>Atalhos</b><p><kbd>N</kbd> nova campanha · <kbd>/</kbd> buscar · <kbd>?</kbd> esta ajuda · <kbd>Esc</kbd> fecha</p></div></div>
     </div>
     <div class="modal-foot"><button type="button" class="btn primary" data-fechar>Entendi</button></div>`);
@@ -1815,6 +1866,92 @@ function htmlSugestao(sg) {
   if (!CONFIG.configurado) return mostrarLogin('Falta configurar o Supabase no servidor (SUPABASE_URL, SUPABASE_ANON_KEY e SUPABASE_SERVICE_ROLE_KEY).');
   if (!window.supabase?.createClient) return mostrarLogin('A biblioteca do Supabase não carregou. Verifique sua conexão.');
   sb = window.supabase.createClient(CONFIG.supabaseUrl, CONFIG.supabaseAnonKey);
+  window.Conta?.ligar(sb);
+  // volta do e-mail de senha: o evento PASSWORD_RECOVERY abre a tela de senha nova
+  if (/type=recovery/.test(location.hash)) return;
   const { data } = await sb.auth.getSession();
-  if (data?.session) { esconderLogin(); try { await abrirApp(); } catch (err) { mostrarLogin(err.message); } }
+  if (data?.session) {
+    try { if (window.Conta) await window.Conta.depoisDoLogin(); else { esconderLogin(); await abrirApp(); } }
+    catch (err) { mostrarLogin(err.message); }
+  }
 })();
+
+/* ============================================================================
+   RODADA 3 — equipe: faixa "para você" no Início e aprovação de campanhas
+   ============================================================================ */
+
+/* Início: o que é da pessoa agora — tarefas abertas e campanhas para aprovar. */
+async function pintarFaixaEquipe() {
+  const box = $('#faixaEquipe'); if (!box) return;
+  const [tarefas, camp] = await Promise.all([
+    api('GET', '/tarefas').catch(() => []),
+    api('GET', '/campanhas/aprovacao?status=aguardando').catch(() => ({ lista: [], aguardando: 0 })),
+  ]);
+  if (!$('#faixaEquipe')) return;
+  const vencidas = tarefas.filter(t => t.vence_em && new Date(t.vence_em) < new Date()).length;
+  const gestor = pode('campanha_aprovar');
+  const itens = [];
+  if (tarefas.length) itens.push(`<button type="button" class="fe-item${vencidas ? ' alerta' : ''}" data-fe="tarefas">${svg(I.check)}
+      <span><b>${plural(tarefas.length, 'tarefa sua', 'tarefas suas')}</b><small>${vencidas ? `${plural(vencidas, 'vencida', 'vencidas')} · ` : ''}${esc(tarefas[0].titulo)}</small></span></button>`);
+  if (camp.aguardando) itens.push(`<button type="button" class="fe-item roxo" data-fe="aprovar">${svg(I.megafone)}
+      <span><b>${gestor ? plural(camp.aguardando, 'campanha esperando sua aprovação', 'campanhas esperando sua aprovação') : plural(camp.aguardando, 'campanha sua esperando o gestor', 'campanhas suas esperando o gestor')}</b>
+      <small>${esc(renderTemplate(camp.lista.find(c => c.status === 'aguardando')?.corpo || '', EXEMPLO))}</small></span></button>`);
+  box.innerHTML = itens.join('');
+  box.hidden = !itens.length;
+  box.onclick = (e) => {
+    const b = e.target.closest('[data-fe]'); if (!b) return;
+    if (b.dataset.fe === 'tarefas') window.Conta?.abrirTarefas(); else route('campanhas');
+  };
+}
+
+const STATUS_CAMP = { aguardando:['Aguardando aprovação', 'bp-orange'], aprovada:['Aprovada', 'bp-green'], recusada:['Recusada', 'bp-red'], cancelada:['Cancelada', 'bp-gray'] };
+
+/* Campanhas: propostas de atendentes. Gestor aprova/recusa; atendente vê as dele e pode cancelar. */
+async function pintarAprovacoes() {
+  const box = $('#aprovacoes'); if (!box) return;
+  let r;
+  try { [r] = await Promise.all([api('GET', '/campanhas/aprovacao'), carregarSegmentos().catch(() => null)]); } catch { return; }
+  if (!$('#aprovacoes')) return;
+  const lista = (r.lista || []).filter(c => c.status === 'aguardando' || (Date.now() - new Date(c.decidido_em || c.created_at).getTime()) < 14 * 86400000);
+  if (!lista.length) { box.innerHTML = ''; return; }
+  const gestor = r.gestor;
+  box.innerHTML = `<div class="panel aprov-panel"><div class="panel-head"><h2>${svg(I.check)} ${gestor ? 'Para aprovar' : 'Suas campanhas'}</h2>
+      <span class="panel-sub">${r.aguardando ? plural(r.aguardando, 'aguardando', 'aguardando') : 'nenhuma aguardando'}</span></div>
+    <div class="panel-body lista">${lista.map(c => {
+      const [rot, cor] = STATUS_CAMP[c.status] || [c.status, 'bp-gray'];
+      const alvo = c.segmento?.filtro ? `${(state.segmentos || []).find(s => s.id === c.segmento.filtro)?.rotulo || c.segmento.filtro}${c.segmento.valor ? ` (${c.segmento.valor})` : ''}` : 'clientes escolhidos';
+      return `<article class="aprov${c.id === state.campanhaEmFoco ? ' foco' : ''}" data-camp="${esc(c.id)}">
+        <div class="aprov-topo"><span class="badge-pill ${cor}">${esc(rot)}</span>
+          <small>${esc(c.criado_por_nome || 'atendente')} · ${esc(relativo(c.created_at))} · ${c.total_previsto ?? '?'} clientes · ${esc(alvo)}${c.enviar_em ? ` · para ${esc(dataHoraBR(c.enviar_em))}` : ''}</small></div>
+        <div class="envio-corpo">${esc(c.corpo)}</div>
+        ${c.status === 'recusada' && c.motivo_recusa ? `<p class="form-msg erro">Motivo: ${esc(c.motivo_recusa)}</p>` : ''}
+        ${c.status === 'aprovada' ? `<small class="muted">Aprovada por ${esc(c.decidido_por_nome || 'gestor')} · ${c.enfileirados ?? 0} na fila${c.pulados ? ` · ${c.pulados} pulados` : ''}</small>` : ''}
+        ${c.status === 'aguardando' ? `<div class="envio-acoes">
+          ${gestor ? `<button type="button" class="btn btn-mini" data-recusar="${esc(c.id)}">${svg(I.x)} Recusar</button>
+            <button type="button" class="btn btn-mini primary" data-aprovar="${esc(c.id)}">${svg(I.check)} Aprovar e colocar na fila</button>`
+          : `<button type="button" class="btn btn-mini" data-cancelar-camp="${esc(c.id)}">${svg(I.x)} Cancelar pedido</button>`}</div>` : ''}
+      </article>`; }).join('')}</div></div>`;
+  if (state.campanhaEmFoco) { $('.aprov.foco', box)?.scrollIntoView({ block:'center', behavior:'smooth' }); state.campanhaEmFoco = null; }
+  box.onclick = async (e) => {
+    const ap = e.target.closest('[data-aprovar]'), rc = e.target.closest('[data-recusar]'), cc = e.target.closest('[data-cancelar-camp]');
+    if (ap) {
+      if (!confirm('Aprovar esta campanha? As mensagens entram na fila agora (quem pediu para parar fica fora).')) return;
+      ap.disabled = true;
+      try { const x = await api('POST', `/campanhas/${ap.dataset.aprovar}/aprovar`, {}); toast(`Aprovada: ${plural(x.enfileirados, 'mensagem', 'mensagens')} na fila${x.pulados ? ` · ${x.pulados} pulada(s)` : ''}.`, 'ok', 5000); refreshBadge(); route(null, { quieto:true }); }
+      catch (err) { toast(err.message, 'err'); ap.disabled = false; }
+    }
+    if (rc) {
+      const motivo = prompt('Motivo da recusa (o atendente vê):', '');
+      if (motivo === null) return;
+      rc.disabled = true;
+      try { await api('POST', `/campanhas/${rc.dataset.recusar}/recusar`, { motivo }); toast('Campanha recusada — o atendente foi avisado.'); route(null, { quieto:true }); }
+      catch (err) { toast(err.message, 'err'); rc.disabled = false; }
+    }
+    if (cc) {
+      if (!confirm('Cancelar este pedido de campanha?')) return;
+      cc.disabled = true;
+      try { await api('POST', `/campanhas/${cc.dataset.cancelarCamp}/cancelar`, {}); toast('Pedido cancelado.'); route(null, { quieto:true }); }
+      catch (err) { toast(err.message, 'err'); cc.disabled = false; }
+    }
+  };
+}
