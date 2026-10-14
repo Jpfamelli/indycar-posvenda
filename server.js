@@ -9,20 +9,21 @@
 // As rotas e o porteiro de cada uma estão em rotas.js (testados sem banco);
 // as regras de papel/app em acesso.js; as automações da equipe em automacoes.js.
 import http from 'node:http';
-import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { dirname, join, extname, normalize, sep } from 'node:path';
+import { dirname, join } from 'node:path';
 import * as dados from './dados.js';
 import * as ia from './ia.js';
 import * as acesso from './acesso.js';
 import * as auto from './automacoes.js';
+import * as carteiro from './carteiro.js';
 import { criarApi } from './rotas.js';
+import { criarEstaticos } from './estaticos.js';
 import { selecionarUm, conferirConfiguracao } from './supabase.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC = join(__dirname, 'public');
 const PORT = process.env.PORT || 3500;
-export const VERSAO = '3.0.0';
+export const VERSAO = '4.0.0';
 
 /* Token do carteiro externo (GitHub Actions e o pg_cron do Supabase chamam
    /api/rodar de fora, para o caso do servidor gratuito do Render estar dormindo). */
@@ -127,7 +128,6 @@ async function statusWhatsappAgora() {
 // CARTEIRO — gera o que as réguas mandam e envia o que venceu
 // ============================================================================
 
-let carteiroRodando = false;
 const ultimaRodada = { em: null, resultado: null };
 /* CARTEIRO_DESLIGADO=1: servidor local de conferência — sem timers e sem rodada
    (nada é gerado, nada é enviado, nada é gravado na fila). */
@@ -141,80 +141,127 @@ async function equipeNaRodada() {
   return saida;
 }
 
-async function rodarCarteiro() {
-  if (CARTEIRO_DESLIGADO) return { ok: false, desligado: true, enviados: 0, falhas: 0, aviso: 'Carteiro desligado neste servidor (CARTEIRO_DESLIGADO=1): nada foi gerado nem enviado.' };
-  if (carteiroRodando) return { ok: false, erro: 'já está rodando' };
-  carteiroRodando = true;
-  try {
-    const cfg = await dados.obterConfig();
-    const gerado = await dados.gerarTudo({ cfg });
-    const base = { ok: true, gerado, enviados: 0, falhas: 0, adiados: 0, reagendados: 0, versao: VERSAO };
+/* Rodada 4: se já está rodando, quem chamou ESPERA a rodada atual (antes voltava
+   "já está rodando" e o "Rodar agora" parecia falhar). */
+let rodadaAtual = null;
+function rodarCarteiro(origem = 'desconhecido') {
+  if (CARTEIRO_DESLIGADO) return Promise.resolve({ ok: false, desligado: true, enviados: 0, falhas: 0, aviso: 'Carteiro desligado neste servidor (CARTEIRO_DESLIGADO=1): nada foi gerado nem enviado.' });
+  if (rodadaAtual) return rodadaAtual.then((r) => ({ ...r, juntouComRodadaEmAndamento: true }));
+  const inicio = Date.now();
+  rodadaAtual = umaRodada()
+    .catch((e) => {
+      console.error('Carteiro:', e?.message || e);
+      return { ok: false, erro: 'O carteiro não conseguiu rodar agora (banco ou rede fora). Ele tenta de novo sozinho na próxima chamada.', enviados: 0, falhas: 0, detalhe: String(e?.message || e).slice(0, 200) };
+    })
+    .then((r) => {
+      dados.registrarBatida({
+        origem, duracao_ms: Date.now() - inicio, ok: r.ok !== false, criados: r.gerado?.criados, enviados: r.enviados,
+        falhas: r.falhas, expirados: r.expirados, presos: r.presos, aviso: r.aviso, erro: r.ok === false ? (r.detalhe || r.erro) : null, versao: VERSAO,
+      });
+      return { ...r, origem, duracao_ms: Date.now() - inicio };
+    })
+    .finally(() => { rodadaAtual = null; });
+  return rodadaAtual;
+}
 
-    // a IA lê as respostas novas (independe da janela: ninguém recebe nada por isso)
-    base.ia = await lerRespostasComIA().catch((e) => ({ erro: String(e?.message || e) }));
+/** "Ontem" ficou sem nenhuma rodada? (o servidor ficou fora o dia todo) */
+function ontemSemRodada(ultimaRodadaEm) {
+  if (!ultimaRodadaEm) return false; // nunca rodou: régua recém-ligada não manda parabéns atrasado
+  const inicioDeOntem = dados.instanteSP(dados.somarDias(dados.hoje(), -1), '00:00').getTime();
+  return new Date(ultimaRodadaEm).getTime() < inicioDeOntem;
+}
 
-    if (cfg.pausa_geral) return anotar({ ...base, equipe: await equipeNaRodada(), aviso: 'Envios pausados: a pausa geral está ligada.' });
-    const { hora, diaSemana, data } = dados.agoraSP();
-    if (hora < cfg.janela_inicio || hora >= cfg.janela_fim) {
-      return anotar({ ...base, equipe: await equipeNaRodada(), aviso: `Fora da janela de envio (${cfg.janela_inicio}h–${cfg.janela_fim}h).` });
-    }
-    if (diaSemana === 0 && !cfg.envia_domingo) return anotar({ ...base, equipe: await equipeNaRodada(), aviso: 'Domingo: envios automáticos pausados.' });
+async function umaRodada() {
+  const cfg = await dados.obterConfig();
+  // 1. o que ficou para trás e não faz mais sentido, e envios presos de um servidor que caiu
+  const presos = await dados.soltarReservasPresas(carteiro.ERRO_RESERVA_PRESA, carteiro.RESERVA_PRESA_MIN).catch(() => 0);
+  const expirados = await dados.expirarVencidos(carteiro.MOTIVO_EXPIRADO).catch(() => 0);
+  // 2. as réguas geram (idempotente: chave única por cliente/agendamento)
+  const gerado = await dados.gerarTudo({ cfg, recuperarOntem: ontemSemRodada(cfg.ultima_rodada_em) });
+  const base = { ok: true, gerado, enviados: 0, falhas: 0, adiados: 0, reagendados: 0, expirados, presos, versao: VERSAO };
 
-    // limite por hora: nunca passa do configurado (padrão 60)
-    const vagas = dados.vagasNestaRodada(cfg.limite_por_hora, await dados.enviadasNaUltimaHora().catch(() => 0));
-    if (!vagas) return anotar({ ...base, equipe: await equipeNaRodada(), aviso: `Limite de ${cfg.limite_por_hora} mensagens por hora atingido — o resto sai na próxima rodada.` });
+  // a IA lê as respostas novas (independe da janela: ninguém recebe nada por isso)
+  base.ia = await lerRespostasComIA().catch((e) => ({ erro: String(e?.message || e) }));
 
-    const nomeFeriado = dados.feriado(data);
-    const fila = await dados.enviosDevidos(Math.min(vagas + 10, 40)); // folga: alguns serão adiados
-    let enviados = 0, falhas = 0, adiados = 0, reagendados = 0, parouPor = null;
-    for (const envio of fila) {
-      if (enviados >= vagas) break;
-      // feriado nacional: régua de relacionamento espera o próximo dia útil
-      if (nomeFeriado && dados.TIPOS_SEGURAM_NO_FERIADO.has(envio.tipo)) {
-        await dados.adiarEnvio(envio.id, dados.proximoDiaDeEnvio(data, cfg.hora_envio, cfg.envia_domingo), `feriado (${nomeFeriado})`).catch(() => {});
-        adiados++; continue;
-      }
-      // alguém está atendendo o cliente agora → espera 3 h
-      let ocup = { ocupada: false, conversa: undefined };
-      try { ocup = await dados.ocupacaoDaConversa(envio.telefone); } catch { /* sem leitura: segue */ }
-      if (ocup.ocupada && dados.TIPOS_ESPERAM_ATENDIMENTO.has(envio.tipo)) {
-        await dados.adiarEnvio(envio.id, new Date(Date.now() + 3 * 3600000).toISOString(), ocup.motivo).catch(() => {});
-        adiados++; continue;
-      }
-
-      const r = await enviarWhatsApp(envio.telefone, envio.corpo);
-      const tentativas = (Number(envio.tentativas) || 0) + 1;
-      if (r.ok) {
-        await dados.marcarEnvio(envio.id, 'enviado', null, tentativas, { motivo_pulado: null });
-        enviados++;
-        // aparece no histórico da conversa do Atendimento (só depois de sair de verdade)
-        await dados.registrarNoHistorico(envio, ocup.conversa).catch((e) => console.error(`Histórico do envio ${envio.id}:`, e?.message || e));
-      } else {
-        console.error(`Envio ${envio.id} falhou: ${r.erro}`);
-        if (erroEstrutural(r.erro)) {
-          /* Sem aparelho/chave TODOS falhariam igual: a mensagem volta para a
-             fila (sem gastar tentativa) e a rodada para aqui, com o aviso claro. */
-          await dados.marcarEnvio(envio.id, 'pendente', r.erro, Number(envio.tentativas) || 0).catch(() => {});
-          falhas++;
-          parouPor = r.erro;
-          break;
-        }
-        // falha transitória: até 3 tentativas, com espera (5 e 15 min)
-        const d = dados.decidirFalha(r.erro, tentativas);
-        if (d.status === 'pendente') {
-          await dados.marcarEnvio(envio.id, 'pendente', r.erro, tentativas, { enviar_em: d.enviar_em });
-          reagendados++;
-        } else {
-          await dados.marcarEnvio(envio.id, 'falhou', r.erro, tentativas);
-          falhas++;
-        }
-      }
-      await new Promise((r2) => setTimeout(r2, 1200)); // 1 msg/1,2 s — sem rajada
-    }
-    return anotar({ ...base, equipe: await equipeNaRodada(), enviados, falhas, adiados, reagendados, feriado: nomeFeriado || undefined, aviso: parouPor || undefined });
-  } finally {
-    carteiroRodando = false;
+  if (cfg.pausa_geral) return anotar({ ...base, equipe: await equipeNaRodada(), aviso: 'Envios pausados: a pausa geral está ligada.' });
+  const { hora, diaSemana, data } = dados.agoraSP();
+  if (hora < cfg.janela_inicio || hora >= cfg.janela_fim) {
+    return anotar({ ...base, equipe: await equipeNaRodada(), aviso: `Fora da janela de envio (${cfg.janela_inicio}h–${cfg.janela_fim}h).` });
   }
+  if (diaSemana === 0 && !cfg.envia_domingo) return anotar({ ...base, equipe: await equipeNaRodada(), aviso: 'Domingo: envios automáticos pausados.' });
+
+  // limite por hora: nunca passa do configurado (padrão 60)
+  const vagas = dados.vagasNestaRodada(cfg.limite_por_hora, await dados.enviadasNaUltimaHora().catch(() => 0));
+  if (!vagas) return anotar({ ...base, equipe: await equipeNaRodada(), aviso: `Limite de ${cfg.limite_por_hora} mensagens por hora atingido — o resto sai na próxima rodada.` });
+
+  const nomeFeriado = dados.feriado(data);
+  const fila = await dados.enviosDevidos(Math.min(vagas + 10, 40)); // folga: alguns serão adiados
+  // lembretes: confere o horário de AGORA (cancelado/remarcado enquanto o servidor dormia)
+  const agendas = await dados.agendamentosPorIds(fila.filter((e) => e.tipo === 'lembrete').map((e) => e.agendamento_id)).catch(() => null);
+  let enviados = 0, falhas = 0, adiados = 0, reagendados = 0, pulados = 0, parouPor = null;
+  for (const envio of fila) {
+    if (enviados >= vagas) break;
+    if (carteiro.envioVencido(envio)) continue; // a faxina do começo pega na próxima
+    // feriado nacional: régua de relacionamento espera o próximo dia útil
+    if (nomeFeriado && dados.TIPOS_SEGURAM_NO_FERIADO.has(envio.tipo)) {
+      await dados.adiarEnvio(envio.id, dados.proximoDiaDeEnvio(data, cfg.hora_envio, cfg.envia_domingo), `feriado (${nomeFeriado})`).catch(() => {});
+      adiados++; continue;
+    }
+    if (envio.tipo === 'lembrete' && envio.agendamento_id && agendas) {
+      const c = carteiro.conferirLembrete(envio, agendas.get(envio.agendamento_id), cfg);
+      if (c.acao === 'pular') { await dados.marcarEnvio(envio.id, 'pulado', null, undefined, { motivo_pulado: c.motivo }).catch(() => {}); pulados++; continue; }
+      if (c.acao === 'atualizar') {
+        await dados.atualizarEnvio(envio.id, { corpo: c.corpo, expira_em: c.expira_em, ...(c.enviar_em ? { enviar_em: c.enviar_em } : {}) }).catch(() => {});
+        if (c.enviar_em) { reagendados++; continue; }
+        envio.corpo = c.corpo;
+      }
+    }
+    // alguém está atendendo o cliente agora → espera 3 h
+    let ocup = { ocupada: false, conversa: undefined };
+    try { ocup = await dados.ocupacaoDaConversa(envio.telefone); } catch { /* sem leitura: segue */ }
+    if (ocup.ocupada && dados.TIPOS_ESPERAM_ATENDIMENTO.has(envio.tipo)) {
+      await dados.adiarEnvio(envio.id, new Date(Date.now() + 3 * 3600000).toISOString(), ocup.motivo).catch(() => {});
+      adiados++; continue;
+    }
+
+    // reserva: só quem reservou manda (outro carteiro pode estar na mesma fila)
+    const reservado = await dados.reservarEnvio(envio.id).catch(() => null);
+    if (!reservado) continue;
+
+    const r = await enviarWhatsApp(envio.telefone, envio.corpo);
+    const tentativas = (Number(envio.tentativas) || 0) + 1;
+    if (r.ok) {
+      /* Saiu: marcar como enviado com novas tentativas (o Supabase às vezes engasga).
+         Se nem assim gravar, a reserva fica e vira "confira antes de reenviar" —
+         nunca uma segunda mensagem para o cliente. */
+      await carteiro.comTentativas(() => dados.marcarEnvio(envio.id, 'enviado', null, tentativas, { motivo_pulado: null }))
+        .catch((e) => console.error(`Envio ${envio.id} saiu mas não consegui marcar:`, e?.message || e));
+      enviados++;
+      // aparece no histórico da conversa do Atendimento (só depois de sair de verdade)
+      await dados.registrarNoHistorico(envio, ocup.conversa).catch((e) => console.error(`Histórico do envio ${envio.id}:`, e?.message || e));
+    } else {
+      console.error(`Envio ${envio.id} falhou: ${r.erro}`);
+      if (erroEstrutural(r.erro)) {
+        /* Sem aparelho/chave TODOS falhariam igual: a mensagem volta para a
+           fila (sem gastar tentativa) e a rodada para aqui, com o aviso claro. */
+        await dados.marcarEnvio(envio.id, 'pendente', r.erro, Number(envio.tentativas) || 0).catch(() => {});
+        falhas++;
+        parouPor = r.erro;
+        break;
+      }
+      // falha transitória: até 3 tentativas, com espera (5 e 15 min)
+      const d = dados.decidirFalha(r.erro, tentativas);
+      if (d.status === 'pendente') {
+        await dados.marcarEnvio(envio.id, 'pendente', r.erro, tentativas, { enviar_em: d.enviar_em });
+        reagendados++;
+      } else {
+        await dados.marcarEnvio(envio.id, 'falhou', r.erro, tentativas);
+        falhas++;
+      }
+    }
+    await new Promise((r2) => setTimeout(r2, 1200)); // 1 msg/1,2 s — sem rajada
+  }
+  return anotar({ ...base, equipe: await equipeNaRodada(), enviados, falhas, adiados, reagendados, pulados, feriado: nomeFeriado || undefined, aviso: parouPor || undefined });
 }
 
 function anotar(resultado) {
@@ -358,32 +405,8 @@ const api = criarApi({
   carteiro: { rodar: rodarCarteiro, lerRespostas: lerRespostasComIA, ultimaRodada: () => (ultimaRodada.em ? ultimaRodada : null) },
 });
 
-async function serveStatic(req, res, pathname) {
-  if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405, { Allow: 'GET, HEAD', ...SEGUROS }); return res.end(); }
-  let rel;
-  try { rel = decodeURIComponent(pathname === '/' ? '/index.html' : pathname); }
-  catch { res.writeHead(400, SEGUROS); return res.end(); }
-  const filePath = normalize(join(PUBLIC, rel));
-  if (filePath !== PUBLIC && !filePath.startsWith(PUBLIC + sep)) { res.writeHead(404, SEGUROS); return res.end(); }
-  const ext = extname(filePath);
-  try {
-    const data = await readFile(filePath);
-    res.writeHead(200, {
-      'Content-Type': MIME[ext] || 'application/octet-stream',
-      // o service worker e o HTML nunca podem ficar presos em cache; imagens podem
-      'Cache-Control': /\.(png|svg|ico|woff2)$/.test(ext) ? 'public, max-age=86400' : 'no-cache, must-revalidate',
-      ...SEGUROS,
-    });
-    res.end(data);
-  } catch {
-    if (ext && ext !== '.html') { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', ...SEGUROS }); return res.end('Não encontrado'); }
-    try {
-      const html = await readFile(join(PUBLIC, 'index.html'));
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...SEGUROS });
-      res.end(html);
-    } catch { res.writeHead(404, SEGUROS); res.end(); }
-  }
-}
+/* Rodada 4: arquivos da tela em memória, comprimidos e com ETag (estaticos.js). */
+const serveStatic = criarEstaticos({ pasta: PUBLIC, mime: MIME, seguros: SEGUROS });
 
 const server = http.createServer(async (req, res) => {
   const inicio = Date.now();
@@ -415,8 +438,8 @@ const aviso = (onde) => (e) => console.error(`${onde}:`, e?.message || e);
 // gratuito o servidor DORME — por isso o GitHub Actions e o pg_cron do Supabase
 // também chamam /api/rodar.
 // CARTEIRO_DESLIGADO=1 (conferência local): nenhum timer é criado.
-const timerCarteiro = CARTEIRO_DESLIGADO ? null : setInterval(() => rodarCarteiro().catch(aviso('Carteiro')), 10 * 60 * 1000);
-const timerInicial = CARTEIRO_DESLIGADO ? null : setTimeout(() => rodarCarteiro().catch(aviso('Carteiro')), 15 * 1000);
+const timerCarteiro = CARTEIRO_DESLIGADO ? null : setInterval(() => rodarCarteiro('timer').catch(aviso('Carteiro')), 10 * 60 * 1000);
+const timerInicial = CARTEIRO_DESLIGADO ? null : setTimeout(() => rodarCarteiro('inicio').catch(aviso('Carteiro')), 15 * 1000);
 
 function encerrar(sinal) {
   console.log(`\n  ${sinal}: encerrando com calma…`);

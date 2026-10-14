@@ -13,6 +13,11 @@
 import { randomUUID } from 'node:crypto';
 import * as A from './acesso.js';
 import * as auto from './automacoes.js';
+import { gzipSync, brotliCompressSync, constants as zc } from 'node:zlib';
+import * as carteiroPuro from './carteiro.js';
+import * as prontidao from './prontidao.js';
+import * as projecao from './projecao.js';
+import * as aniv from './aniversarios.js';
 
 const LIMITE_CORPO = 2_000_000; // importação de planilha pode ser grande
 
@@ -32,6 +37,16 @@ function lerCorpo(req, limite = LIMITE_CORPO) {
   });
 }
 
+/** O navegador aceita esta compressão? ("gzip, deflate, br;q=1.0" → br e gzip sim). */
+export function aceitaCodificacao(cabecalho, nome) {
+  return String(cabecalho || '').toLowerCase().split(',').some((p) => {
+    const [tok, ...params] = p.trim().split(';');
+    if (tok.trim() !== nome) return false;
+    const q = params.map((x) => x.trim()).find((x) => x.startsWith('q='));
+    return !q || Number(q.slice(2)) > 0;
+  });
+}
+
 const mascararTel = (t) => { const d = String(t || '').replace(/\D/g, ''); return d ? `…${d.slice(-4)}` : null; };
 
 export function criarApi(deps) {
@@ -47,9 +62,16 @@ export function criarApi(deps) {
   const marcarAcesso = A.criarMarcadorDeAcesso({ relogio });
 
   // ---- respostas ---------------------------------------------------------------
+  /* Rodada 4: resposta grande vai comprimida (brotli ou gzip, o que o navegador aceitar). */
   function send(res, status, data, headers = {}) {
-    const body = typeof data === 'string' ? data : JSON.stringify(data);
-    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...seguros, ...(res.__cors || {}), ...headers });
+    let body = typeof data === 'string' ? data : JSON.stringify(data);
+    const extra = {};
+    if (body.length > 1400 && res.__aceita) {
+      if (aceitaCodificacao(res.__aceita, 'br')) { body = brotliCompressSync(body, { params: { [zc.BROTLI_PARAM_QUALITY]: 4 } }); extra['Content-Encoding'] = 'br'; }
+      else if (aceitaCodificacao(res.__aceita, 'gzip')) { body = gzipSync(body, { level: 6 }); extra['Content-Encoding'] = 'gzip'; }
+      if (extra['Content-Encoding']) extra.Vary = 'Accept-Encoding';
+    }
+    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...seguros, ...(res.__cors || {}), ...extra, ...headers });
     res.end(body);
   }
   const ok = (res, d) => send(res, 200, d);
@@ -100,6 +122,19 @@ export function criarApi(deps) {
     return !!e && e.criado_por_id === usuario.id;
   }
 
+  /* Cache curto no servidor (por processo): telas que várias pessoas abrem ao
+     mesmo tempo não repetem as mesmas leituras pesadas. */
+  const cache = new Map();
+  async function emCache(chave, ms, fn) {
+    const c = cache.get(chave);
+    if (c && relogio() - c.em < ms) return c.valor;
+    const valor = await fn();
+    cache.set(chave, { valor, em: relogio() });
+    return valor;
+  }
+  const esquecerCache = (...chaves) => { for (const k of chaves) cache.delete(k); };
+  deps.esquecerCache = esquecerCache;
+
   // ---- handlers (chave = "MÉTODO padrão" de acesso.ROTAS) ------------------------
   const H = {};
   const rota = (metodo, padrao, fn) => { H[`${metodo} ${padrao}`] = fn; };
@@ -111,10 +146,17 @@ export function criarApi(deps) {
     app: 'IndyCar Comunicar', versao,
   }));
   rota('GET', '/api/ping', ({ res }) => ok(res, { ok: true, versao }));
+  /* Carteiro externo (pg_cron/GitHub). Rodada 4: diz de onde veio (?origem=) e
+     responde em até 25 s — se a rodada for longa, devolve 202 e ela segue
+     sozinha (antes o pg_cron estourava 90 s esperando). */
   rota('POST', '/api/rodar', async ({ req, res, url }) => {
     const t = req.headers['x-runner-token'] || url.searchParams.get('t') || '';
     if (!runnerToken || t !== runnerToken) return send(res, 403, { erro: 'Token do carteiro inválido.' });
-    return ok(res, await carteiro.rodar());
+    const pedida = String(url.searchParams.get('origem') || req.headers['x-origem'] || 'cron').toLowerCase();
+    const origem = ['cron', 'reforco', 'github'].includes(pedida) ? pedida : 'cron';
+    const r = await carteiroPuro.esperarAte(Promise.resolve(carteiro.rodar(origem)), deps.esperaRodarMs ?? 25_000, null);
+    esquecerCache('resumo', 'fila', 'carteiro', 'pronto');
+    return r ? ok(res, r) : send(res, 202, { ok: true, emAndamento: true, origem, aviso: 'A rodada continua no servidor.' });
   });
 
   // ---- conta: perfil, sino, tarefas ----
@@ -172,7 +214,7 @@ export function criarApi(deps) {
   });
 
   // ---- painel ----
-  rota('GET', '/api/resumo', async ({ res }) => ok(res, await dados.resumo()));
+  rota('GET', '/api/resumo', async ({ res }) => ok(res, await emCache('resumo', 15_000, () => dados.resumo())));
   rota('GET', '/api/saude', async ({ res }) => {
     const s = await dados.saude();
     const ur = carteiro.ultimaRodada?.();
@@ -219,7 +261,7 @@ export function criarApi(deps) {
   // ---- fila ----
   const filtrosEnvios = (sp, limite) => ({
     status: sp.get('status') || undefined, tipo: sp.get('tipo') || undefined, q: String(sp.get('q') || '').slice(0, 80) || undefined,
-    de: sp.get('de') || undefined, ate: sp.get('ate') || undefined, intencao: sp.get('intencao') || undefined, limite,
+    de: sp.get('de') || undefined, ate: sp.get('ate') || undefined, intencao: sp.get('intencao') || undefined, limite, offset: Number(sp.get('offset')) || 0,
   });
   rota('GET', '/api/envios', async ({ res, url }) =>
     ok(res, await dados.listarEnvios(filtrosEnvios(url.searchParams, Math.min(Number(url.searchParams.get('limite')) || 300, 1000)))));
@@ -267,6 +309,7 @@ export function criarApi(deps) {
       return ok(res, { ok: true, enfileirados: criado ? 1 : 0, pulados: 0, envio: criado });
     }
 
+    esquecerCache('resumo', 'fila');
     const r = await executarCampanha({ corpo, detalhe, destinos, enviarEm: enviarEm.toISOString(), criador: usuario });
     auditar(usuario, 'campanha_enviada', 'posvenda_envios', r.lote, { total: destinos.length, enfileirados: r.enfileirados, pulados: r.pulados, segmento: body.segmento || null });
     return ok(res, { ok: true, ...r });
@@ -359,7 +402,8 @@ export function criarApi(deps) {
 
   // ---- carteiro e prévia ----
   rota('POST', '/api/rodar-agora', async ({ res, usuario }) => {
-    const r = await carteiro.rodar();
+    const r = await carteiro.rodar('manual');
+    esquecerCache('resumo', 'fila', 'carteiro', 'pronto');
     auditar(usuario, 'carteiro_manual', 'posvenda_envios', null, { enviados: r?.enviados ?? 0, falhas: r?.falhas ?? 0 });
     return ok(res, r);
   });
@@ -374,6 +418,7 @@ export function criarApi(deps) {
   const salvarConfig = async ({ res, usuario, body }) => {
     const antes = await dados.obterConfig();
     const depois = await dados.salvarConfig(body);
+    esquecerCache('resumo', 'pronto', 'projecao', 'carteiro');
     for (const r of dados.REGUAS) {
       const k = `ativo_${r}`;
       if (antes[k] !== depois[k]) auditar(usuario, depois[k] ? 'regua_ligada' : 'regua_desligada', 'posvenda_config', r, { regua: r });
@@ -488,6 +533,115 @@ export function criarApi(deps) {
     return ok(res, { ok: true });
   });
 
+  // ---- RODADA 4: carteiro, prontidão, prévia do mês, aniversários, equipe ----
+
+  async function resumoDoCarteiro() {
+    const [batidas, chamadas, cfg] = await Promise.all([
+      dados.batidasRecentes?.(24).catch(() => []) ?? [],
+      dados.chamadasRecentes?.(24).catch(() => []) ?? [],
+      dados.obterConfig(),
+    ]);
+    const r = carteiroPuro.resumirCarteiro({ batidas, chamadas, agora: relogio(), janela: { inicio: cfg.janela_inicio, fim: cfg.janela_fim } });
+    // a última rodada gravada na config vale mesmo sem batida (servidor antigo)
+    if (!r.ultimaEm && cfg.ultima_rodada_em) r.ultimaEm = cfg.ultima_rodada_em;
+    return { ...r, configurado: !!cfg.carteiro_configurado, janela: { inicio: cfg.janela_inicio, fim: cfg.janela_fim } };
+  }
+
+  rota('GET', '/api/carteiro', async ({ res }) => ok(res, await emCache('carteiro', 20_000, resumoDoCarteiro)));
+  rota('GET', '/api/fila/contagem', async ({ res }) => ok(res, { pendentes: await emCache('fila', 10_000, () => dados.contarPendentes()) }));
+
+  rota('GET', '/api/pronto', async ({ res, usuario }) => {
+    const fatos = await emCache('pronto', 30_000, async () => {
+      const [cfg, wa, carteiroR, comData, total, iaCfg, chave, testeOk] = await Promise.all([
+        dados.obterConfig(),
+        Promise.resolve(whatsapp.status?.()).catch(() => ({ ok: false })),
+        resumoDoCarteiro().catch(() => ({})),
+        dados.contarComNascimento().catch(() => 0),
+        dados.contarClientesComTelefone().catch(() => 0),
+        dados.iaConfig().catch(() => ({})),
+        dados.chaveIA().catch(() => null),
+        dados.ultimoTesteOk().catch(() => null),
+      ]);
+      return { cfg, whatsapp: wa || {}, carteiro: carteiroR, aniversarios: { comData, total }, ia: { ativo: iaCfg.ativo, temChave: !!chave }, teste: { ultimoOkEm: testeOk } };
+    });
+    const r = prontidao.montarProntidao({ ...fatos, agora: relogio() });
+    return ok(res, { ...r, gestor: A.ehGestor(usuario) });
+  });
+
+  rota('GET', '/api/projecao', async ({ res }) => {
+    const r = await emCache('projecao', 10 * 60_000, async () => {
+      const d = await dados.dadosDaProjecao();
+      return projecao.projetarMes({ hoje: dados.hoje(), ...d, agora: new Date(relogio()) });
+    });
+    return ok(res, r);
+  });
+
+  rota('POST', '/api/aniversarios/analisar', async ({ res, body }) => {
+    const texto = String(body.texto ?? '');
+    if (!texto.trim()) return bad(res, 'Cole a lista (ou escolha o arquivo) primeiro.');
+    if (texto.length > 600_000) return bad(res, 'Lista grande demais: divida em partes de até 3.000 linhas.');
+    const lido = aniv.lerLista(texto);
+    if (!lido.linhas.length) return bad(res, 'Não achei nenhuma linha com conteúdo.');
+    const clientes = await emCache('clientes-casar', 60_000, () => dados.clientesParaCasar());
+    const itens = aniv.casarComClientes(lido.linhas, clientes);
+    return ok(res, { itens, resumo: aniv.resumirAnalise(itens), cabecalho: lido.cabecalho, cortado: !!lido.cortado });
+  });
+
+  rota('POST', '/api/aniversarios/gravar', async ({ res, usuario, body }) => {
+    const brutos = Array.isArray(body.itens) ? body.itens.slice(0, 3000) : [];
+    const itens = brutos.filter((i) => i && dados.ehUuid(i.cliente_id) && aniv.lerData(i.nascimento))
+      .map((i) => ({ cliente_id: i.cliente_id, nascimento: aniv.lerData(i.nascimento) }));
+    if (!itens.length) return bad(res, 'Nada para gravar: escolha pelo menos um cliente com data válida.');
+    if (itens.length > 1 && !A.pode(usuario, 'importar'))
+      return send(res, 403, { erro: 'Gravar uma lista inteira é com o gestor. Peça a ele, ou cadastre um por vez na ficha.', codigo: 'sem_permissao' });
+    const r = await dados.gravarNascimentos(itens, { substituir: body.substituir === true && A.pode(usuario, 'importar') });
+    esquecerCache('pronto', 'projecao', 'clientes-casar');
+    auditar(usuario, 'aniversarios_gravados', 'clientes', null, { pedidos: itens.length, gravados: r.gravados, substituir: body.substituir === true, origem: String(body.origem || 'lista').slice(0, 20) });
+    return ok(res, { ok: true, ...r, ignorados: itens.length - r.gravados });
+  });
+
+  rota('GET', '/api/aniversarios/sugestoes', async ({ res }) => {
+    const r = await emCache('sugestoes-aniv', 5 * 60_000, async () => {
+      const textos = await dados.textosComAniversario();
+      const ids = [...textos.leads.map((l) => l.cliente_id), ...textos.mensagens.map((m) => m.conversa?.cliente_id)].filter(dados.ehUuid);
+      const fichas = ids.length ? await dados.buscarClientesPorIds(ids) : [];
+      const mapa = new Map(fichas.map((c) => [c.id, c]));
+      const sugestoes = aniv.montarSugestoes(textos, mapa);
+      return { sugestoes, lidos: { fichas: textos.fichas.length, crm: textos.leads.length, conversas: textos.mensagens.length } };
+    });
+    return ok(res, r);
+  });
+
+  const ASSUNTOS_PEDIDO = {
+    reguas: 'mudar uma régua', ligar: 'ligar o Comunicar (réguas)', importar: 'importar aniversários/planilha', teste: 'mandar um teste de WhatsApp',
+    rodar: 'rodar o carteiro agora', optout: 'voltar a mandar para um cliente que saiu da lista', campanha: 'aprovar uma campanha', outro: 'uma ajuda no Comunicar',
+  };
+  rota('POST', '/api/pedir-gestor', async ({ res, usuario, body }) => {
+    const assunto = ASSUNTOS_PEDIDO[body.assunto] ? body.assunto : 'outro';
+    const detalhe = String(body.detalhe || '').trim().slice(0, 300) || null;
+    const ids = (await dados.gestores().catch(() => [])).filter((id) => id !== usuario.id);
+    if (!ids.length) return bad(res, 'Não achei um gestor para avisar. Fale com o administrador.');
+    const dia = dados.hoje();
+    let avisados = 0;
+    for (const perfil of ids) {
+      const r = await dados.notificar({
+        perfil, tipo: 'pedido', titulo: `${usuario.nome || 'Alguém da equipe'} pede: ${ASSUNTOS_PEDIDO[assunto]}`,
+        corpo: detalhe, link: assunto === 'campanha' ? '/?tela=campanhas' : '/?tela=reguas', app: 'comunicar',
+        chave: `pedido:${usuario.id}:${assunto}:${dia}`,
+      }).catch(() => null);
+      if (r !== null) avisados++;
+    }
+    auditar(usuario, 'pedido_ao_gestor', 'notificacoes', null, { assunto, avisados });
+    return ok(res, { ok: true, avisados });
+  });
+
+  rota('GET', '/api/equipe/indicadores', async ({ res, usuario, url }) => {
+    const dias = Math.min(Math.max(Number(url.searchParams.get('dias')) || 30, 7), 90);
+    const todos = await emCache(`indicadores:${dias}`, 60_000, () => dados.indicadoresEquipe(dias));
+    const gestor = A.ehGestor(usuario);
+    return ok(res, { dias, gestor, pessoas: gestor ? todos : todos.filter((p) => p.perfil_id === usuario.id) });
+  });
+
   // ---- o porteiro ------------------------------------------------------------------
   async function api(req, res, url) {
     const { pathname } = url;
@@ -504,6 +658,7 @@ export function criarApi(deps) {
       }
     }
 
+    res.__aceita = String(req.headers['accept-encoding'] || '');
     const regra = A.regraDaRota(m, pathname);
     if (!regra) return naoAchou(res);
     if (regra.metodoErrado) return send(res, 405, { erro: 'Método não permitido.' });

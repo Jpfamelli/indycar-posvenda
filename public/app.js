@@ -122,8 +122,16 @@ async function api(method, path, body, _repetiu = false) {
   const opt = { method, headers: await authCabecalhos() };
   if (body !== undefined) opt.body = JSON.stringify(body);
   let r;
-  try { r = await fetch('/api' + path, opt); }
-  catch { const e = new Error('Sem internet — confira a conexão e tente de novo.'); e.status = 0; throw e; }
+  /* Rodada 4: o Acordar (acordar.js) espera o Render acordar e tenta de novo
+     sozinho (até ~3 min) em vez de mostrar erro cru. */
+  try { r = await (window.Acordar ? window.Acordar.buscar('/api' + path, opt) : fetch('/api' + path, opt)); }
+  catch (err) {
+    const e = new Error(/não acordou/.test(err?.message || '') ? err.message : 'Sem internet — confira a conexão e tente de novo. O que você escreveu continua aqui.');
+    e.status = 0; throw e;
+  }
+  if (window.Acordar?.ehAcordando(r.status, r.headers.get('content-type'))) {
+    const e = new Error('O sistema está acordando. Tente de novo em instantes — o que você escreveu continua aqui.'); e.status = r.status; throw e;
+  }
   const data = await r.json().catch(() => ({}));
   if (r.status === 401 || (r.status === 403 && ['sem_acesso', 'trocar_senha'].includes(data.codigo))) {
     const acao = window.Conta ? await window.Conta.tratarRecusa(r.status, data, _repetiu) : 'parar';
@@ -255,7 +263,8 @@ async function route(r, opts = {}) {
   $$('.nav-item').forEach(n => { const ativo = n.dataset.route === state.route; n.classList.toggle('active', ativo);
     if (ativo) n.setAttribute('aria-current', 'page'); else n.removeAttribute('aria-current'); });
   $('#pageTag').textContent = TAGS[state.route] || 'COMUNICAR';
-  if (!quieto) { view.classList.add('entrando'); view.innerHTML = esqueleto(state.route); }
+  const mudouDeTela = !quieto && state._rotaAnunciada !== state.route;
+  if (!quieto) { view.classList.add('entrando'); view.innerHTML = esqueleto(state.route); view.setAttribute('aria-busy', 'true'); }
   try {
     await (ROUTES[state.route] || renderInicio)({ quieto });
     if (vez === state._vez && !quieto) {
@@ -263,15 +272,30 @@ async function route(r, opts = {}) {
       state._entraTimer = setTimeout(() => view.classList.remove('entrando'), 1200);
     }
   } catch (e) {
-    if (vez === state._vez) view.innerHTML = vazio(I.alerta, 'Não deu para abrir esta tela', esc(e.message));
+    if (vez === state._vez) view.innerHTML = vazio(I.alerta, 'Não deu para abrir esta tela', esc(e.message) + (e.status === 0 || e.status >= 500 ? '<br><button type="button" class="btn btn-mini" data-tentar-tela>Tentar de novo</button>' : ''));
+    $('[data-tentar-tela]', view)?.addEventListener('click', () => route(state.route));
+  } finally {
+    view.removeAttribute('aria-busy');
   }
-  refreshBadge();
+  /* acessibilidade (rodada 4): título da aba, aviso para leitor de tela e foco no título da tela nova */
+  const nomeTela = NOMES_TELA[state.route] || 'Início';
+  document.title = `${nomeTela} · IndyCar Comunicar`;
+  if (mudouDeTela && vez === state._vez) {
+    state._rotaAnunciada = state.route;
+    const an = $('#anuncioTela'); if (an) an.textContent = `Tela ${nomeTela}`;
+    if (state._focarTela) { const h = $('h2', view); if (h) { h.setAttribute('tabindex', '-1'); h.focus({ preventScroll:true }); } }
+    state._focarTela = true;
+  }
+  if (state.route !== 'inicio') refreshBadge();
 }
+const NOMES_TELA = { inicio:'Início', reguas:'Réguas', mensagens:'Mensagens', campanhas:'Campanhas', clientes:'Clientes', satisfacao:'Satisfação' };
 
-async function refreshBadge() {
+/* Selo da fila: só a contagem (antes baixava até 500 mensagens para contar). */
+async function refreshBadge(pendentes) {
   try {
-    const r = await api('GET', '/envios?status=pendente&limite=500');
-    const b = $('#badgeFila'); b.textContent = r.length > 99 ? '99+' : r.length; b.hidden = !r.length;
+    const n = Number.isFinite(pendentes) ? pendentes : (await api('GET', '/fila/contagem')).pendentes;
+    const b = $('#badgeFila'); b.textContent = n > 99 ? '99+' : n; b.hidden = !n;
+    b.setAttribute('aria-label', `${n} na fila`);
   } catch { /* sem badge */ }
 }
 
@@ -304,6 +328,7 @@ async function renderInicio() {
   const ultima = saude?.ultimaRodada?.em
     ? `carteiro rodou <b>${esc(relativo(saude.ultimaRodada.em))}</b>${saude.ultimaRodada.resultado?.enviados ? ` · ${saude.ultimaRodada.resultado.enviados} enviadas` : ''}`
     : (r.carteiroConfigurado ? 'carteiro <b>ainda não rodou</b> desde que o servidor acordou' : 'carteiro externo <b>não configurado</b>');
+  refreshBadge(r.pendentes);
   const janela = `envia das <b>${r.janela?.inicio}h às ${r.janela?.fim}h</b>${r.janela?.domingo ? '' : ' · sem domingo'}`;
   const ligadas = (r.reguasLigadas || []);
   const chips = ligadas.length
@@ -327,15 +352,17 @@ async function renderInicio() {
       <div><div class="hero-data">${esc(dataTxt)}</div><h2 class="hero-titulo">${titulo}</h2></div>
       <div class="hero-acoes">
         <button type="button" class="btn" id="btnPrevia">${svg(I.olho)} Prévia de hoje</button>
+        <button type="button" class="btn" id="btnMes">${svg(I.calendar)} Próximos 30 dias</button>
         ${pode('rodar') ? `<button type="button" class="btn primary" id="btnRodar">${svg(I.play)} Rodar agora</button>` : ''}
       </div>
     </div>
     <div class="faixa-equipe" id="faixaEquipe" hidden></div>
+    <div id="painelPronto"></div>
 
     <div class="situacao${r.pausaGeral ? ' pausada' : ''}" role="status">
       ${r.pausaGeral ? `<span class="item"><span class="dot off"></span><b style="color:var(--red-txt)">PAUSA GERAL ligada</b></span><span class="sep"></span>` : ''}
       <span class="item" id="waItem">${htmlWhatsapp(null)}</span>
-      <span class="sep"></span><span class="item">${svg(I.clock)} <span>${ultima}</span></span>
+      <span class="sep"></span><button type="button" class="item item-btn" id="btnCarteiro" title="Ver as últimas rodadas do carteiro">${svg(I.clock)} <span>${ultima}</span></button>
       <span class="sep"></span><span class="item">${janela}</span>
       ${r.falhas ? `<span class="sep"></span><span class="item" title="${esc(r.ultimoErro || '')}"><span class="dot warn"></span><span><b>${r.falhas}</b> falharam em 30 dias</span></span>` : ''}
       <span class="sep"></span><span class="item chips">${chips}</span>
@@ -390,7 +417,10 @@ async function renderInicio() {
   waPromise.then(wa => { const el = $('#waItem'); if (el) el.innerHTML = htmlWhatsapp(wa); });
   $('#btnRodar')?.addEventListener('click', rodarAgora);
   $('#btnPrevia').addEventListener('click', () => abrirPrevia());
+  $('#btnMes').addEventListener('click', () => window.R4?.abrirMes());
+  $('#btnCarteiro').addEventListener('click', () => window.R4?.abrirCarteiro());
   pintarFaixaEquipe();
+  window.R4?.pintarInicio();
   $$('[data-ir]', view).forEach(b => b.addEventListener('click', () => route(b.dataset.ir)));
 }
 
@@ -443,6 +473,9 @@ async function abrirPrevia(regua = null) {
 async function renderReguas() {
   const [cfg, regras] = await Promise.all([api('GET', '/comunicar/config'), api('GET', '/regras-retorno').catch(() => [])]);
   state.cfg = cfg; state.cfgEdit = {}; state.regras = regras;
+  /* rodada 4: alterações que não foram salvas (aba fechada, servidor dormindo) voltam */
+  const rascunho = ehGestor() ? window.R4?.lerRascunhoReguas(cfg) : null;
+  if (rascunho && Object.keys(rascunho).length) { state.cfgEdit = rascunho; state._rascunhoRestaurado = Object.keys(rascunho).length; }
   const gestor = ehGestor();
   const v = (campo) => state.cfgEdit[campo] !== undefined ? state.cfgEdit[campo] : cfg[campo];
   const horas = Array.from({ length:25 }, (_, i) => i);
@@ -533,7 +566,18 @@ async function renderReguas() {
       aplicar: (t) => { ta.value = t; ta.dispatchEvent(new Event('input', { bubbles:true })); ta.focus(); } });
   }));
   $$('[data-relatorio]', view).forEach(b => b.addEventListener('click', () => abrirRelatorio(b.dataset.relatorio)));
-  $('#btnAnivBase')?.addEventListener('click', abrirAniversariosBase);
+  $('#btnAnivBase')?.addEventListener('click', () => (window.R4 ? window.R4.abrirAniversarios() : abrirAniversariosBase()));
+  if (state._rascunhoRestaurado) {
+    // a tela nasceu com os valores salvos: reaplica o rascunho nos campos e mostra a barra
+    for (const [campo, valor] of Object.entries(state.cfgEdit)) {
+      const el = $(`[data-cfg="${campo}"]`, view); if (!el) continue;
+      if (el.type === 'checkbox') el.checked = !!valor; else el.value = campo === 'telefone_teste' && telBR(valor) !== '—' ? telBR(valor) : valor;
+      el.dispatchEvent(new Event(el.tagName === 'TEXTAREA' || ['text', 'url', 'tel', 'number'].includes(el.type) ? 'input' : 'change', { bubbles:true }));
+    }
+    toast(`Voltaram ${plural(state._rascunhoRestaurado, 'alteração', 'alterações')} que você não tinha salvado.`, 'ok', 5000);
+    state._rascunhoRestaurado = 0;
+  }
+  window.R4?.pintarReguas();
 }
 
 /* Lê o valor de um campo de configuração do jeito que o servidor espera. */
@@ -589,6 +633,7 @@ function atualizarBarra() {
   $('#nAlteracoes').textContent = n;
   $('#txtAlteracoes').textContent = n === 1 ? 'alteração sem salvar' : 'alterações sem salvar';
   const topo = $('#btnSalvarTopo'); if (topo) topo.disabled = !n;
+  window.R4?.guardarRascunhoReguas(state.cfgEdit);
 }
 async function salvarConfig() {
   const dados = { ...state.cfgEdit };
@@ -605,10 +650,11 @@ async function salvarConfig() {
   try {
     const cfg = await api('PUT', '/comunicar/config', dados);
     state.cfg = cfg; state.cfgEdit = {};
+    window.R4?.guardarRascunhoReguas({});
     toast('Réguas salvas — valem a partir da próxima rodada.');
     await route('reguas', { quieto:true });
   } catch (e) {
-    toast(e.status === 403 ? 'Só gestor altera as réguas. Peça ao João para salvar.' : e.message, 'err', 5000);
+    toast(e.status === 403 ? 'Só gestor altera as réguas. Use "Pedir ao gestor".' : `${e.message} Suas alterações continuam guardadas neste aparelho.`, 'err', 6000);
     btns.forEach(b => (b.disabled = false));
   }
 }
@@ -708,7 +754,11 @@ async function renderMensagens({ quieto } = {}) {
   if (f.ate) q.set('ate', f.ate);
   if (f.intencao !== 'todas') q.set('intencao', f.intencao);
   state._qMsg = new URLSearchParams(q);
-  const lista = await api('GET', '/envios' + (q.toString() ? `?${q}` : ''));
+  /* rodada 4: páginas de 100 (antes vinham 300 de uma vez) */
+  const POR_PAGINA = 100;
+  q.set('limite', String(POR_PAGINA));
+  const lista = await api('GET', '/envios?' + q);
+  state._msgLista = lista; state._msgFim = lista.length < POR_PAGINA;
   const htmlLista = () => lista.length ? lista.map(cartaoEnvio).join('')
     : vazio(I.wa, f.q || f.de || f.ate || f.intencao !== 'todas' || f.status !== 'todas' || f.tipo !== 'todos' ? 'Nada com esse filtro' : 'Nenhuma mensagem ainda',
         f.q || f.de || f.ate || f.intencao !== 'todas' || f.status !== 'todas' || f.tipo !== 'todos' ? 'Tente outro status, tipo, período ou busca.' : 'As automáticas aparecem sozinhas quando você ligar as réguas; campanhas e avulsas também caem aqui.');
@@ -717,11 +767,12 @@ async function renderMensagens({ quieto } = {}) {
      mudam — o campo de busca continua com o foco e o cursor de quem digita. */
   if (quieto && $('#listaEnvios')) {
     $('#listaEnvios').innerHTML = htmlLista();
-    $('#qtdMsg').textContent = plural(lista.length, 'na lista', 'na lista');
-    $$('.pilula', view).forEach(b => b.classList.toggle('ativa', b.dataset.filtro === f.status));
+    $('#qtdMsg').textContent = plural(lista.length, 'na lista', 'na lista') + (state._msgFim ? '' : '+');
+    $$('.pilula', view).forEach(b => { const a = b.dataset.filtro === f.status; b.classList.toggle('ativa', a); b.setAttribute('aria-selected', String(a)); });
+    $('#maisMsg').hidden = state._msgFim;
     return;
   }
-  const pilula = (chave, rotulo) => `<button type="button" class="pilula ${f.status === chave ? 'ativa' : ''}" data-filtro="${chave}">${rotulo}</button>`;
+  const pilula = (chave, rotulo) => `<button type="button" role="tab" aria-selected="${f.status === chave}" class="pilula ${f.status === chave ? 'ativa' : ''}" data-filtro="${chave}">${rotulo}</button>`;
   const tipos = ['todos', ...REGUAS, 'campanha', 'avulsa'];
 
   view.innerHTML = `
@@ -744,8 +795,22 @@ async function renderMensagens({ quieto } = {}) {
     <div class="pilulas" role="tablist">
       ${pilula('todas', 'Todas')}${pilula('pendente', '🕒 Na fila')}${pilula('enviado', '✅ Enviadas')}${pilula('falhou', '❌ Falharam')}${pilula('cancelado', 'Canceladas')}${pilula('pulado', '⏭ Puladas')}
     </div>
-    <div class="panel"><div class="panel-body lista lista-anim" id="listaEnvios">${htmlLista()}</div></div>`;
+    <div class="panel"><div class="panel-body lista lista-anim" id="listaEnvios">${htmlLista()}</div>
+      <div class="mais-linha"><button type="button" class="btn" id="maisMsg" ${state._msgFim ? 'hidden' : ''}>Carregar mais 100</button></div></div>`;
 
+  $('#maisMsg').addEventListener('click', async (ev) => {
+    const b = ev.currentTarget; b.disabled = true; b.textContent = 'Carregando…';
+    try {
+      const q2 = new URLSearchParams(state._qMsg); q2.set('limite', '100'); q2.set('offset', String(state._msgLista.length));
+      const mais = await api('GET', '/envios?' + q2);
+      state._msgLista.push(...mais); state._msgFim = mais.length < 100;
+      $('#listaEnvios').insertAdjacentHTML('beforeend', mais.map(cartaoEnvio).join(''));
+      ligarAcoesEnvio($('#listaEnvios'));
+      $('#qtdMsg').textContent = plural(state._msgLista.length, 'na lista', 'na lista') + (state._msgFim ? '' : '+');
+      b.hidden = state._msgFim;
+    } catch (e) { toast(e.message, 'err'); }
+    finally { b.disabled = false; b.textContent = 'Carregar mais 100'; }
+  });
   $$('.pilula', view).forEach(b => b.addEventListener('click', () => { state.msg.status = b.dataset.filtro; route(null, { quieto:true }); }));
   $('#tipoMsg').addEventListener('change', e => { state.msg.tipo = e.target.value; route(null, { quieto:true }); });
   $('#qMsg').addEventListener('input', debounce(e => { state.msg.q = e.target.value.trim(); route(null, { quieto:true }); }, 300));
@@ -888,7 +953,8 @@ async function carregarModelos() { if (!state.modelos) state.modelos = await api
 /* Modal "Nova campanha" em 3 passos: para quem → mensagem → quando. */
 window.openCampanhaModal = async function (pre = {}) {
   const c = { passo:1, alvo: pre.cliente ? 'cliente' : 'segmento', filtro:'todos', valor:'', cliente: pre.cliente || null,
-    previa:null, corpo:'', quando:'agora', enviar_em:'', sugestao:null };
+    previa:null, corpo: window.R4?.lerRascunho('campanha') || '', quando:'agora', enviar_em:'', sugestao:null };
+  if (c.corpo) setTimeout(() => toast('Recuperei a mensagem que você estava escrevendo.'), 300);
   const [segmentos, modelos] = await Promise.all([carregarSegmentos(), carregarModelos()]);
 
   openModal(`<div class="modal-head"><h3>${svg(I.megafone)} Nova campanha</h3><button type="button" class="modal-close" aria-label="Fechar">×</button></div>
@@ -999,6 +1065,7 @@ window.openCampanhaModal = async function (pre = {}) {
     const ta = $('#campCorpo'), bolha = $('#campBolha'), cont = $('#campCont');
     const pintar = () => {
       c.corpo = ta.value;
+      window.R4?.guardarRascunho('campanha', c.corpo);
       const cli = clienteDaPrevia() || EXEMPLO;
       const txt = renderTemplate(c.corpo, { nome: cli.nome, carro: cli.carro, placa: cli.placa, detalhe:'…' });
       pintarBolha(bolha, txt, horaBR(new Date()), 'Escreva para ver a prévia.');
@@ -1068,6 +1135,7 @@ window.openCampanhaModal = async function (pre = {}) {
         ? { tipo:'avulsa', corpo, enviar_em, destinos:[{ cliente_id:c.cliente.id, telefone:c.cliente.telefone, nome:c.cliente.nome, carro:c.cliente.carro, placa:c.cliente.placa }] }
         : { corpo, enviar_em, segmento:{ filtro:c.filtro, valor: c.valor || segmentos.find(s => s.id === c.filtro)?.valor } };
       const r = await api('POST', '/envios', payload);
+      window.R4?.guardarRascunho('campanha', '');
       if (r.aguardando) {
         toast('Campanha mandada para aprovação — o gestor foi avisado no sino.', 'ok', 5500);
         closeModal(); state.route === 'campanhas' ? route(null, { quieto:true }) : route('campanhas');
@@ -1095,6 +1163,7 @@ async function renderClientes() {
         ${fora ? `<span class="badge-pill bp-red">🚫 ${fora} fora da lista</span>` : ''}</div>
       <div class="right">
         <div class="search">${svg(I.search)}<input id="qCli" placeholder="Nome, telefone ou placa…" value="${esc(state.cliQ)}" aria-label="Buscar clientes"></div>
+        <button type="button" class="btn" id="btnAniv">${svg(I.gift)} Aniversários</button>
         ${pode('importar') ? `<button type="button" class="btn" id="btnImportar">${svg(I.upload)} Importar planilha</button>` : ''}
       </div>
     </div>
@@ -1107,6 +1176,7 @@ async function renderClientes() {
     if ($('#cliLista')) { $('#cliLista').innerHTML = linhasClientes(r); ligarClientes($('#cliLista'), r); }
   }, 250));
   $('#btnImportar')?.addEventListener('click', () => openImportarModal());
+  $('#btnAniv').addEventListener('click', () => window.R4?.abrirAniversarios());
   if (state.cliQ) { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); }
 }
 /* Quem saiu da lista só volta pela mão do gestor (o servidor também barra). */
@@ -1537,6 +1607,7 @@ function esconderLogin() { document.body.classList.remove('deslogado'); $('#tela
 
 let _appAberto = false;
 async function abrirApp() {
+  state._focarTela = false; // na abertura o foco fica onde o navegador pôs (não rouba o foco)
   let p;
   try { p = await api('GET', '/perfil'); }
   catch (e) {
@@ -1551,6 +1622,7 @@ async function abrirApp() {
   carregarSaude();
   await route('inicio');
   await abrirPorLink();
+  window.R4?.talvezTour();
 }
 
 /* Link vindo de outro app (Atendimento, CRM, Agenda) ou do sino:
@@ -1822,8 +1894,12 @@ async function abrirAniversariosBase() {
   $$('[data-nasc-base]').forEach(b => b.addEventListener('click', () => { const c = d.semDataRecentes.find(x => x.id === b.dataset.nascBase); closeModal(); openNascimentoModal(c); }));
 }
 
-/* ---- AJUDA curta ---- */
+/* ---- AJUDA curta (a da rodada 4, por papel, mora em rodada4.js) ---- */
 function abrirAjuda() {
+  if (window.R4) return window.R4.abrirAjuda();
+  return abrirAjudaAntiga();
+}
+function abrirAjudaAntiga() {
   openModal(`<div class="modal-head"><h3>❔ Como o Comunicar funciona</h3><button type="button" class="modal-close" aria-label="Fechar">×</button></div>
     <div class="modal-body ajuda">
       <div class="ajuda-item"><span>🏁</span><div><b>Réguas</b><p>Mensagens automáticas (lembrete, pós-venda, revisão, aniversário…). Ligou, o carteiro gera e envia sozinho dentro da janela, no máximo o limite por hora.</p></div></div>
@@ -1861,8 +1937,16 @@ function htmlSugestao(sg) {
 
 (async function init() {
   mostrarLogin();
-  try { CONFIG = await (await fetch('/api/config')).json(); }
-  catch { return mostrarLogin('Não consegui falar com o servidor. Ele está rodando?'); }
+  /* rodada 4: a configuração pública (URL e chave anônima do Supabase) fica guardada
+     no aparelho — com o servidor dormindo a tela abre na hora e o Acordar espera ele. */
+  let guardada = null;
+  try { guardada = JSON.parse(localStorage.getItem('comunicar_config') || 'null'); } catch { /* sem localStorage */ }
+  try {
+    const pedido = (window.Acordar ? window.Acordar.buscar('/api/config') : fetch('/api/config')).then(r => r.json());
+    CONFIG = guardada?.configurado ? guardada : await pedido;
+    pedido.then(c => { try { if (c?.configurado) localStorage.setItem('comunicar_config', JSON.stringify(c)); } catch { /* cheio */ } }).catch(() => {});
+  }
+  catch { return mostrarLogin('Não consegui falar com o servidor. Confira a internet e tente de novo em instantes.'); }
   if (!CONFIG.configurado) return mostrarLogin('Falta configurar o Supabase no servidor (SUPABASE_URL, SUPABASE_ANON_KEY e SUPABASE_SERVICE_ROLE_KEY).');
   if (!window.supabase?.createClient) return mostrarLogin('A biblioteca do Supabase não carregou. Verifique sua conexão.');
   sb = window.supabase.createClient(CONFIG.supabaseUrl, CONFIG.supabaseAnonKey);

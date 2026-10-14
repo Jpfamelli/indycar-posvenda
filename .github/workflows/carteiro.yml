@@ -1,7 +1,12 @@
-# O "carteiro" do Pós-venda: de 15 em 15 minutos acorda o servidor no Render
-# (plano free dorme) e manda ele gerar/enviar as mensagens programadas.
-# Precisa do secret RUNNER_TOKEN (Settings > Secrets and variables > Actions),
-# com o MESMO valor da variável RUNNER_TOKEN no Render.
+# O "carteiro" do Comunicar pelo GitHub (o pg_cron do Supabase é o principal:
+# chama de 15 em 15 min, com reforço de 5 em 5 quando a chamada falha).
+# Aqui é a terceira rede de segurança — o GitHub atrasa os agendamentos, então
+# não conte com o horário exato. Precisa do secret RUNNER_TOKEN (Settings >
+# Secrets and variables > Actions), com o MESMO valor da variável RUNNER_TOKEN no Render.
+#
+# Rodada 4: diz que veio do GitHub (?origem=github, aparece em "Carteiro · 24 h"),
+# aceita 202 (rodada longa continua no servidor) e espera mais quando o Render
+# responde 503 "hibernate-wake-error" (até ~5 min no total).
 name: carteiro
 on:
   schedule:
@@ -11,19 +16,20 @@ on:
 jobs:
   rodar:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
       - name: Acordar o servidor e rodar o carteiro
         env:
           RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
         run: |
           if [ -z "$RUNNER_TOKEN" ]; then echo "Secret RUNNER_TOKEN não configurado"; exit 1; fi
-          # 1ª chamada acorda o Render free (pode demorar ~1 min); repete até responder
-          for i in 1 2 3; do
-            code=$(curl -s -o resposta.json -w "%{http_code}" --max-time 120 \
-              -X POST -H "X-Runner-Token: $RUNNER_TOKEN" \
-              https://indycar-posvenda.onrender.com/api/rodar) && [ "$code" = "200" ] && break
-            echo "tentativa $i: HTTP $code — esperando o servidor acordar…"
-            sleep 30
+          code=000
+          for espera in 0 20 40 60 90; do
+            [ "$espera" -gt 0 ] && { echo "HTTP $code — o Render está acordando; tento de novo em ${espera}s…"; sleep "$espera"; }
+            code=$(curl -s -o resposta.json -w "%{http_code}" --max-time 60 \
+              -X POST -H "X-Runner-Token: $RUNNER_TOKEN" -H "X-Origem: github" \
+              "https://indycar-posvenda.onrender.com/api/rodar?origem=github") || code=000
+            if [ "$code" = "200" ] || [ "$code" = "202" ]; then break; fi
           done
           cat resposta.json || true
-          [ "$code" = "200" ]
+          [ "$code" = "200" ] || [ "$code" = "202" ]

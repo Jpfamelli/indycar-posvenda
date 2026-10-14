@@ -17,6 +17,7 @@ import {
   selecionar, selecionarUm, selecionarTudo,
   inserir, inserirUm, atualizar, atualizarUm, remover, contar, rpc,
 } from './supabase.js';
+import { validadeDoEnvio } from './carteiro.js';
 
 const T = {
   clientes: 'clientes',
@@ -385,6 +386,7 @@ export async function obterConfig() {
   cfg.pausa_geral = !!c.pausa_geral;
   cfg.telefone_teste = c.telefone_teste || '';
   cfg.carteiro_configurado = !!c.runner_token;
+  cfg.ultima_rodada_em = c.ultima_rodada_em || null;
   cfg.ia_resumo = c.ia_resumo || null;
   cfg.ia_resumo_em = c.ia_resumo_em || null;
   cfg.updated_at = c.updated_at || null;
@@ -487,8 +489,12 @@ export async function listarModelos() {
 // FILA DE ENVIOS
 // ============================================================================
 
-export async function listarEnvios({ status, tipo, q, de, ate, intencao, limite = 300 } = {}) {
-  const p = new URLSearchParams('select=*');
+/* rodada 4: colunas explícitas (antes select=*) — é o que a tela e o CSV usam */
+const CAMPOS_ENVIO = 'id,cliente_id,agendamento_id,lead_id,telefone,nome,tipo,corpo,enviar_em,enviado_em,status,erro,tentativas,motivo_pulado,chave_unica,criado_por,criado_por_id,campanha_id,lote,resposta,resposta_tipo,respondido_em,agendou_depois_id,intencao,intencao_em,intencao_resumo,encaminhado_em,tarefa_id,expira_em,conversa_id,mensagem_id,created_at';
+export async function listarEnvios({ status, tipo, q, de, ate, intencao, limite = 300, offset = 0 } = {}) {
+  const p = new URLSearchParams(`select=${CAMPOS_ENVIO}`);
+  const desloc = Math.max(0, Math.min(Number(offset) || 0, 100000));
+  if (desloc) p.set('offset', String(desloc));
   if (status && status !== 'todas') p.set('status', `eq.${status}`);
   if (intencao && intencao !== 'todas') p.set('intencao', intencao === 'qualquer' ? 'not.is.null' : `eq.${intencao}`);
   // período no fuso da oficina (de/até inclusivos, 'YYYY-MM-DD')
@@ -516,6 +522,7 @@ export async function enfileirar({
   cliente_id = null, agendamento_id = null, lead_id = null, telefone, nome = null,
   tipo, corpo, enviar_em = null, chave_unica = null, criado_por = null,
   status = 'pendente', motivo_pulado = null, lote = null, criado_por_id = null, campanha_id = null,
+  expira_em = null,
 }) {
   const tel = soDigitos(telefone);
   if (!tel || !corpo || !tipo) return null;
@@ -528,6 +535,7 @@ export async function enfileirar({
       enviar_em: enviar_em || new Date().toISOString(),
       chave_unica, criado_por, status, motivo_pulado, lote: uuidOuNulo(lote),
       criado_por_id: uuidOuNulo(criado_por_id), campanha_id: uuidOuNulo(campanha_id),
+      ...(expira_em ? { expira_em } : {}),
     }, 'select=*');
   } catch (e) {
     if (e?.status === 409) return null; // chave_unica repetida: já estava na fila
@@ -556,9 +564,11 @@ export async function reenfileirar(id) {
 }
 
 /** Pendentes que já venceram — o carteiro do server.js chama isto. */
+export const CAMPOS_FILA = 'id,cliente_id,agendamento_id,lead_id,telefone,nome,tipo,corpo,enviar_em,tentativas,status,enviando_em,expira_em,mensagem_id,criado_por_id';
 export async function enviosDevidos(limite = 25) {
-  const p = new URLSearchParams('select=*');
+  const p = new URLSearchParams(`select=${CAMPOS_FILA}`);
   p.set('status', 'eq.pendente');
+  p.set('enviando_em', 'is.null'); // reservado = outro carteiro está mandando agora
   p.set('enviar_em', `lte.${new Date().toISOString()}`);
   p.set('order', 'enviar_em.asc');
   p.set('limit', String(limite));
@@ -569,6 +579,7 @@ export async function marcarEnvio(id, status, erro = null, tentativas = undefine
   const campos = {
     status, erro,
     enviado_em: status === 'enviado' ? new Date().toISOString() : null,
+    enviando_em: null, // a reserva acaba aqui (saiu, falhou ou voltou para a fila)
     ...extra,
   };
   if (Number.isInteger(tentativas)) campos.tentativas = tentativas;
@@ -702,6 +713,7 @@ export async function gerarLembretes(cfg, porteiro, ctx) {
     await entregarAoPorteiro(porteiro, {
       cliente_id: a.cliente_id, agendamento_id: a.id, lead_id: a.lead_id, telefone: a.telefone, nome: a.cliente_nome,
       tipo: 'lembrete', corpo, enviar_em: new Date().toISOString(), chave_unica: `lembrete:${a.id}`, criado_por: 'gerador',
+      expira_em: validadeDoEnvio('lembrete', { agendamento: a }),
     }, ctx);
   }
 }
@@ -709,19 +721,28 @@ export async function gerarLembretes(cfg, porteiro, ctx) {
 /** Aniversariantes de hoje → fila. Dedupe por cliente+ano. */
 export async function gerarAniversarios(cfg, porteiro, ctx) {
   const d = hoje();
-  const mmdd = d.slice(5);
-  const ano = d.slice(0, 4);
+  /* Recuperação: se o servidor não rodou NENHUMA vez ontem (Render fora do ar o
+     dia todo), os aniversariantes de ontem ainda recebem hoje — uma vez só
+     (a chave é por cliente e ano) e com validade até o fim de hoje. */
+  const dias = [d];
+  if (ctx.recuperarOntem) dias.push(somarDias(d, -1));
   const clientes = await selecionarTudo(T.clientes, 'select=id,nome,telefone,carro_modelo,carro_ano,placa,nascimento&nascimento=not.is.null');
-  for (const c of clientes) {
-    if (String(c.nascimento || '').slice(5) !== mmdd) continue;
-    if (!soDigitos(c.telefone)) continue;
-    const corpo = renderTemplate(cfg.msg_aniversario, {
-      nome: c.nome, carro: [c.carro_modelo, c.carro_ano].filter(Boolean).join(' '), placa: c.placa,
-    });
-    await entregarAoPorteiro(porteiro, {
-      cliente_id: c.id, telefone: c.telefone, nome: c.nome, tipo: 'aniversario', corpo,
-      enviar_em: hojeAs(cfg.hora_envio), chave_unica: `aniversario:${c.id}:${ano}`, criado_por: 'gerador',
-    }, ctx);
+  for (const dia of dias) {
+    const mmdd = dia.slice(5);
+    const ano = dia.slice(0, 4);
+    for (const c of clientes) {
+      if (String(c.nascimento || '').slice(5) !== mmdd) continue;
+      if (!soDigitos(c.telefone)) continue;
+      const corpo = renderTemplate(cfg.msg_aniversario, {
+        nome: c.nome, carro: [c.carro_modelo, c.carro_ano].filter(Boolean).join(' '), placa: c.placa,
+      });
+      await entregarAoPorteiro(porteiro, {
+        cliente_id: c.id, telefone: c.telefone, nome: c.nome, tipo: 'aniversario', corpo,
+        enviar_em: dia === d ? hojeAs(cfg.hora_envio) : new Date().toISOString(),
+        chave_unica: `aniversario:${c.id}:${ano}`, criado_por: 'gerador',
+        expira_em: validadeDoEnvio('aniversario', { base: dia }),
+      }, ctx);
+    }
   }
 }
 
@@ -741,6 +762,7 @@ export async function gerarPosvenda(cfg, porteiro, ctx) {
     await entregarAoPorteiro(porteiro, {
       cliente_id: a.cliente_id, agendamento_id: a.id, lead_id: a.lead_id, telefone: a.telefone, nome: a.cliente_nome,
       tipo: 'posvenda', corpo, enviar_em: hojeAs(cfg.hora_envio), chave_unica: `posvenda:${a.id}`, criado_por: 'gerador',
+      expira_em: validadeDoEnvio('posvenda', { base: hoje() }),
     }, ctx);
   }
 }
@@ -799,6 +821,7 @@ export async function gerarRetornos(cfg, porteiro, ctx, regras) {
     await entregarAoPorteiro(porteiro, {
       cliente_id: a.cliente_id, agendamento_id: a.id, lead_id: a.lead_id, telefone: a.telefone, nome: a.cliente_nome,
       tipo: 'retorno', corpo, enviar_em: hojeAs(cfg.hora_envio), chave_unica: `retorno:${a.id}`, criado_por: 'gerador',
+      expira_em: validadeDoEnvio('retorno', { base: hoje() }),
     }, ctx);
   }
 }
@@ -819,6 +842,7 @@ export async function gerarOrcamentos(cfg, porteiro, ctx) {
     await entregarAoPorteiro(porteiro, {
       cliente_id: l.cliente_id, lead_id: l.id, telefone: l.telefone, nome: l.nome,
       tipo: 'orcamento', corpo, enviar_em: hojeAs(cfg.hora_envio), chave_unica: `orcamento:${l.id}`, criado_por: 'gerador',
+      expira_em: validadeDoEnvio('orcamento', { base: hoje() }),
     }, ctx);
   }
 }
@@ -843,6 +867,7 @@ export async function gerarNaoFechou(cfg, porteiro, ctx) {
     await entregarAoPorteiro(porteiro, {
       cliente_id: a.cliente_id, agendamento_id: a.id, lead_id: a.lead_id, telefone: a.telefone, nome: a.cliente_nome,
       tipo: 'nao_fechou', corpo, enviar_em: hojeAs(cfg.hora_envio), chave_unica: `nao_fechou:${a.id}`, criado_por: 'gerador',
+      expira_em: validadeDoEnvio('nao_fechou', { base: hoje() }),
     }, ctx);
   }
 }
@@ -889,6 +914,7 @@ export async function gerarReativacao(cfg, porteiro, ctx) {
       cliente_id: clienteId, agendamento_id: u.id, telefone, nome: c?.nome || u.cliente_nome,
       tipo: 'reativacao', corpo, enviar_em: hojeAs(cfg.hora_envio),
       chave_unica: `reativacao:${clienteId}:${h.slice(0, 4)}`, criado_por: 'gerador',
+      expira_em: validadeDoEnvio('reativacao', { base: h }),
     }, ctx);
   }
 }
@@ -904,10 +930,10 @@ const GERADORES = {
  * Em simulação (`simular:true`) roda TODAS sem gravar nada e devolve o que
  * entraria na fila — é a "Prévia" da tela.
  */
-export async function gerarTudo({ cfg = null, simular = false, so = null } = {}) {
+export async function gerarTudo({ cfg = null, simular = false, so = null, recuperarOntem = false } = {}) {
   cfg = cfg || await obterConfig();
   const [porteiro, regras] = await Promise.all([carregarPorteiro(cfg), listarRegras()]);
-  const ctx = { simular, criados: [], pulados: [], adiados: [], previa: [], erros: [] };
+  const ctx = { simular, recuperarOntem, criados: [], pulados: [], adiados: [], previa: [], erros: [] };
   const porRegua = {};
   for (const [tipo, gerar] of Object.entries(GERADORES)) {
     if (so && so !== tipo) continue;
@@ -1717,3 +1743,191 @@ export async function completarCampanha(id, campos) {
   if (!ehUuid(id)) return null;
   return atualizarUm(T.campanhas, `id=eq.${id}&select=${CAMPOS_CAMPANHA}`, { ...campos, updated_at: new Date().toISOString() });
 }
+
+// ============================================================================
+// RODADA 4 (14/10/2026) — carteiro tolerante, prontidão, aniversários, prévia
+// do mês, indicadores por pessoa. As regras puras moram em carteiro.js,
+// prontidao.js, aniversarios.js e projecao.js; aqui só as leituras/gravações.
+// ============================================================================
+
+T.batidas = 'comunicar_carteiro_batidas';
+
+/**
+ * Reserva o envio antes de ir ao WhatsApp: só passa se ainda está pendente e
+ * sem reserva. Dois carteiros ao mesmo tempo (timer + pg_cron, ou dois
+ * processos durante um deploy) nunca mandam a mesma mensagem.
+ */
+export async function reservarEnvio(id) {
+  if (!ehUuid(id)) return null;
+  return atualizarUm(T.envios, `id=eq.${id}&status=eq.pendente&enviando_em=is.null&select=id`, { enviando_em: new Date().toISOString() });
+}
+
+/** Volta para a fila sem gastar tentativa (lembrete remarcado, régua esperou…). */
+export async function atualizarEnvio(id, campos) {
+  if (!ehUuid(id)) return null;
+  return atualizarUm(T.envios, `id=eq.${id}&status=eq.pendente`, { enviando_em: null, ...campos });
+}
+
+/** Pendentes cuja validade passou → 'pulado' com o motivo (lembrete depois do horário, parabéns velho). */
+export async function expirarVencidos(motivo, agoraIso = new Date().toISOString()) {
+  const linhas = await atualizar(T.envios, `status=eq.pendente&expira_em=lt.${agoraIso}&select=id,tipo`, { status: 'pulado', motivo_pulado: motivo, enviando_em: null });
+  return linhas.length;
+}
+
+/** Reservas de mais de 15 min ainda pendentes = o servidor caiu no meio: 'falhou' (NUNCA reenvia sozinho). */
+export async function soltarReservasPresas(erro, minutos = 15) {
+  const limite = new Date(Date.now() - minutos * 60000).toISOString();
+  const linhas = await atualizar(T.envios, `status=eq.pendente&enviando_em=lt.${limite}&select=id`, { status: 'falhou', erro, enviando_em: null });
+  return linhas.length;
+}
+
+/** Agendamentos (para conferir os lembretes antes de sair). */
+export async function agendamentosPorIds(ids) {
+  const lista = [...new Set((ids || []).filter(ehUuid))];
+  if (!lista.length) return new Map();
+  const linhas = await selecionar(T.agendamentos, `${A_SEL}&id=in.(${lista.join(',')})`);
+  return new Map(linhas.map((a) => [a.id, a]));
+}
+
+/** Cada rodada do carteiro fica anotada (a tela mostra as últimas 24 h). */
+export async function registrarBatida(b) {
+  const linha = {
+    origem: ['cron', 'reforco', 'timer', 'inicio', 'manual', 'github'].includes(b.origem) ? b.origem : 'desconhecido',
+    duracao_ms: Number.isFinite(b.duracao_ms) ? Math.round(b.duracao_ms) : null, ok: b.ok !== false,
+    criados: Number(b.criados) || 0, enviados: Number(b.enviados) || 0, falhas: Number(b.falhas) || 0,
+    expirados: Number(b.expirados) || 0, presos: Number(b.presos) || 0,
+    aviso: b.aviso ? String(b.aviso).slice(0, 300) : null, erro: b.erro ? String(b.erro).slice(0, 300) : null,
+    versao: b.versao || null,
+  };
+  return inserirUm(T.batidas, linha).catch((e) => { console.error('batida do carteiro:', e?.message || e); return null; });
+}
+
+export async function batidasRecentes(horas = 24) {
+  const desde = new Date(Date.now() - horas * 3600000).toISOString();
+  return selecionar(T.batidas, `select=em,origem,duracao_ms,ok,criados,enviados,falhas,expirados,presos,aviso,erro&em=gte.${desde}&order=em.desc&limit=400`);
+}
+
+/** Chamadas do pg_cron com o resultado (200 / 503 / tempo esgotado) — rpc só do servidor. */
+export async function chamadasRecentes(horas = 24) {
+  const r = await rpc('comunicar_chamadas_recentes', { p_horas: horas }).catch(() => []);
+  return Array.isArray(r) ? r : [];
+}
+
+/** O último "Mandar teste para mim" que saiu bem (para o checklist). */
+export async function ultimoTesteOk() {
+  const p = new URLSearchParams('select=enviado_em');
+  p.set('tipo', 'eq.avulsa'); p.set('status', 'eq.enviado'); p.set('nome', 'like.Teste (*');
+  p.set('order', 'enviado_em.desc.nullslast'); p.set('limit', '1');
+  return (await selecionarUm(T.envios, p))?.enviado_em || null;
+}
+
+/** Selo da aba Mensagens sem baixar a fila inteira. */
+export async function contarPendentes() {
+  return contar(T.envios, 'status=eq.pendente');
+}
+
+/** Clientes para casar com a lista de aniversários (só o necessário). */
+export async function clientesParaCasar() {
+  return selecionarTudo(T.clientes, 'select=id,nome,telefone,nascimento&order=nome.asc');
+}
+
+/** Grava as datas escolhidas (uma requisição por cliente; ids e datas validados). */
+export async function gravarNascimentos(itens, { substituir = false } = {}) {
+  let gravados = 0; const erros = [];
+  for (const i of itens) {
+    if (!ehUuid(i.cliente_id) || !/^\d{4}-\d{2}-\d{2}$/.test(String(i.nascimento || ''))) continue;
+    try {
+      const r = await atualizarUm(T.clientes, `id=eq.${i.cliente_id}${substituir ? '' : '&nascimento=is.null'}&select=id`, { nascimento: i.nascimento });
+      if (r) gravados++;
+    } catch (e) { erros.push(String(e?.message || e).slice(0, 120)); }
+  }
+  return { gravados, erros: erros.slice(0, 5) };
+}
+
+/**
+ * Textos onde costuma aparecer o aniversário: observações da ficha, observações
+ * do lead (CRM) e mensagens que o próprio cliente mandou no WhatsApp.
+ * Filtra no banco pelas palavras-chave para não baixar tudo.
+ */
+export async function textosComAniversario() {
+  const filtro = 'or=(observacoes.ilike.*anivers*,observacoes.ilike.*nasc*,observacoes.ilike.*niver*)';
+  const [fichas, leads, msgs] = await Promise.all([
+    selecionar(T.clientes, `select=id,nome,telefone,nascimento,observacoes&${filtro}&limit=500`).catch(() => []),
+    selecionar(T.leads, `select=id,cliente_id,nome,telefone,observacoes&${filtro}&limit=500`).catch(() => []),
+    selecionar(T.mensagens, 'select=id,conversa_id,corpo,created_at&direcao=eq.entrada&or=(corpo.ilike.*anivers*,corpo.ilike.*nasci*,corpo.ilike.*niver*)&order=created_at.desc&limit=500').catch(() => []),
+  ]);
+  const conversaIds = [...new Set(msgs.map((m) => m.conversa_id).filter(ehUuid))];
+  const conversas = new Map();
+  for (let i = 0; i < conversaIds.length; i += 80) {
+    const lote = await selecionar(T.conversas, `select=id,cliente_id,telefone,nome&id=in.(${conversaIds.slice(i, i + 80).join(',')})`).catch(() => []);
+    for (const c of lote) conversas.set(c.id, c);
+  }
+  return { fichas, leads, mensagens: msgs.map((m) => ({ ...m, conversa: conversas.get(m.conversa_id) || null })) };
+}
+
+/** Tudo que a prévia do mês precisa (cache curto em rotas.js). */
+export async function dadosDaProjecao() {
+  const desde = somarDias(hoje(), -(36 * 30 + 40));
+  const [cfg, regras, agendamentos, clientes, leads, taxa] = await Promise.all([
+    obterConfig(),
+    listarRegras(),
+    selecionarTudo(T.agendamentos, `select=id,cliente_id,cliente_nome,telefone,servico,data,hora,status&data=gte.${desde}`),
+    selecionarTudo(T.clientes, 'select=id,nome,telefone,nascimento,aceita_mensagens'),
+    selecionarTudo(T.leads, 'select=id,cliente_id,nome,telefone,status,updated_at&status=eq.orcamento'),
+    taxaDeAvaliacao(),
+  ]);
+  return { cfg, regras, agendamentos, clientes, leads, taxaAvaliacao: taxa };
+}
+
+/** Fração dos pós-vendas enviados que viraram avaliação (180 dias); null sem histórico. */
+export async function taxaDeAvaliacao() {
+  const desde = new Date(Date.now() - 180 * 86400000).toISOString();
+  const [pos, aval] = await Promise.all([
+    contar(T.envios, `tipo=eq.posvenda&status=eq.enviado&enviado_em=gte.${desde}`).catch(() => 0),
+    contar(T.envios, `tipo=eq.avaliacao&status=in.(enviado,pendente)&enviar_em=gte.${desde}`).catch(() => 0),
+  ]);
+  return pos >= 10 ? Math.min(1, aval / pos) : null;
+}
+
+/**
+ * Indicadores por pessoa (30 dias): mensagens que cada um mandou, quantas
+ * tiveram resposta, quantas viraram agendamento, campanhas propostas/aprovadas.
+ * Atendente vê só a dele (filtro feito em rotas.js).
+ */
+export async function indicadoresEquipe(dias = 30) {
+  const desde = new Date(Date.now() - dias * 86400000).toISOString();
+  const [envios, campanhas] = await Promise.all([
+    selecionarTudo(T.envios, `select=criado_por_id,criado_por,nome,tipo,status,respondido_em,agendou_depois_id&criado_por_id=not.is.null&enviar_em=gte.${desde}`),
+    selecionar(T.campanhas, `select=criado_por,criado_por_nome,status,decidido_por,decidido_por_nome&created_at=gte.${desde}&limit=500`).catch(() => []),
+  ]);
+  return montarIndicadores(envios, campanhas);
+}
+
+/** Pura: agrupa por pessoa (testes de WhatsApp não contam). */
+export function montarIndicadores(envios, campanhas = []) {
+  const pessoas = new Map();
+  const p = (id, nome) => {
+    if (!pessoas.has(id)) pessoas.set(id, { perfil_id: id, nome: nome || 'Equipe', enviadas: 0, naFila: 0, falharam: 0, responderam: 0, agendaram: 0, propostas: 0, aprovadas: 0, decidiu: 0 });
+    const x = pessoas.get(id); if (nome && x.nome === 'Equipe') x.nome = nome; return x;
+  };
+  for (const e of envios) {
+    if (!e.criado_por_id || /^Teste \(/.test(e.nome || '')) continue;
+    const x = p(e.criado_por_id, e.criado_por);
+    if (e.status === 'enviado') x.enviadas++;
+    else if (e.status === 'pendente') x.naFila++;
+    else if (e.status === 'falhou') x.falharam++;
+    if (e.respondido_em) x.responderam++;
+    if (e.agendou_depois_id) x.agendaram++;
+  }
+  for (const c of campanhas) {
+    if (c.criado_por) { const x = p(c.criado_por, c.criado_por_nome); x.propostas++; if (c.status === 'aprovada') x.aprovadas++; }
+    if (c.decidido_por && ['aprovada', 'recusada'].includes(c.status)) p(c.decidido_por, c.decidido_por_nome).decidiu++;
+  }
+  return [...pessoas.values()].map((x) => ({ ...x, taxaResposta: x.enviadas ? Math.round((x.responderam / x.enviadas) * 100) : null }))
+    .sort((a, b) => (b.enviadas + b.propostas) - (a.enviadas + a.propostas));
+}
+export const buscarClientesPorIds = (ids) => clientesPorIds(ids);
+
+/** Para o checklist: quantos clientes têm aniversário e quantos têm telefone. */
+export const contarComNascimento = () => contar(T.clientes, 'nascimento=not.is.null');
+export const contarClientesComTelefone = () => contar(T.clientes, 'telefone=not.is.null');

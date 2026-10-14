@@ -394,8 +394,9 @@ test('API: JSON inválido 400, corpo grande 413, CORS só do ecossistema, erro i
     assert.equal(mal.status, 403);
     const bom = await s.chamar('gestor', 'GET', '/api/resumo', undefined, { Origin: 'https://indycar-atendimento.onrender.com' });
     assert.equal(bom.headers.get('access-control-allow-origin'), 'https://indycar-atendimento.onrender.com');
-    s.d.resumo = async () => { throw new Error('senha do banco: xyz123 (detalhe interno)'); };
-    const boom = await s.chamar('gestor', 'GET', '/api/resumo');
+    // (o /api/resumo agora tem cache de 15 s — o erro interno é conferido noutra rota)
+    s.d.listarClientes = async () => { throw new Error('senha do banco: xyz123 (detalhe interno)'); };
+    const boom = await s.chamar('gestor', 'GET', '/api/clientes');
     assert.equal(boom.status, 500); assert.doesNotMatch(boom.texto, /xyz123|detalhe interno/); assert.match(boom.json.erro, /ref\./);
   } finally { await s.fechar(); }
 });

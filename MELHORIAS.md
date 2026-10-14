@@ -340,3 +340,135 @@ Banco
 - Servidor real local na 3510 com `CARTEIRO_DESLIGADO=1`: ping 200, 401 sem login e com token falso, 403 no carteiro sem token, 404/405, CORS (403 de fora, cabeçalho para o ecossistema, preflight 204), CSP e cabeçalhos no HTML, travessia 404, POST no estático 405; a tela abre em 1440/375 com a CSP sem bloquear supabase-js nem fontes.
 - Mock na 3511 + puppeteer: 137/137 verificações em 1440 e 375 px.
 - Produção (publicado pelo publicar.mjs, commit a9d62a7, `live`): ping 3.0.0, 401 sem login/token falso, 403 carteiro sem token e origem de fora, 405, CSP + HSTS no HTML, conta.js e supabase-js 2.45.4 servidos, SW comunicar-v3; tela de login sem erro de console em 1440/375; a primeira rodada do carteiro v3 mandou o resumo semanal aos 2 admins (`resumo-comunicar:2026-10-12`, conferido no banco).
+
+## Rodada 4 (14/10/2026)
+
+Foco: o Render gratuito dormindo (503 "hibernate-wake-error"), o que falta para o Comunicar funcionar, aniversários, prévia do mês, equipe, velocidade e acessibilidade.
+
+Diagnóstico
+
+234. Conferido no banco: o pg_cron `comunicar-carteiro` levou **503** às 16:35 e 19:05 e estourou **90 s** às 17:35 e 18:05 de 14/10 (4 de ~24 chamadas do dia); as outras responderam 200.
+
+Carteiro tolerante (servidor + banco)
+
+235. **Reserva** antes de ir ao WhatsApp (`posvenda_envios.enviando_em`): só quem reservou envia — dois carteiros (timer + pg_cron, ou dois processos num deploy) nunca mandam a mesma mensagem.
+236. A fila do carteiro pula o que está reservado (`enviando_em=is.null`) e lê colunas explícitas.
+237. **Reserva presa** (> 15 min e ainda pendente = o servidor caiu no meio) vira "falhou" com "confira na conversa se saiu antes de reenviar" — nunca reenvia sozinho.
+238. **Validade por régua** (`expira_em`): lembrete até 1 h antes do horário, aniversário até o fim do dia seguinte, pós-venda 5 dias, orçamento e não fechou 7, revisão 10, reativação 20.
+239. Faxina no começo de cada rodada: o que perdeu a validade vira "pulado" com o motivo "passou da hora: o servidor ficou fora do ar…".
+240. O **lembrete confere a Agenda** na hora de sair: horário cancelado, já atendido, falta ou apagado → pulado com o motivo.
+241. **Lembrete remarcado** enquanto o servidor dormia: o texto é refeito com o horário novo e, se ficou longe, espera a hora certa.
+242. **Aniversário recuperado**: se o servidor não rodou nenhuma vez ontem, os aniversariantes de ontem recebem hoje (uma vez só; régua recém-ligada não manda parabéns atrasado).
+243. "Rodar agora" no meio de uma rodada **espera** a rodada atual (antes respondia "já está rodando").
+244. Rodada que estoura (banco ou rede fora) devolve erro claro, fica anotada e não derruba o servidor.
+245. Marcar "enviado" tenta 3 vezes; se mesmo assim não gravar, a reserva segura — nada de segunda mensagem.
+246. `/api/rodar` responde em até **25 s**; rodada longa devolve **202** e continua no servidor (fim do "tempo esgotado" do pg_cron).
+247. `/api/rodar` diz de onde veio (`?origem=cron|reforco|github` ou `X-Origem`).
+248. Cada rodada fica em **`comunicar_carteiro_batidas`** (origem, duração, criadas, enviadas, falhas, vencidas, presas, aviso, erro, versão).
+249. **`comunicar_carteiro_chamar(origem)`**: o job `comunicar-carteiro` passou a anotar cada chamada com o id do pg_net (`comunicar_carteiro_chamadas`), com 100 s de espera.
+250. **Reforço** `comunicar-carteiro-reforco` (minutos 2, 7, 12…, 8h–20h): chama de novo se a última rodada tem 17+ min, no máximo uma vez a cada 4 min.
+251. **`comunicar_chamadas_recentes(horas)`**: junta cada chamada ao resultado do pg_net (200, 503, tempo esgotado) — só o servidor executa.
+252. Limpeza automática: chamadas com mais de 14 dias e rodadas com mais de 30.
+253. GitHub Actions do carteiro: avisa a origem, aceita 202 e espera 20/40/60/90 s quando o Render responde 503.
+
+Tela que aguenta o servidor dormindo
+
+254. **`acordar.js`**: 502/503/504 sem JSON = servidor acordando — a chamada espera e tenta de novo sozinha (2, 4, 8, 12, 20, 30… s, até ~3 min).
+255. **Uma sonda só** (`/api/ping`) para todas as chamadas que estão esperando; quando volta, todas seguem.
+256. Só repete o que é seguro: leitura sempre; gravação só quando o 502/503 veio do Render (o pedido nem chegou ao app) ou o aparelho estava sem internet. O 503 do próprio app (IA desligada) volta na hora.
+257. Faixa **"O sistema está acordando… tentando de novo em 8 s (tentativa 3). Nada do que você escreveu se perde."** com contagem, barra de progresso e "Tentar agora"; `role=status`/`aria-live`; aparece até na tela de login.
+258. **"Voltou! O sistema está no ar de novo."** e a tela aberta se atualiza sozinha (sem piscar; Réguas com edição não é recarregada).
+259. Depois de 3 min: mensagem clara de que o servidor não acordou e de que o que foi escrito continua na tela.
+260. A configuração pública (URL e chave anônima do Supabase) fica no aparelho: com o servidor dormindo a tela abre na hora.
+261. **Service worker v4**: a página espera a rede por até 4 s; servidor fora (5xx), sem rede ou lento → a casca vem do cache (testado derrubando o servidor real).
+262. Arquivos com a versão na URL (`?v=4.0.0`): cache primeiro e a versão nova em segundo plano; supabase-js e fontes num cache próprio.
+263. Tela que falha ao abrir mostra **"Tentar de novo"**.
+264. **Rascunho da campanha** no aparelho: volta ao reabrir "Nova campanha" ("Recuperei a mensagem que você estava escrevendo") e some ao enviar.
+265. **Rascunho das Réguas**: alterações não salvas voltam ao recarregar (só se ninguém salvou as réguas depois) e a aba avisa antes de fechar com alteração pendente.
+266. Erro ao salvar as réguas diz que as alterações continuam guardadas no aparelho.
+267. Voltar para a aba depois de 2+ min atualiza a saúde e a tela.
+
+Pronto para ligar
+
+268. **`GET /api/pronto`** + `prontidao.js`: checklist de 11 itens com estado (pronto · falta · atenção), o que fazer e o botão certo.
+269. Itens: chave do CodeWords, WhatsApp conectado, réguas ligadas, texto de cada régua ligada, pausa geral, link de avaliação, telefone de teste, um teste que chegou, aniversários cadastrados, carteiro rodando, IA.
+270. Painel no Início com anel "N/11", "próximo passo" e itens essenciais marcados; abre sozinho quando falta algo e lembra se a pessoa fechou.
+271. Cada item leva ao lugar: Atendimento (chave/QR), Réguas, cadastro de aniversários ou histórico do carteiro.
+272. Atendente vê **"Pedir ao gestor"** no lugar dos botões que são do gestor.
+273. Em produção (lido no banco): 4 de 11 — faltam a chave do CodeWords, ligar as réguas e o telefone de teste; 0 de 2.464 clientes com aniversário.
+
+Carteiro na tela
+
+274. Modal **"Carteiro · últimas 24 h"**: rodadas, mensagens que saíram, chamadas sem resposta e quantas o reforço salvou.
+275. Linha do tempo das 24 h com as rodadas e os 503/tempo esgotado.
+276. Lista das chamadas do banco (a cada 15 min, reforço) com a situação e os **buracos** de mais de 20 min no horário de envio.
+277. O "carteiro rodou há…" do Início virou botão que abre esse histórico; "Rodar agora" no próprio modal para o gestor.
+
+Próximos 30 dias e alcance
+
+278. **`GET /api/projecao`** + `projecao.js`: o que sairia nos próximos 30 dias com as 8 réguas ligadas, por régua e por dia.
+279. Mesmas regras dos geradores: prazos e janelas de recuperação, quem voltou depois não recebe, um convite de revisão por cliente, opt-out fora.
+280. Domingo, feriado nacional (nas réguas que seguram) e intervalo mínimo entre mensagens aplicados; "segurados pelo intervalo" contados.
+281. O que depende do futuro aparece como **estimado** (pós-venda de quem ainda vai ser atendido; avaliação pela taxa histórica).
+282. Avisos: régua Avaliação sem link, dia acima do que o limite por hora comporta e orçamentos parados há tempo demais para a régua.
+283. Modal **"Próximos 30 dias"**: número total e "com as réguas ligadas hoje", barra por régua com exemplos, calendário de calor; clicar num dia lista quem recebe.
+284. **Alcance em cada régua** ("≈ 9 mensagens em 30 dias") que abre a prévia.
+285. Cache de 10 min no servidor; no banco real a conta leva ~300 ms (168 agendamentos, 2.464 clientes, 69 orçamentos).
+
+Aniversários mais fáceis
+
+286. `lerData` entende 12/05/1980, 12/05/80, 5.6.2001, 12-05, 1980-05-12, "12 de maio [de 1980]", 12/mai/80 e data do Excel com hora; recusa 29/02/1981, 31/04, ano no futuro e antes de 1900.
+287. **Colar lista** em qualquer formato (nome, telefone e data em qualquer ordem; espaço, vírgula, ponto e vírgula, tabulação) — telefone não vira data.
+288. **Arquivo CSV** com ou sem cabeçalho (nome/telefone/nascimento/aniversário/data), aspas e vírgula no nome; planilha do Excel em ANSI é relida como Windows-1252.
+289. Acha o cliente pelo telefone, pelos 8 últimos dígitos (com ou sem o 9), pelo nome completo ou primeiro + último nome; mais de um candidato = a pessoa escolhe.
+290. **Conferência antes de gravar**: datas novas, que trocariam, iguais e para conferir, linha a linha, com o motivo ("não entendi a data 31/02").
+291. Nunca troca uma data que já existe sem marcar "trocar também" (só gestor) — o servidor grava com `nascimento=is.null`.
+292. Lista inteira só gestor (403 claro + "Pedir ao gestor para gravar"); uma data por vez qualquer pessoa da equipe.
+293. **Procurar nas conversas e no CRM**: datas perto de "aniversário/nasci/nascimento/niver" nas observações da ficha, nos leads e no que o cliente escreveu no WhatsApp, com o trecho para conferir.
+294. Aba "Quem já tem": quantos têm data, os próximos 30 dias e atendidos sem data.
+295. Botão **Aniversários** em Clientes; o "Puxar do CRM" da régua abre o novo cadastro; o rascunho da lista colada fica no aparelho.
+296. Gravação auditada (`aniversarios_gravados`: quantos, origem, se trocou).
+
+Mais funcionários no dia a dia
+
+297. **Indicadores por pessoa** (30 dias): mensagens enviadas, % que responderam, agendaram, campanhas — "Equipe" para gestor, "Você" para atendente (o servidor filtra); testes de WhatsApp não contam.
+298. **"Pedir ao gestor"** (`POST /api/pedir-gestor`): aviso no sino de cada gestor, um por assunto por dia, sem avisar a si mesmo, auditado.
+299. Botão "Pedir ao gestor" nas Réguas do atendente, no checklist, na ajuda e na lista de aniversários.
+300. **Tour de boas-vindas por papel** (gestor: Pronto para ligar, Réguas, Mensagens, Clientes, Campanhas, Ajuda; atendente: Seu dia, Mensagens, Clientes, Campanhas, Avisos, Ajuda), só na primeira vez de cada pessoa.
+301. Tour com destaque no lugar certo, Próximo/Voltar/Pular, setas do teclado, Enter, Esc e foco preso no cartão; "Rever o tour" na ajuda.
+302. **Ajuda "Como faço…"** por papel, com busca (sem acento), e o papel da pessoa explicado no topo.
+
+Velocidade
+
+303. Selo da fila por **contagem** (`/api/fila/contagem`) — antes baixava até 500 mensagens; no Início usa o número que já veio no resumo.
+304. **Mensagens em páginas de 100** com "Carregar mais" (antes 300 de uma vez).
+305. Respostas JSON acima de 1,4 KB vão em **brotli ou gzip**.
+306. Arquivos da tela **em memória, já comprimidos** (brotli/gzip) e com **ETag/304**; HEAD sem corpo (`estaticos.js`).
+307. **Cache curto no servidor**: resumo 15 s, pronto 30 s, carteiro 20 s, fila 10 s, indicadores 60 s, sugestões 5 min, prévia 10 min — limpo ao salvar réguas, rodar ou gravar aniversários.
+308. Colunas explícitas na lista de mensagens e na fila (antes `select=*`).
+309. `preconnect` do jsDelivr (supabase-js).
+
+Acessibilidade
+
+310. **"Pular para o conteúdo"** é o primeiro Tab da página.
+311. Título da aba muda com a tela ("Réguas · IndyCar Comunicar") e o leitor de tela ouve "Tela Réguas".
+312. Trocar de tela leva o foco ao título da tela (sem roubar o foco na abertura); `aria-busy` enquanto carrega.
+313. Abas de Mensagens e do cadastro de aniversários com `role=tab` e `aria-selected`; selo da fila com `aria-label`.
+314. Anel do checklist e linha do tempo do carteiro com `role=img` e texto; calendário com rótulo por dia ("16/10: 2 mensagens (Pós-venda: 2)").
+315. `:focus-visible` em todos os controles; animações novas respeitam `prefers-reduced-motion`.
+316. Tudo novo em 375 px sem rolagem lateral (checklist, carteiro, 30 dias, aniversários, ajuda, tour, faixa "acordando" no pé da tela).
+
+Testes e ferramentas
+
+317. `scripts/testes-rodada4.mjs` (27 testes): aniversários, prévia do mês, prontidão, carteiro (validade, reserva, lembrete, reforço, resumo), `acordar.js` num navegador de mentira, API real com papéis, compressão, estáticos e indicadores — `npm test` = **93**.
+318. `npm run navegador4` (`scripts/navegador-rodada4.mjs`): roteiro puppeteer em 1440 e 375 px.
+319. `scripts/conferir-rodada4.mjs`: as leituras da rodada 4 no banco real, sem gravar nada.
+320. Mock: `?dormir=N` (503 em HTML como o Render), `?pronto=tudo`, `?tour=0`, `?semente=1` volta também os aniversários, e as rotas novas com as MESMAS funções puras do servidor.
+
+### Como foi verificado (14/10/2026, rodada 4)
+
+- `npm test`: 93/93 · `npm run check` limpo · `npm run segredos` limpo.
+- Banco real: migração `comunicar_rodada4` aplicada (advisors sem WARN novo; só o INFO "RLS sem política" de propósito, igual a `comunicar_campanhas`); DO-block revertido com `TESTE_REVERTIDO`: reforço chama com rodada velha (sim), não repete em 4 min (não), não chama com rodada recente (não), chamada anotada (1), envio vencido vira pulado (1), reserva (1) e segunda reserva barrada (0); as chamadas reais das 22:35 e 22:50 UTC já aparecem com status 200 na `comunicar_chamadas_recentes`.
+- `node scripts/conferir-rodada4.mjs` no banco real (só leitura): pronto 4/11, prévia 13 mensagens em 30 dias com tudo ligado (0 com as ligadas hoje), lista de teste casou 3 de 4.
+- Servidor real local (3510, `CARTEIRO_DESLIGADO=1`): ping 4.0.0, 401/403 nas rotas novas, `/api/rodar?origem=reforco` com token, app.js em brotli com ETag e 304; navegador: login sem erro de console em 1440/375, service worker no controle, config guardada e, **com o servidor derrubado**, a casca abre do cache com a faixa "acordando".
+- Mock + puppeteer: `navegador4` **104/104** verificações em 1440 e 375 px (zero erro de console); `navegador` (rodada 3) 137/137 — sem regressão.

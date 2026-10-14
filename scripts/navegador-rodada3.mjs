@@ -26,7 +26,7 @@ async function abrir(larg, qs) {
   page.on('dialog', (d) => d.accept(d.type() === 'prompt' ? 'Esta semana não' : undefined));
   if (larg === 375) await page.setViewport({ width: 375, height: 812, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
   else await page.setViewport({ width: 1440, height: 900 });
-  await page.goto(`${BASE}/?${qs}`, { waitUntil: 'networkidle0' });
+  await page.goto(`${BASE}/?${qs}&tour=0`, { waitUntil: 'networkidle0' }); // rodada 4: sem o tour de boas-vindas
   await espera(600);
   page.__erros = erros;
   return page;

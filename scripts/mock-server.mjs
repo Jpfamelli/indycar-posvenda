@@ -30,6 +30,12 @@ import {
 import * as ia from '../ia.js';
 import * as A from '../acesso.js';
 import * as auto from '../automacoes.js';
+// rodada 4: as MESMAS funções puras do servidor
+import { montarProntidao } from '../prontidao.js';
+import { projetarMes } from '../projecao.js';
+import { resumirCarteiro } from '../carteiro.js';
+import { lerLista, casarComClientes, resumirAnalise, montarSugestoes, lerData } from '../aniversarios.js';
+import { montarIndicadores } from '../dados.js';
 
 /* IA de MENTIRA: o mock usa as funções REAIS do ia.js (validação, correção de
    vocabulário, prévia) com um cliente falso — nada vai para a Anthropic. */
@@ -114,6 +120,7 @@ const CLIENTES = [
     aceita_mensagens_em: diasAtras(40), aceita_mensagens_motivo:'desligado no painel por João Pedro: pediu no balcão' }),
 ];
 const porId = (id) => CLIENTES.find((c) => c.id === id);
+const NASC0 = new Map(CLIENTES.map((c) => [c.id, c.nascimento])); // rodada 4: ?semente=1 também volta as datas
 const C = (i) => CLIENTES[i];
 
 // ---- config ---------------------------------------------------------------
@@ -264,6 +271,13 @@ let RESPOSTAS = [
 
 // ---- saúde e carteiro -------------------------------------------------------
 let SAUDE_OK = false;
+// rodada 4: Render dormindo de mentira e o histórico do carteiro (24 h com dois 503 e um tempo esgotado)
+let DORMIR_ATE = 0, CHAMADAS_DORMINDO = 0, PRONTO_TUDO = false;
+const minAtras = (n) => new Date(Date.now() - n * 60000).toISOString();
+const BATIDAS = () => Array.from({ length: 40 }, (_, i) => ({ em: minAtras(10 + i * 15), origem: i % 7 === 3 ? 'reforco' : 'cron', ok: true, enviados: i % 5 === 0 ? 2 : 0, criados: i % 9 === 0 ? 1 : 0 }))
+  .filter((b, i) => i !== 12 && i !== 13);
+const CHAMADAS = () => Array.from({ length: 40 }, (_, i) => ({ em: minAtras(10 + i * 15), origem: i % 7 === 3 ? 'reforco' : 'cron',
+  status_code: [12, 20].includes(i) ? 503 : i === 13 ? null : 200, timed_out: i === 13, erro: i === 13 ? 'Timeout of 100000 ms reached' : null }));
 const ultimaRodada = { em: horasAtras(0.4), resultado:{ ok:true, gerado:{ criados:3, pulados:1 }, enviados:3, falhas:0 } };
 
 
@@ -391,9 +405,13 @@ http.createServer(async (req, res) => {
     if (p === '/' || p === '/index.html') {
       if (url.searchParams.has('papel')) { const k = url.searchParams.get('papel'); PAPEL = PERFIS[k] ? k : 'admin'; }
       LOGADO = url.searchParams.get('logado') !== '0';
-      if (url.searchParams.get('semente') === '1') { semearEnvios(); semearR3(); }
+      if (url.searchParams.get('semente') === '1') { semearEnvios(); semearR3(); for (const c of CLIENTES) c.nascimento = NASC0.get(c.id) ?? null; }
       if (url.searchParams.has('saude')) SAUDE_OK = url.searchParams.get('saude') === 'ok';
       if (url.searchParams.has('ia')) IA_LIGADA = url.searchParams.get('ia') !== 'off';
+      // rodada 4: ?dormir=20 → por 20 s toda a API responde 503 em HTML (como o Render acordando)
+      if (url.searchParams.has('dormir')) DORMIR_ATE = Date.now() + (Number(url.searchParams.get('dormir')) || 20) * 1000;
+      // ?pronto=tudo → o checklist sai todo verde (WhatsApp ok, réguas, datas…)
+      if (url.searchParams.has('pronto')) PRONTO_TUDO = url.searchParams.get('pronto') === 'tudo';
       const html = fs.readFileSync(path.join(PUBLIC, 'index.html'), 'utf8')
         .replace(/<script src="https:\/\/cdn\.jsdelivr\.net\/npm\/@supabase[^"]*"><\/script>/, dubleSupabase());
       res.writeHead(200, { 'Content-Type': MIME['.html'] }); return res.end(html);
@@ -405,14 +423,19 @@ http.createServer(async (req, res) => {
     return fs.createReadStream(arq).pipe(res);
   }
 
+  if (Date.now() < DORMIR_ATE) {
+    CHAMADAS_DORMINDO++;
+    res.writeHead(503, { 'Content-Type': 'text/html; charset=utf-8', 'x-render-routing': 'hibernate-wake-error' });
+    return res.end('<html><body>Service Unavailable</body></html>');
+  }
   let body = {};
   if (m !== 'GET') { let b = ''; for await (const c of req) b += c; try { body = JSON.parse(b || '{}'); } catch {} }
   await new Promise((r) => setTimeout(r, 180));            // latência de verdade, para ver o esqueleto
   const naoGestor = () => json(res, 403, { erro:'Só gestor altera as réguas.' });
   let mm;
 
-  if (p === '/api/config') return json(res, 200, { configurado:true, supabaseUrl:'http://mock.local', supabaseAnonKey:'mock', app:'IndyCar Comunicar', versao:'3.0.0-mock' });
-  if (p === '/api/ping') return json(res, 200, { ok:true, versao:'3.0.0-mock' });
+  if (p === '/api/config') return json(res, 200, { configurado:true, supabaseUrl:'http://mock.local', supabaseAnonKey:'mock', app:'IndyCar Comunicar', versao:'4.0.0-mock' });
+  if (p === '/api/ping') return json(res, 200, { ok:true, versao:'4.0.0-mock' });
 
   /* Porteiro: as MESMAS regras do servidor (acesso.js) — rota, acesso ao app,
      segundo fator, troca de senha obrigatória e permissão do papel. */
@@ -525,7 +548,56 @@ http.createServer(async (req, res) => {
     if (q) l = l.filter((e) => [e.nome, e.corpo, e.telefone].some((x) => String(x || '').toLowerCase().includes(q)));
     l = filtrarExtra(l, url.searchParams);
     l.sort((a, b) => (a.enviar_em < b.enviar_em ? 1 : -1));
-    return json(res, 200, l.slice(0, Number(url.searchParams.get('limite')) || 300));
+    const ini = Number(url.searchParams.get('offset')) || 0;
+    return json(res, 200, l.slice(ini, ini + (Number(url.searchParams.get('limite')) || 300)));
+  }
+
+  // ---- rodada 4 ---------------------------------------------------------------
+  if (p === '/api/fila/contagem') return json(res, 200, { pendentes: ENVIOS.filter((e) => e.status === 'pendente').length });
+  if (p === '/api/carteiro') return json(res, 200, { ...resumirCarteiro({ batidas: BATIDAS(), chamadas: CHAMADAS(), janela: { inicio: CFG.janela_inicio, fim: CFG.janela_fim } }), configurado: true, janela: { inicio: CFG.janela_inicio, fim: CFG.janela_fim } });
+  if (p === '/api/pronto') {
+    const fatos = PRONTO_TUDO
+      ? { cfg: CFG, whatsapp: { ok: true, conectado: true }, carteiro: resumirCarteiro({ batidas: BATIDAS(), chamadas: CHAMADAS() }), aniversarios: { comData: 9, total: 12 }, ia: { ativo: true, temChave: true }, teste: { ultimoOkEm: horasAtras(30) } }
+      : { cfg: { ...CFG, link_avaliacao: SAUDE_OK ? CFG.link_avaliacao : '' }, whatsapp: SAUDE_OK ? { ok: true, conectado: true } : { ok: false, chaveRecusada: true },
+          carteiro: resumirCarteiro({ batidas: BATIDAS(), chamadas: CHAMADAS() }), aniversarios: { comData: CLIENTES.filter((c) => c.nascimento).length, total: CLIENTES.filter((c) => c.telefone).length },
+          ia: { ativo: IA_LIGADA, temChave: true }, teste: { ultimoOkEm: null } };
+    return json(res, 200, { ...montarProntidao(fatos), gestor: ehGestor() });
+  }
+  if (p === '/api/projecao') {
+    const agendamentos = AG.map((a) => ({ id: a.id, cliente_id: a.cliente.id, cliente_nome: a.cliente.nome, telefone: a.cliente.telefone, servico: a.servico, data: a.data, hora: a.hora, status: a.status }));
+    const leads = [{ id: uuid(), cliente_id: C(4).id, nome: C(4).nome, telefone: C(4).telefone, status: 'orcamento', updated_at: diasAtras(2) }];
+    return json(res, 200, projetarMes({ hoje: hoje(), cfg: CFG, regras: REGRAS, agendamentos, clientes: CLIENTES, leads, taxaAvaliacao: 0.5 }));
+  }
+  if (p === '/api/aniversarios/analisar' && m === 'POST') {
+    const lido = lerLista(String(body.texto || ''));
+    if (!lido.linhas.length) return json(res, 400, { erro: 'Não achei nenhuma linha com conteúdo.' });
+    const itens = casarComClientes(lido.linhas, CLIENTES);
+    return json(res, 200, { itens, resumo: resumirAnalise(itens), cabecalho: lido.cabecalho, cortado: !!lido.cortado });
+  }
+  if (p === '/api/aniversarios/gravar' && m === 'POST') {
+    const itens = (Array.isArray(body.itens) ? body.itens : []).filter((i) => porId(i.cliente_id) && lerData(i.nascimento));
+    if (!itens.length) return json(res, 400, { erro: 'Nada para gravar: escolha pelo menos um cliente com data válida.' });
+    if (itens.length > 1 && !A.pode(eu, 'importar')) return json(res, 403, { erro: 'Gravar uma lista inteira é com o gestor. Peça a ele, ou cadastre um por vez na ficha.', codigo: 'sem_permissao' });
+    let gravados = 0;
+    for (const i of itens) { const c = porId(i.cliente_id); if (c.nascimento && !(body.substituir && A.pode(eu, 'importar'))) continue; c.nascimento = lerData(i.nascimento); gravados++; }
+    return json(res, 200, { ok: true, gravados, ignorados: itens.length - gravados, erros: [] });
+  }
+  if (p === '/api/aniversarios/sugestoes') {
+    const textos = { fichas: [{ ...C(4), observacoes: 'Cliente comentou: meu aniversário é 22/11, quer desconto no mês.' }],
+      leads: [{ cliente_id: C(9).id, observacoes: 'Nasci em 3 de março de 1985 — disse no telefone' }],
+      mensagens: [{ corpo: 'Semana que vem é meu aniversário, dia 28/10! Dá pra marcar depois?', conversa: { cliente_id: C(11).id } }] };
+    const mapa = new Map(CLIENTES.map((c) => [c.id, c]));
+    return json(res, 200, { sugestoes: montarSugestoes(textos, mapa), lidos: { fichas: 1, crm: 1, conversas: 1 } });
+  }
+  if (p === '/api/pedir-gestor' && m === 'POST') {
+    const ids = (await lojaMock.gestores()).filter((id) => id !== eu.id);
+    let avisados = 0;
+    for (const perfilId of ids) if (await lojaMock.notificar({ perfil: perfilId, tipo: 'pedido', titulo: `${eu.nome} pede: ${body.assunto || 'ajuda'}`, corpo: body.detalhe || null, link: '/?tela=reguas', chave: `pedido:${eu.id}:${body.assunto}:${hoje()}` })) avisados++;
+    return json(res, 200, { ok: true, avisados });
+  }
+  if (p === '/api/equipe/indicadores') {
+    const todos = montarIndicadores(ENVIOS, CAMPANHAS);
+    return json(res, 200, { dias: 30, gestor: ehGestor(), pessoas: ehGestor() ? todos : todos.filter((x) => x.perfil_id === eu.id) });
   }
   if (p === '/api/envios.csv' && m === 'GET') {
     let l = filtrarExtra(ENVIOS.slice(), url.searchParams);
