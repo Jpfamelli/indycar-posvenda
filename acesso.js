@@ -289,3 +289,20 @@ export function camposDoMeuPerfil(corpo = {}) {
 
 /** Tipos de aviso do Comunicar que a pessoa pode desligar (Meu perfil › Notificações). */
 export const TIPOS_NOTIFICACAO = ['reclamacao', 'aprovacao', 'falhas', 'resumo_semanal'];
+
+/**
+ * Rodada 4: merge PROFUNDO das preferências. perfis.preferencias é de TODOS os
+ * apps (Agenda, CRM, Atendimento…): gravar o jsonb inteiro apagaria o que os
+ * outros guardaram. Objetos se juntam chave a chave; o resto (número, texto,
+ * lista, null) é trocado pelo novo. Não altera os originais.
+ */
+export function mesclarPreferencias(atual, novo) {
+  const ehObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+  if (!ehObj(novo)) return ehObj(atual) ? { ...atual } : {};
+  const saida = ehObj(atual) ? { ...atual } : {};
+  for (const [k, v] of Object.entries(novo)) {
+    if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+    saida[k] = ehObj(v) && ehObj(saida[k]) ? mesclarPreferencias(saida[k], v) : (ehObj(v) ? mesclarPreferencias({}, v) : v);
+  }
+  return saida;
+}

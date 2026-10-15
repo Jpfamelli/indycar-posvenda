@@ -101,7 +101,7 @@ npm start            # produção local (precisa de .env com SUPABASE_*)
 npm run dev          # com --watch
 npm run mock         # tela com dados de MENTIRA em http://localhost:3511 — sem login
 npm run check        # node --check em tudo
-npm test             # 93 testes (funções puras, IA falsa, carteiro, papéis, aprovação, automações, API, rodada 4) — sem banco
+npm test             # 94 testes (funções puras, IA falsa, carteiro, papéis, aprovação, automações, API, rodada 4) — sem banco
 npm run segredos     # nenhuma chave nos arquivos versionados nem no histórico
 npm run navegador    # roteiro puppeteer da rodada 3 em 1440 e 375 px contra o mock (precisa do mock no ar)
 npm run navegador4   # roteiro da rodada 4 (pronto, carteiro, 30 dias, aniversários, tour, acordando)

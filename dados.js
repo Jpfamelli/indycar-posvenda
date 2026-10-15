@@ -18,6 +18,7 @@ import {
   inserir, inserirUm, atualizar, atualizarUm, remover, contar, rpc,
 } from './supabase.js';
 import { validadeDoEnvio } from './carteiro.js';
+import { mesclarPreferencias } from './acesso.js';
 
 const T = {
   clientes: 'clientes',
@@ -1561,7 +1562,7 @@ export async function atualizarMeuPerfil(id, campos) {
   const c = { ...campos };
   if (c.preferencias) {
     const atual = (await selecionarUm(T.perfis, `select=preferencias&id=eq.${id}`))?.preferencias || {};
-    c.preferencias = { ...atual, notificacoes: { ...(atual.notificacoes || {}), ...(c.preferencias.notificacoes || {}) } };
+    c.preferencias = mesclarPreferencias(atual, c.preferencias); // merge profundo: não apaga o que os outros apps guardaram
   }
   return atualizarUm(T.perfis, `id=eq.${id}&select=${CAMPOS_PERFIL}`, c);
 }

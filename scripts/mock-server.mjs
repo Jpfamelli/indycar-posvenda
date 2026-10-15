@@ -459,7 +459,7 @@ http.createServer(async (req, res) => {
   if (p === '/api/perfil' && m === 'PUT') {
     const { campos, erro } = A.camposDoMeuPerfil(body);
     if (erro) return json(res, 400, { erro });
-    if (campos.preferencias) campos.preferencias = { notificacoes: { ...(eu.preferencias?.notificacoes || {}), ...campos.preferencias.notificacoes } };
+    if (campos.preferencias) campos.preferencias = A.mesclarPreferencias(eu.preferencias, campos.preferencias);
     Object.assign(eu, campos);
     return json(res, 200, { ok:true, nome: eu.nome, cargo: eu.cargo, telefone: eu.telefone, avatar_cor: eu.avatar_cor, notificacoes: eu.preferencias?.notificacoes || {} });
   }

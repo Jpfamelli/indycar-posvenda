@@ -503,3 +503,16 @@ test('indicadores por pessoa: agrupa, ignora teste e calcula a taxa de resposta'
   assert.deepEqual([ana.enviadas, ana.naFila, ana.responderam, ana.agendaram, ana.taxaResposta, ana.decidiu], [2, 1, 1, 1, 50, 1]);
   assert.deepEqual([bia.enviadas, bia.falharam, bia.propostas, bia.aprovadas, bia.taxaResposta], [0, 1, 1, 1, null]);
 });
+
+test('preferências: merge profundo não apaga o que a Agenda, o CRM e o Atendimento guardaram', () => {
+  const atual = { tema: 'claro', agenda: { visao: 'semana', filtros: { consultor: 'x' } }, notificacoes: { reclamacao: true, tarefa_agenda: false, atendimento: { som: true } } };
+  const novo = A.camposDoMeuPerfil({ preferencias: { notificacoes: { reclamacao: false, aprovacao: true } } }).campos.preferencias;
+  const r = A.mesclarPreferencias(atual, novo);
+  assert.deepEqual(r, { tema: 'claro', agenda: { visao: 'semana', filtros: { consultor: 'x' } }, notificacoes: { reclamacao: false, tarefa_agenda: false, atendimento: { som: true }, aprovacao: true } });
+  assert.equal(atual.notificacoes.reclamacao, true, 'não altera o original');
+  assert.deepEqual(A.mesclarPreferencias(null, { a: { b: 1 } }), { a: { b: 1 } });
+  assert.deepEqual(A.mesclarPreferencias({ a: 1 }, null), { a: 1 });
+  assert.equal(Object.prototype.polluted, undefined);
+  A.mesclarPreferencias({}, JSON.parse('{"__proto__":{"polluted":1}}'));
+  assert.equal({}.polluted, undefined, 'sem poluir o protótipo');
+});

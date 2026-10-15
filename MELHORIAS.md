@@ -464,10 +464,11 @@ Testes e ferramentas
 318. `npm run navegador4` (`scripts/navegador-rodada4.mjs`): roteiro puppeteer em 1440 e 375 px.
 319. `scripts/conferir-rodada4.mjs`: as leituras da rodada 4 no banco real, sem gravar nada.
 320. Mock: `?dormir=N` (503 em HTML como o Render), `?pronto=tudo`, `?tour=0`, `?semente=1` volta também os aniversários, e as rotas novas com as MESMAS funções puras do servidor.
+321. **Preferências sem apagar as dos outros apps**: `perfis.preferencias` é compartilhado (Agenda, CRM, Atendimento…); gravar "Meu perfil › Notificações" agora lê o atual e faz **merge profundo** (`acesso.js › mesclarPreferencias`, sem poluir o protótipo) no servidor e no mock — a tela só manda a chave `notificacoes`. Teste novo: chaves da Agenda e aninhadas continuam intactas.
 
 ### Como foi verificado (14/10/2026, rodada 4)
 
-- `npm test`: 93/93 · `npm run check` limpo · `npm run segredos` limpo.
+- `npm test`: 94/94 · `npm run check` limpo · `npm run segredos` limpo.
 - Banco real: migração `comunicar_rodada4` aplicada (advisors sem WARN novo; só o INFO "RLS sem política" de propósito, igual a `comunicar_campanhas`); DO-block revertido com `TESTE_REVERTIDO`: reforço chama com rodada velha (sim), não repete em 4 min (não), não chama com rodada recente (não), chamada anotada (1), envio vencido vira pulado (1), reserva (1) e segunda reserva barrada (0); as chamadas reais das 22:35 e 22:50 UTC já aparecem com status 200 na `comunicar_chamadas_recentes`.
 - `node scripts/conferir-rodada4.mjs` no banco real (só leitura): pronto 4/11, prévia 13 mensagens em 30 dias com tudo ligado (0 com as ligadas hoje), lista de teste casou 3 de 4.
 - Servidor real local (3510, `CARTEIRO_DESLIGADO=1`): ping 4.0.0, 401/403 nas rotas novas, `/api/rodar?origem=reforco` com token, app.js em brotli com ETag e 304; navegador: login sem erro de console em 1440/375, service worker no controle, config guardada e, **com o servidor derrubado**, a casca abre do cache com a faixa "acordando".

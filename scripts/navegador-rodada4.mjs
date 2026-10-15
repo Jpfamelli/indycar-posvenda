@@ -149,7 +149,7 @@ for (const larg of [1440, 375]) {
     await page.reload({ waitUntil: 'networkidle0' }); await espera(1800);
     ok(larg, 'atendente: o tour não volta depois de pular', !(await visivel(page, '.tour-card')));
     ok(larg, 'atendente: checklist oferece "Pedir ao gestor" no lugar de "Ligar réguas"', await page.evaluate(() => !!document.querySelector('.pronto [data-pedir]') && !document.querySelector('.pronto [data-pronto-acao="rota:reguas"]')));
-    await clicar(page, '[data-route="reguas"]'); await espera(1100);
+    await clicar(page, '[data-route="reguas"]'); await page.waitForSelector('.toolbar [data-pedir="reguas"]', { timeout: 8000 }).catch(() => {});
     ok(larg, 'réguas do atendente: botão "Pedir ao gestor"', await visivel(page, '.toolbar [data-pedir="reguas"]'));
     await clicar(page, '.toolbar [data-pedir="reguas"]'); await espera(600);
     ok(larg, 'pedir ao gestor: avisa no sino dos gestores', /Pedido enviado: [0-9]+ gestores avisados/.test(await texto(page, '#toast')), await texto(page, '#toast'));
