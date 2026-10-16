@@ -9,8 +9,10 @@
 // -----------------------------------------------------------------------------
 import { REGUAS, ROTULO_TIPO } from './dados.js';
 import { itemPatioProntidao } from './patio.js';
+import { APPS, LINKS } from './acesso.js';
 
-const ATENDIMENTO = 'https://indycar-atendimento.onrender.com';
+const ATENDIMENTO = LINKS.integracoes(); // rodada 5: abre direto em Configurações › Integrações
+void APPS;
 
 /**
  * @param {object} f fatos

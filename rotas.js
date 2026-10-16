@@ -19,6 +19,7 @@ import * as prontidao from './prontidao.js';
 import * as projecao from './projecao.js';
 import * as aniv from './aniversarios.js';
 import * as patio from './patio.js';
+import { montarSaude } from './whatsapp.js';
 
 const LIMITE_AREA = 300;      // convite da Área do Cliente: um link (rpc) por pessoa
 const LIMITE_CORPO = 2_000_000; // importação de planilha pode ser grande
@@ -84,12 +85,13 @@ export function criarApi(deps) {
   const auditar = (u, acao, tabela, registro, detalhes) =>
     Promise.resolve(dados.auditar?.(u?.id || null, acao, tabela, registro, detalhes)).catch(() => null);
 
-  /** Enfileira a campanha (já aprovada ou feita por gestor). */
+  /** Enfileira a campanha (já aprovada ou feita por gestor). Rodada 5: respeita o limite diário (escalona nos dias seguintes). */
   async function executarCampanha({ corpo, detalhe, destinos, enviarEm, criador, campanhaId = null }) {
+    const cfg = (await Promise.resolve(dados.obterConfig?.()).catch(() => null)) || {};
     const porteiro = await dados.carregarPorteiro({ intervalo_minimo_dias: 0 });
     const lote = randomUUID();
     const linhas = [];
-    let pulados = 0;
+    const pulados = { total: 0, nao_quer: 0, sem_link: 0 };
     // Pátio (16/10): {link_area} = convite da Área do Cliente, um link NOVO por cliente
     const area = patio.usaLinkArea(corpo);
     const tipo = area ? 'area_cliente' : 'campanha';
@@ -97,17 +99,25 @@ export function criarApi(deps) {
     for (const d of destinos) {
       const clienteId = d.cliente_id ?? d.id ?? null;
       const v = porteiro.podeReceber({ cliente_id: clienteId, telefone: d.telefone, tipo });
-      if (!v.ok) { pulados++; continue; }
+      if (!v.ok) { pulados.total++; pulados.nao_quer++; continue; }
       const linkArea = area ? links.get(clienteId) : '';
-      if (area && !linkArea) { pulados++; continue; }   // sem cadastro de cliente não dá para gerar o link
+      if (area && !linkArea) { pulados.total++; pulados.sem_link++; continue; }   // sem cadastro de cliente não dá para gerar o link
       linhas.push({
         cliente_id: clienteId, telefone: d.telefone, nome: d.nome ?? null, tipo,
         corpo: dados.renderTemplate(corpo, { nome: d.nome, carro: d.carro, placa: d.placa, detalhe: detalhe || '', link_area: linkArea }),
         enviar_em: enviarEm, criado_por: criador?.nome || null, criado_por_id: criador?.id || null, lote, campanha_id: campanhaId,
       });
     }
-    const enfileirados = linhas.length ? await dados.enfileirarVarios(linhas) : 0;
-    return { enfileirados, pulados, lote };
+    // limite diário: o que não cabe hoje é programado para os próximos dias, na hora de envio
+    const hojeIso = dados.hoje?.() || new Date().toISOString().slice(0, 10);
+    const diaDoEnvio = dados.agoraSP ? dados.agoraSP(new Date(enviarEm)).data : hojeIso;
+    const jaHoje = diaDoEnvio === hojeIso ? await (dados.cargaDeHoje?.() ?? Promise.resolve(0)).catch(() => 0) : 0;
+    const dist = carteiroPuro.distribuirPorDia(linhas, {
+      limitePorDia: cfg.limite_por_dia || 300, jaHoje, inicioIso: enviarEm, hoje: diaDoEnvio,
+      horaEnvio: cfg.hora_envio || '09:30', enviaDomingo: !!cfg.envia_domingo, feriado: dados.feriado || (() => null),
+    });
+    const enfileirados = dist.linhas.length ? await dados.enfileirarVarios(dist.linhas) : 0;
+    return { enfileirados, pulados: pulados.total, puladosDetalhe: pulados, lote, dias: dist.dias, porDia: dist.porDia, limitePorDia: cfg.limite_por_dia || 300 };
   }
 
   /** Um link da Área do Cliente por cliente (de 5 em 5; quem não tem cadastro fica sem). */
@@ -161,9 +171,11 @@ export function criarApi(deps) {
   const U = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}';
   const idDe = (pathname) => (pathname.match(new RegExp(U)) || [])[0];
 
-  rota('GET', '/api/config', ({ res }) => ok(res, {
+  rota('GET', '/api/config', ({ res, req }) => ok(res, {
     supabaseUrl: supabase.url, supabaseAnonKey: supabase.anon, configurado: !!supabase.configurado,
     app: 'IndyCar Comunicar', versao,
+    // rodada 5 (Central): o prefixo em que o app está montado ('' sozinho, '/comunicar' na Central)
+    prefixo: String(req?.prefixo ?? deps.prefixo ?? ''),
   }));
   rota('GET', '/api/ping', ({ res }) => ok(res, { ok: true, versao }));
   /* Carteiro externo (pg_cron/GitHub). Rodada 4: diz de onde veio (?origem=) e
@@ -242,6 +254,29 @@ export function criarApi(deps) {
   });
   rota('GET', '/api/whatsapp/status', async ({ res }) => ok(res, await whatsapp.status()));
 
+  /* Rodada 5: "Saúde do WhatsApp" — estado, motivo em português e o botão para o lugar certo. */
+  async function saudeDoWhatsapp(forcar = false) {
+    const desde = new Date(relogio() - 24 * 3600000).toISOString();
+    const [status, falhas, fila, cart, cfg] = await Promise.all([
+      Promise.resolve(forcar ? whatsapp.status?.(true) : whatsapp.status?.()).catch(() => ({ ok: false, classe: 'instabilidade', erro: 'sem resposta' })),
+      Promise.resolve(dados.falhasPorClasse?.(desde)).catch(() => ({})),
+      Promise.resolve(dados.resumoDaFila?.()).catch(() => ({})),
+      resumoDoCarteiro().catch(() => ({})),
+      dados.obterConfig().catch(() => ({})),
+    ]);
+    const s = montarSaude({ status, falhas24h: falhas || {}, fila: fila || {}, carteiro: { ultimaEm: cart.ultimaEm, falhas24h: cart.falhas24h }, estadoGravado: cfg.whatsapp || null, agora: relogio() });
+    return { ...s, cadencia: { porMinuto: cfg.limite_por_minuto, porHora: cfg.limite_por_hora, porDia: cfg.limite_por_dia, mesmoCliente: cfg.intervalo_mesmo_cliente_min, janela: { inicio: cfg.janela_inicio, fim: cfg.janela_fim }, soHorarioComercial: !!cfg.so_horario_comercial }, conferidoEm: new Date(relogio()).toISOString() };
+  }
+  rota('GET', '/api/whatsapp/saude', async ({ res }) => ok(res, await emCache('wa-saude', 20_000, () => saudeDoWhatsapp(false))));
+  rota('POST', '/api/whatsapp/reconferir', async ({ res, usuario }) => {
+    await Promise.resolve(whatsapp.reconferir?.()).catch(() => null);
+    esquecerCache('wa-saude', 'pronto', 'resumo');
+    const s = await saudeDoWhatsapp(true);
+    cache.set('wa-saude', { valor: s, em: relogio() });
+    auditar(usuario, 'whatsapp_reconferido', 'posvenda_config', 'whatsapp', { estado: s.estado });
+    return ok(res, s);
+  });
+
   // ---- clientes ----
   rota('GET', '/api/clientes', async ({ res, url }) => ok(res, await dados.listarClientes(String(url.searchParams.get('q') || '').slice(0, 80) || undefined)));
   rota('PUT', `/api/clientes/${U}`, async ({ res, usuario, body, url }) => {
@@ -274,8 +309,66 @@ export function criarApi(deps) {
   rota('GET', '/api/segmentos/previa', async ({ res, url }) => {
     const filtro = url.searchParams.get('filtro') || 'todos';
     if (!segmentoValido(filtro)) return bad(res, 'Segmento desconhecido.');
+    // rodada 5: quantos recebem E quantos ficam de fora, com o motivo
+    if (dados.segmentarComMotivos) {
+      const r = await dados.segmentarComMotivos(filtro, url.searchParams.get('valor'));
+      return ok(res, { total: r.total, bruto: r.bruto, pulados: r.pulados, recentes: r.recentes, intervalo_dias: r.intervalo_dias, amostra: r.lista.slice(0, 12).map((c) => ({ id: c.id, nome: c.nome, telefone: c.telefone, carro: c.carro, placa: c.placa })) });
+    }
     const lista = await dados.segmentar(filtro, url.searchParams.get('valor'));
     return ok(res, { total: lista.length, amostra: lista.slice(0, 12).map((c) => ({ id: c.id, nome: c.nome, telefone: c.telefone, carro: c.carro })) });
+  });
+
+  // ---- rodada 5: segmentos salvos ----
+  rota('GET', '/api/segmentos/salvos', async ({ res }) => ok(res, await dados.listarSegmentosSalvos()));
+  rota('POST', '/api/segmentos/salvos', async ({ res, usuario, body }) => {
+    if (!segmentoValido(String(body.filtro || ''))) return bad(res, 'Segmento desconhecido.');
+    try {
+      const s = await dados.salvarSegmento({ nome: body.nome, filtro: String(body.filtro || ''), valor: body.valor, criado_por: usuario.id, criado_por_nome: usuario.nome || usuario.email });
+      auditar(usuario, 'segmento_salvo', 'comunicar_segmentos', s?.id, { nome: s?.nome, filtro: s?.filtro, valor: s?.valor });
+      esquecerCache('seg-salvos');
+      return ok(res, s);
+    } catch (e) { return bad(res, e.message); }
+  });
+  rota('DELETE', `/api/segmentos/salvos/${U}`, async ({ res, usuario, url }) => {
+    const id = idDe(url.pathname);
+    const s = await dados.obterSegmentoSalvo(id);
+    if (!s) return naoAchou(res);
+    if (s.criado_por !== usuario.id && !A.pode(usuario, 'segmentos_apagar')) return proibido(res, 'segmentos_apagar');
+    const okk = await dados.apagarSegmentoSalvo(id);
+    if (okk) auditar(usuario, 'segmento_apagado', 'comunicar_segmentos', id, { nome: s.nome });
+    return ok(res, { ok: okk });
+  });
+
+  // ---- rodada 5: ficha 360 pelo telefone e ligações de um envio ----
+  rota('GET', '/api/clientes/360', async ({ res, url }) => {
+    const bruto = String(url.searchParams.get('tel') || '').replace(/\D/g, '');
+    const tel = dados.telefoneNacional?.(bruto) || bruto; // com ou sem 55: a coluna normalizada não tem o DDI
+    if (!tel || tel.length < 10) return bad(res, 'Informe o telefone com DDD.');
+    const c360 = await dados.cliente360(tel).catch((e) => { const err = new Error('Não consegui ler a ficha 360 agora.'); err.causa = e; throw err; });
+    return ok(res, { telefone: tel, ligacoes: dados.montarLigacoes(c360), cliente: c360?.cliente || null, resumo: c360?.resumo || null });
+  });
+  rota('GET', `/api/envios/${U}/ligacoes`, async ({ res, url }) => {
+    const r = await dados.ligacoesDoEnvio(idDe(url.pathname));
+    return r ? ok(res, r) : naoAchou(res);
+  });
+
+  /* Rodada 5: prévia REAL de um texto de régua para um cliente de verdade (nome/carro/placa e,
+     se o texto pedir, {link_os} da última ordem do Pátio e {link_area} de exemplo). Nada é gravado. */
+  rota('GET', '/api/previa/mensagem', async ({ res, url }) => {
+    const id = url.searchParams.get('cliente_id');
+    const regua = url.searchParams.get('regua') || 'campanha';
+    const corpo = String(url.searchParams.get('corpo') || '').slice(0, 2000);
+    if (!dados.ehUuid(id)) return bad(res, 'Escolha o cliente.');
+    const c = await dados.obterCliente(id);
+    if (!c) return naoAchou(res);
+    const cfg = await dados.obterConfig();
+    const ags = await dados.agendamentosDoCliente?.(id, 1).catch(() => []) ?? [];
+    const a = ags[0] || null;
+    const links = await dados.linksDaRegua(corpo, { cliente_id: id, agendamento_id: a?.id || null }, { simular: true }).catch(() => ({}));
+    const vars = { nome: c.nome, carro: c.carro, placa: c.placa, servico: a?.servico || 'o serviço', meses: cfg.meses_retorno,
+      quando: a ? dados.quandoRelativo(a.data, a.hora) : 'amanhã às 09:00', link_avaliacao: cfg.link_avaliacao || 'https://g.page/r/indycar', detalhe: '…', ...links };
+    const falta = dados.faltaLink(corpo, links);
+    return ok(res, { cliente: { id: c.id, nome: c.nome, telefone: c.telefone, carro: c.carro, placa: c.placa }, agendamento: a, texto: dados.renderTemplate(corpo, vars), vars, falta, regua });
   });
 
   // ---- fila ----
@@ -337,8 +430,26 @@ export function criarApi(deps) {
 
     esquecerCache('resumo', 'fila');
     const r = await executarCampanha({ corpo, detalhe, destinos, enviarEm: enviarEm.toISOString(), criador: usuario });
-    auditar(usuario, 'campanha_enviada', 'posvenda_envios', r.lote, { total: destinos.length, enfileirados: r.enfileirados, pulados: r.pulados, segmento: body.segmento || null });
+    if (dados.ehUuid(body.segmento_salvo_id)) dados.marcarSegmentoUsado?.(body.segmento_salvo_id).catch(() => null);
+    auditar(usuario, 'campanha_enviada', 'posvenda_envios', r.lote, { total: destinos.length, enfileirados: r.enfileirados, pulados: r.pulados, dias: r.dias, segmento: body.segmento || null });
     return ok(res, { ok: true, ...r });
+  });
+
+  /* Rodada 5: "mandar para o MEU celular" — o texto da campanha chega no telefone do perfil
+     de quem está escrevendo (qualquer um da equipe), fora da fila. */
+  rota('POST', '/api/envios/teste-meu', async ({ res, usuario, body }) => {
+    const telefone = dados.soDigitos(usuario.telefone || '');
+    if (telefone.length < 10) return bad(res, 'Cadastre seu celular em "Meu perfil" para receber o teste.', { codigo: 'sem_telefone' });
+    const texto = String(body.corpo || '').trim().slice(0, 2000);
+    if (!texto) return bad(res, 'Escreva a mensagem antes de testar.');
+    const corpo = dados.renderTemplate(texto, { ...EXEMPLO_PREVIA, nome: usuario.nome || EXEMPLO_PREVIA.nome, link_area: `${patio.PATIO_URL}/minha/?c=exemplo`, link_os: `${patio.PATIO_URL}/acompanhar/?t=exemplo` });
+    const r = await whatsapp.enviar(telefone, `[teste] ${corpo}`);
+    await dados.enfileirar({
+      telefone, nome: `Teste (${usuario.nome || 'equipe'})`, tipo: 'avulsa', corpo, criado_por: usuario.nome || usuario.email,
+      criado_por_id: usuario.id, status: r.ok ? 'enviado' : 'falhou',
+    }).then((e) => e && r.ok && dados.marcarEnvio(e.id, 'enviado', null, 1)).catch(() => {});
+    auditar(usuario, 'envio_teste_proprio', 'posvenda_envios', null, { telefone: mascararTel(telefone), ok: !!r.ok, classe: r.classe || null });
+    return r.ok ? ok(res, { ok: true, telefone: mascararTel(telefone) }) : send(res, 502, { erro: r.erro, classe: r.classe || null, fazer: r.fazer || null });
   });
 
   const mexerNoEnvio = (fn, erro, acao) => async ({ res, usuario, url }) => {
@@ -486,7 +597,15 @@ export function criarApi(deps) {
   rota('GET', '/api/relatorio', async ({ res, url }) => {
     const regua = url.searchParams.get('regua');
     if (regua && regua !== 'todas' && !dados.TIPOS_ENVIO.includes(regua)) return bad(res, 'Régua desconhecida.');
-    return ok(res, await dados.relatorioRegua(regua || null, Math.min(Math.max(Number(url.searchParams.get('semanas')) || 8, 2), 26)));
+    const de = url.searchParams.get('de') || null, ate = url.searchParams.get('ate') || null;
+    if (de && ate && de > ate) return bad(res, 'O "de" precisa vir antes do "até".');
+    return ok(res, await dados.relatorioRegua(regua || null, Math.min(Math.max(Number(url.searchParams.get('semanas')) || 8, 2), 26), { de, ate }));
+  });
+  /* Rodada 5: uma linha por régua no período — enviadas, responderam, agendaram depois, pediram para parar. */
+  rota('GET', '/api/relatorio/reguas', async ({ res, url }) => {
+    const de = url.searchParams.get('de') || null, ate = url.searchParams.get('ate') || null;
+    if (de && ate && de > ate) return bad(res, 'O "de" precisa vir antes do "até".');
+    return ok(res, await emCache(`rel-reguas:${de}:${ate}`, 60_000, () => dados.relatorioPorRegua({ de, ate })));
   });
   rota('GET', '/api/intencoes', async ({ res, url }) => ok(res, await dados.intencoesRecentes(Math.min(Math.max(Number(url.searchParams.get('dias')) || 7, 1), 60))));
   rota('GET', '/api/aniversarios', async ({ res }) => ok(res, await dados.aniversariosDaBase()));

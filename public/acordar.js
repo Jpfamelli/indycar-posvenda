@@ -16,6 +16,8 @@
 (function (raiz) {
   'use strict';
   var ESPERAS = [2, 4, 8, 12, 20, 30, 30, 30, 30, 30]; // segundos (≈ 3 min no total)
+  /* Rodada 5: a API é RELATIVA à página (funciona em / e em /comunicar/ na Central). */
+  function caminhoApi(rota) { try { return new URL('api/' + String(rota).replace(/^\/+/, ''), (raiz.document && raiz.document.baseURI) || raiz.location.href).href; } catch (e) { return '/api/' + rota; } }
   var LIMITE_MS = 200 * 1000;
 
   /** A resposta é do Render dormindo (e não do nosso servidor)? */
@@ -40,7 +42,7 @@
     clearTimeout(estado.timer);
     estado.tentativa++;
     avisar('tentando', { tentativa: estado.tentativa });
-    raiz.fetch('/api/ping', { cache: 'no-store' }).then(function (r) {
+    raiz.fetch(caminhoApi('ping'), { cache: 'no-store' }).then(function (r) {
       if (r.ok) return terminar(true);
       agendar();
     }).catch(agendar);

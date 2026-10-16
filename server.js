@@ -5,11 +5,16 @@
 // tudo saindo pelo WhatsApp DA EMPRESA.
 // Banco: o MESMO Supabase do CRM, da Agenda e do Atendimento.
 //
-// Aqui mora a "fiação": WhatsApp, carteiro, IA, login e arquivos estáticos.
-// As rotas e o porteiro de cada uma estão em rotas.js (testados sem banco);
-// as regras de papel/app em acesso.js; as automações da equipe em automacoes.js.
+// Aqui mora a "fiação": WhatsApp (whatsapp.js), carteiro, IA, login e arquivos
+// estáticos. As rotas e o porteiro de cada uma estão em rotas.js (testados sem
+// banco); as regras de papel/app em acesso.js; as automações da equipe em automacoes.js.
+//
+// Rodada 5 (preparo para a IndyCar Central): este arquivo EXPORTA
+//   { handler, iniciar, VERSAO } — `handler(req, res)` serve tudo e aceita
+//   `req.prefixo` (ex.: '/comunicar') ou a variável PREFIXO; o `listen` só
+//   acontece quando este arquivo é o programa principal (`node server.js`).
 import http from 'node:http';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 import * as dados from './dados.js';
 import * as ia from './ia.js';
@@ -17,6 +22,7 @@ import * as acesso from './acesso.js';
 import * as auto from './automacoes.js';
 import * as carteiro from './carteiro.js';
 import * as patio from './patio.js';
+import { criarWhatsApp } from './whatsapp.js';
 import { criarApi } from './rotas.js';
 import { criarEstaticos } from './estaticos.js';
 import { selecionarUm, conferirConfiguracao } from './supabase.js';
@@ -24,12 +30,20 @@ import { selecionarUm, conferirConfiguracao } from './supabase.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC = join(__dirname, 'public');
 const PORT = process.env.PORT || 3500;
-export const VERSAO = '4.0.0';
+export const VERSAO = '5.0.0';
 
 /* Token do carteiro externo (GitHub Actions e o pg_cron do Supabase chamam
    /api/rodar de fora, para o caso do servidor gratuito do Render estar dormindo). */
 const RUNNER_TOKEN = (process.env.RUNNER_TOKEN || '').trim();
 const EM_PRODUCAO = !!process.env.RENDER;
+/* Prefixo em que o app está montado ('' sozinho; '/comunicar' dentro da Central).
+   A Central também pode mandar `req.prefixo` em cada chamada (vale mais que a variável). */
+const PREFIXO = normalizarPrefixo(process.env.PREFIXO || '');
+export function normalizarPrefixo(p) {
+  const t = String(p || '').trim();
+  if (!t || t === '/') return '';
+  return ('/' + t.replace(/^\/+|\/+$/g, '')).replace(/\/{2,}/g, '/');
+}
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -41,19 +55,12 @@ const MIME = {
 };
 const SEGUROS = acesso.cabecalhosSeguros({ https: EM_PRODUCAO });
 
-function telefoneInternacional(telefone) {
-  let num = dados.soDigitos(telefone);
-  if (num && num.length <= 11) num = '55' + num;
-  return num;
-}
-
 // ============================================================================
 // WHATSAPP DA EMPRESA — mesma fonte dos outros painéis:
 //   • chave e serviço do CodeWords: agenda_ia_config (linha única)
 //   • aparelho conectado: codewords_config (o Atendimento mantém atualizado)
+// A fiação do envio/status mora em whatsapp.js (testada com um CodeWords falso).
 // ============================================================================
-
-const ERRO_CHAVE_RECUSADA = 'A chave do CodeWords foi recusada (401). Gere uma nova em runtime.codewords.ai e cole em Atendimento › Configurações › Integrações.';
 
 let _cacheCw = { valor: null, em: 0 };
 async function configWhatsapp(forcar = false) {
@@ -71,59 +78,9 @@ async function configWhatsapp(forcar = false) {
   _cacheCw = { valor: cfg, em: Date.now() };
   return cfg;
 }
-
-/** Erro "estrutural": com ele TODOS os envios falhariam igual — o carteiro para a rodada. */
-const erroEstrutural = (erro) => /chave|conectado|CodeWords|401|aparelho/i.test(String(erro || ''));
-
-/* Envia pelo número conectado (proxy GOWA). `phone_id`, não `device_id`:
-   o CodeWords renomeou o parâmetro quando trocou /devices por /connections. */
-async function enviarWhatsApp(telefone, mensagem) {
-  const cfg = await configWhatsapp();
-  if (!cfg.api_key) return { ok: false, erro: 'CodeWords sem chave (Atendimento › Configurações › Integrações).' };
-  if (!cfg.device_id) return { ok: false, erro: 'Nenhum WhatsApp conectado — reconecte no painel de atendimento.' };
-  const url = `${cfg.base}/run/${cfg.servico}/proxy/send/message?phone_id=${encodeURIComponent(cfg.device_id)}`;
-  const body = new URLSearchParams({ phone: telefoneInternacional(telefone), message: mensagem }).toString();
-  try {
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: { Authorization: cfg.api_key, 'Content-Type': 'application/x-www-form-urlencoded' },
-      body, signal: AbortSignal.timeout(20000),
-    });
-    const texto = await r.text();
-    let data = {};
-    try { data = JSON.parse(texto); } catch { /* resposta sem JSON */ }
-    if (r.status === 401 || r.status === 403) return { ok: false, erro: ERRO_CHAVE_RECUSADA };
-    // HTTP 200 não é entrega: o proxy responde 200 com "skip"/"error" também.
-    if (r.ok && /success/i.test(texto)) return { ok: true };
-    return { ok: false, erro: data?.message || data?.detail || `O CodeWords respondeu ${r.status}: ${texto.slice(0, 120)}` };
-  } catch (e) { return { ok: false, erro: String(e?.message || e) }; }
-}
-
-/** Situação da conexão — só leitura, para a tela mostrar (cache de 60 s: a chamada leva até 15 s). */
-let _cacheStatus = { valor: null, em: 0 };
-async function statusWhatsapp() {
-  if (_cacheStatus.valor && Date.now() - _cacheStatus.em < 60_000) return _cacheStatus.valor;
-  const r = await statusWhatsappAgora();
-  _cacheStatus = { valor: r, em: Date.now() };
-  return r;
-}
-async function statusWhatsappAgora() {
-  const cfg = await configWhatsapp();
-  if (!cfg.api_key) return { ok: false, erro: 'CodeWords não configurado.' };
-  try {
-    const r = await fetch(`${cfg.base}/run/${cfg.servico}/connections`, {
-      headers: { Authorization: cfg.api_key }, signal: AbortSignal.timeout(15000),
-    });
-    if (r.status === 401 || r.status === 403) return { ok: false, chaveRecusada: true, erro: ERRO_CHAVE_RECUSADA };
-    if (!r.ok) return { ok: false, erro: `O CodeWords respondeu ${r.status}.` };
-    const lista = await r.json();
-    const viva = (Array.isArray(lista) ? lista : [])
-      .find((c) => c.phone_id === cfg.device_id && /logged_in|connected/i.test(String(c.status || '')));
-    return viva
-      ? { ok: true, conectado: true, numero: viva.phone_number || null }
-      : { ok: true, conectado: false };
-  } catch (e) { return { ok: false, erro: String(e?.message || e) }; }
-}
+const wa = criarWhatsApp({ configWhatsapp });
+/** "Conferir agora": esquece a chave em cache (o João pode ter acabado de colar a nova) e o status. */
+function reconferirWhatsapp() { _cacheCw = { valor: null, em: 0 }; wa.limparCache(); }
 
 // ============================================================================
 // CARTEIRO — gera o que as réguas mandam e envia o que venceu
@@ -172,6 +129,8 @@ function ontemSemRodada(ultimaRodadaEm) {
   return new Date(ultimaRodadaEm).getTime() < inicioDeOntem;
 }
 
+const dormir = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function umaRodada() {
   const cfg = await dados.obterConfig();
   // 1. o que ficou para trás e não faz mais sentido, e envios presos de um servidor que caiu
@@ -185,23 +144,36 @@ async function umaRodada() {
   base.ia = await lerRespostasComIA().catch((e) => ({ erro: String(e?.message || e) }));
 
   if (cfg.pausa_geral) return anotar({ ...base, equipe: await equipeNaRodada(), aviso: 'Envios pausados: a pausa geral está ligada.' });
-  const { hora, diaSemana, data } = dados.agoraSP();
+  const { hora, minuto, diaSemana, data } = dados.agoraSP();
   if (hora < cfg.janela_inicio || hora >= cfg.janela_fim) {
     return anotar({ ...base, equipe: await equipeNaRodada(), aviso: `Fora da janela de envio (${cfg.janela_inicio}h–${cfg.janela_fim}h).` });
   }
   if (diaSemana === 0 && !cfg.envia_domingo) return anotar({ ...base, equipe: await equipeNaRodada(), aviso: 'Domingo: envios automáticos pausados.' });
+  // rodada 5: "só no horário da loja" (seg–sáb 8h–17h30), quem quiser
+  if (cfg.so_horario_comercial && !carteiro.dentroDoHorarioComercial({ diaSemana, hora, minuto })) {
+    return anotar({ ...base, equipe: await equipeNaRodada(), aviso: 'Fora do horário comercial (seg–sáb, 8h–17h30): os envios esperam a loja abrir.' });
+  }
 
-  // limite por hora: nunca passa do configurado (padrão 60)
-  const vagas = dados.vagasNestaRodada(cfg.limite_por_hora, await dados.enviadasNaUltimaHora().catch(() => 0));
-  if (!vagas) return anotar({ ...base, equipe: await equipeNaRodada(), aviso: `Limite de ${cfg.limite_por_hora} mensagens por hora atingido — o resto sai na próxima rodada.` });
+  // limites: por hora (padrão 60), por dia (padrão 300) e por minuto (padrão 10) — cadência segura
+  const [ultimaHora, enviadasHoje] = await Promise.all([dados.enviadasNaUltimaHora().catch(() => 0), dados.enviadasHoje().catch(() => 0)]);
+  const vagasHora = dados.vagasNestaRodada(cfg.limite_por_hora, ultimaHora);
+  if (!vagasHora) return anotar({ ...base, equipe: await equipeNaRodada(), aviso: `Limite de ${cfg.limite_por_hora} mensagens por hora atingido — o resto sai na próxima rodada.` });
+  const vagas = carteiro.vagasPorCadencia({ limitePorMinuto: cfg.limite_por_minuto, limitePorDia: cfg.limite_por_dia, enviadasHoje, vagasHora });
+  if (!vagas) return anotar({ ...base, equipe: await equipeNaRodada(), aviso: `Limite diário de ${cfg.limite_por_dia} mensagens atingido — o resto sai amanhã.` });
+  const pausaMs = carteiro.pausaEntreEnvios(cfg.limite_por_minuto);
 
   const nomeFeriado = dados.feriado(data);
-  const fila = await dados.enviosDevidos(Math.min(vagas + 10, 40)); // folga: alguns serão adiados
+  // a fila por PRIORIDADE (pátio pronto > lembrete > pós-venda > … > campanha) e um aviso por cliente por vez
+  const bruta = await dados.enviosDevidos(Math.min(vagas + 10, 40)); // folga: alguns serão adiados
+  const sep = carteiro.separarMesmoCliente(bruta, { minutos: cfg.intervalo_mesmo_cliente_min });
+  for (const a of sep.adiados) await dados.adiarEnvio(a.envio.id, a.enviar_em, 'outra mensagem para o mesmo cliente saiu agora: espera um pouco').catch(() => {});
+  const fila = sep.agora;
   // lembretes: confere o horário de AGORA (cancelado/remarcado enquanto o servidor dormia)
   const agendas = await dados.agendamentosPorIds(fila.filter((e) => e.tipo === 'lembrete').map((e) => e.agendamento_id)).catch(() => null);
   // avisos do Pátio: confere a ordem de AGORA (carro já entregue não recebe "está pronto")
   const ordensPatio = await dados.ordensDoPatio(fila.map((e) => patio.osIdDaChave(e.chave_unica)).filter(Boolean)).catch(() => null);
-  let enviados = 0, falhas = 0, adiados = 0, reagendados = 0, pulados = 0, parouPor = null;
+  let enviados = 0, falhas = 0, adiados = sep.adiados.length, reagendados = 0, pulados = 0, parouPor = null, classeParou = null;
+  const porClasse = {};
   for (const envio of fila) {
     if (enviados >= vagas) break;
     if (carteiro.envioVencido(envio)) continue; // a faxina do começo pega na próxima
@@ -237,40 +209,45 @@ async function umaRodada() {
     const reservado = await dados.reservarEnvio(envio.id).catch(() => null);
     if (!reservado) continue;
 
-    const r = await enviarWhatsApp(envio.telefone, envio.corpo);
+    const r = await wa.enviar(envio.telefone, envio.corpo);
     const tentativas = (Number(envio.tentativas) || 0) + 1;
     if (r.ok) {
       /* Saiu: marcar como enviado com novas tentativas (o Supabase às vezes engasga).
          Se nem assim gravar, a reserva fica e vira "confira antes de reenviar" —
          nunca uma segunda mensagem para o cliente. */
-      await carteiro.comTentativas(() => dados.marcarEnvio(envio.id, 'enviado', null, tentativas, { motivo_pulado: null }))
+      await carteiro.comTentativas(() => dados.marcarEnvio(envio.id, 'enviado', null, tentativas, { motivo_pulado: null, erro_classe: null }))
         .catch((e) => console.error(`Envio ${envio.id} saiu mas não consegui marcar:`, e?.message || e));
       enviados++;
       // aparece no histórico da conversa do Atendimento (só depois de sair de verdade)
       await dados.registrarNoHistorico(envio, ocup.conversa).catch((e) => console.error(`Histórico do envio ${envio.id}:`, e?.message || e));
     } else {
-      console.error(`Envio ${envio.id} falhou: ${r.erro}`);
-      if (erroEstrutural(r.erro)) {
+      console.error(`Envio ${envio.id} falhou [${r.classe}]: ${r.erro}`);
+      porClasse[r.classe] = (porClasse[r.classe] || 0) + 1;
+      if (r.estrutural) {
         /* Sem aparelho/chave TODOS falhariam igual: a mensagem volta para a
            fila (sem gastar tentativa) e a rodada para aqui, com o aviso claro. */
-        await dados.marcarEnvio(envio.id, 'pendente', r.erro, Number(envio.tentativas) || 0).catch(() => {});
+        await dados.marcarEnvio(envio.id, 'pendente', r.erro, Number(envio.tentativas) || 0, { erro_classe: r.classe }).catch(() => {});
         falhas++;
-        parouPor = r.erro;
+        parouPor = r.erro; classeParou = r.classe;
         break;
       }
-      // falha transitória: até 3 tentativas, com espera (5 e 15 min)
-      const d = dados.decidirFalha(r.erro, tentativas);
+      // falha passageira: até 3 re-tentativas, com espera crescente (5, 15, 45 min); número inválido falha de vez
+      const d = dados.decidirFalha(r.erro, tentativas, Date.now(), r.definitivo);
       if (d.status === 'pendente') {
-        await dados.marcarEnvio(envio.id, 'pendente', r.erro, tentativas, { enviar_em: d.enviar_em });
+        await dados.marcarEnvio(envio.id, 'pendente', r.erro, tentativas, { enviar_em: d.enviar_em, erro_classe: r.classe });
         reagendados++;
       } else {
-        await dados.marcarEnvio(envio.id, 'falhou', r.erro, tentativas);
+        await dados.marcarEnvio(envio.id, 'falhou', r.erro, tentativas, { erro_classe: r.classe });
         falhas++;
       }
     }
-    await new Promise((r2) => setTimeout(r2, 1200)); // 1 msg/1,2 s — sem rajada
+    await dormir(pausaMs); // cadência: respeita o limite por minuto, com variação (sem rajada)
   }
-  return anotar({ ...base, equipe: await equipeNaRodada(), enviados, falhas, adiados, reagendados, pulados, feriado: nomeFeriado || undefined, aviso: parouPor || undefined });
+  // o estado do WhatsApp fica gravado (o painel "Saúde" lê mesmo com o servidor recém-acordado)
+  if (classeParou) await dados.gravarEstadoWhatsapp(classeParou, parouPor).catch(() => {});
+  else if (enviados) await dados.gravarEstadoWhatsapp('ok', null).catch(() => {});
+  return anotar({ ...base, equipe: await equipeNaRodada(), enviados, falhas, adiados, reagendados, pulados, porClasse, cadencia: { vagas, pausaMs, enviadasHoje },
+    feriado: nomeFeriado || undefined, aviso: parouPor || undefined, classe: classeParou || undefined });
 }
 
 function anotar(resultado) {
@@ -408,20 +385,31 @@ async function autenticar(req) {
 // ============================================================================
 
 const api = criarApi({
-  dados, ia, versao: VERSAO, runnerToken: RUNNER_TOKEN, https: EM_PRODUCAO, autenticar, esquecerSessao, chamadaIA,
+  dados, ia, versao: VERSAO, runnerToken: RUNNER_TOKEN, https: EM_PRODUCAO, autenticar, esquecerSessao, chamadaIA, prefixo: PREFIXO,
   supabase: { url: SUPA_URL, anon: SUPA_ANON, configurado: !!(SUPA_URL && SUPA_ANON && SUPA_SRV) },
-  whatsapp: { enviar: enviarWhatsApp, status: statusWhatsapp },
+  whatsapp: { enviar: wa.enviar, status: wa.status, reconferir: reconferirWhatsapp },
   carteiro: { rodar: rodarCarteiro, lerRespostas: lerRespostasComIA, ultimaRodada: () => (ultimaRodada.em ? ultimaRodada : null) },
 });
 
 /* Rodada 4: arquivos da tela em memória, comprimidos e com ETag (estaticos.js). */
 const serveStatic = criarEstaticos({ pasta: PUBLIC, mime: MIME, seguros: SEGUROS });
 
-const server = http.createServer(async (req, res) => {
+/**
+ * O handler de tudo (exportado para a IndyCar Central). Aceita `req.prefixo`
+ * ('/comunicar') ou a variável PREFIXO: o prefixo é tirado do caminho antes de
+ * decidir entre API e arquivo. A Central pode também já mandar `req.url` sem o
+ * prefixo — aí nada muda.
+ */
+export async function handler(req, res) {
   const inicio = Date.now();
   let url;
   try { url = new URL(req.url, 'http://localhost'); }
   catch { res.writeHead(400, SEGUROS); return res.end(); }
+  const prefixo = normalizarPrefixo(req.prefixo ?? PREFIXO);
+  if (prefixo && (url.pathname === prefixo || url.pathname.startsWith(prefixo + '/'))) {
+    url.pathname = url.pathname.slice(prefixo.length) || '/';
+  }
+  req.prefixo = prefixo;
   res.on('finish', () => {
     if (url.pathname.startsWith('/api/')) {
       const ms = Date.now() - inicio;
@@ -434,39 +422,55 @@ const server = http.createServer(async (req, res) => {
   } catch (e) {
     api.erroInterno(res, e);
   }
-});
-server.headersTimeout = 30_000;
-server.requestTimeout = 60_000;
+}
 
 // ============================================================================
-// Agendadores
+// Servidor e agendadores — só quando este arquivo é o programa principal
 // ============================================================================
 const aviso = (onde) => (e) => console.error(`${onde}:`, e?.message || e);
+let server = null, timerCarteiro = null, timerInicial = null;
 
-// A cada 10 min o carteiro roda sozinho (com o servidor acordado). No Render
-// gratuito o servidor DORME — por isso o GitHub Actions e o pg_cron do Supabase
-// também chamam /api/rodar.
-// CARTEIRO_DESLIGADO=1 (conferência local): nenhum timer é criado.
-const timerCarteiro = CARTEIRO_DESLIGADO ? null : setInterval(() => rodarCarteiro('timer').catch(aviso('Carteiro')), 10 * 60 * 1000);
-const timerInicial = CARTEIRO_DESLIGADO ? null : setTimeout(() => rodarCarteiro('inicio').catch(aviso('Carteiro')), 15 * 1000);
+/**
+ * Liga os timers do carteiro (a cada 10 min + 15 s depois de subir). A Central
+ * chama isto UMA vez para o Comunicar; sozinho, `iniciar()` chama.
+ * No Render gratuito o servidor DORME — por isso o pg_cron do Supabase e o
+ * GitHub Actions também chamam /api/rodar. CARTEIRO_DESLIGADO=1: nenhum timer.
+ */
+export function ligarCarteiro() {
+  if (CARTEIRO_DESLIGADO || timerCarteiro) return false;
+  timerCarteiro = setInterval(() => rodarCarteiro('timer').catch(aviso('Carteiro')), 10 * 60 * 1000);
+  timerInicial = setTimeout(() => rodarCarteiro('inicio').catch(aviso('Carteiro')), 15 * 1000);
+  return true;
+}
+export function desligarCarteiro() {
+  clearInterval(timerCarteiro); clearTimeout(timerInicial);
+  timerCarteiro = null; timerInicial = null;
+}
 
 function encerrar(sinal) {
   console.log(`\n  ${sinal}: encerrando com calma…`);
-  clearInterval(timerCarteiro); clearTimeout(timerInicial);
-  server.close(() => process.exit(0));
+  desligarCarteiro();
+  if (server) server.close(() => process.exit(0)); else process.exit(0);
   setTimeout(() => process.exit(0), 5000).unref();
 }
-process.on('SIGTERM', () => encerrar('SIGTERM'));
-process.on('SIGINT', () => encerrar('SIGINT'));
 
-function iniciar() {
+export function iniciar({ porta = PORT } = {}) {
   conferirConfiguracao();
   if (CARTEIRO_DESLIGADO) console.warn('  ⏸  CARTEIRO_DESLIGADO=1: nenhum envio, nenhuma rodada automática.');
   if (!RUNNER_TOKEN) console.warn('  ⚠  RUNNER_TOKEN não definido: /api/rodar (carteiro externo) fica fechado.');
-  server.listen(PORT, () => {
-    console.log(`\n  🏁 IndyCar Comunicar v${VERSAO} rodando em http://localhost:${PORT}`);
+  if (PREFIXO) console.log(`  ↳ montado em ${PREFIXO}/ (PREFIXO)`);
+  server = http.createServer(handler);
+  server.headersTimeout = 30_000;
+  server.requestTimeout = 60_000;
+  ligarCarteiro();
+  process.on('SIGTERM', () => encerrar('SIGTERM'));
+  process.on('SIGINT', () => encerrar('SIGINT'));
+  server.listen(porta, () => {
+    console.log(`\n  🏁 IndyCar Comunicar v${VERSAO} rodando em http://localhost:${porta}${PREFIXO}/`);
     console.log('  Banco: Supabase (PostgREST) — o mesmo do CRM, Agenda e Atendimento\n');
   });
+  return server;
 }
 
-iniciar();
+const ehPrincipal = (() => { try { return process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url; } catch { return false; } })();
+if (ehPrincipal) iniciar();

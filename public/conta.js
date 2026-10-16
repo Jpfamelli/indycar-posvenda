@@ -18,11 +18,9 @@
   const qq = (s, r = document) => [...r.querySelectorAll(s)];
   const escH = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-  const APPS_URL = {
-    atendimento: 'https://indycar-atendimento.onrender.com', crm: 'https://indycar-crm.onrender.com',
-    agenda: 'https://indycar-agendamentos.onrender.com', comunicar: 'https://indycar-posvenda.onrender.com',
-    orcador: 'https://indycar-orcador.netlify.app',
-  };
+  /* Rodada 5: os endereços dos apps vêm de apps.js (um lugar só para o ecossistema). */
+  const APPS_URL = Object.fromEntries(Object.entries((window.IndyApps && window.IndyApps.APPS) || {}).map(([k, v]) => [k, v.url]).filter(([, u]) => u));
+  const RAIZ_APP = () => new URL('./', location.href).href; // '/' sozinho, '/comunicar/' na Central
   const CHAVE_EMAIL = 'indycar_email_lembrado';
   const CHAVE_ERROS = 'indycar_comunicar_erros_login';
   const PAPEL = { admin: 'Administrador', gestor: 'Gestor', atendente: 'Atendente' };
@@ -196,7 +194,7 @@
     if (!/^\S+@\S+\.\S+$/.test(email)) return aviso('erroEsqueci', 'Digite o seu e-mail completo.');
     const btn = q('#btnEsqueci'); btn.disabled = true; aviso('erroEsqueci', '');
     try {
-      const { error } = await sb.auth.resetPasswordForEmail(email, { redirectTo: `${location.origin}/` });
+      const { error } = await sb.auth.resetPasswordForEmail(email, { redirectTo: RAIZ_APP() });
       if (error) throw error;
       aviso('okEsqueci', 'Pronto: se esse e-mail estiver cadastrado, o link chega em alguns minutos. Olhe também o spam.');
     } catch (err) { aviso('erroEsqueci', mensagemDoErro(err)); }
@@ -281,7 +279,7 @@
     pararSino();
     try { await sb?.auth?.signOut(todos ? { scope: 'global' } : undefined); } catch { /* segue */ }
     state.perfil = null;
-    location.replace('/');
+    location.replace(RAIZ_APP());
   }
   qq('[data-sair]').forEach((b) => b.addEventListener('click', () => sair(false)));
 

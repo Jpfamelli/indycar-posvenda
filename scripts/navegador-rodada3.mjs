@@ -117,8 +117,8 @@ for (const larg of [1440, 375]) {
     ok(larg, 'atendente: sem importar planilha', !(await visivel(page, '#btnImportar')));
     ok(larg, 'atendente: não religa quem saiu da lista', await page.evaluate(() => [...document.querySelectorAll('.cli.fora [data-aceita]')].every((e) => e.disabled)));
     // campanha por segmento → pedir aprovação
-    await clicar(page, '#btnNova'); await espera(900);
-    await clicar(page, '#campAvancar'); await espera(400);
+    await clicar(page, '#btnNova'); await espera(1500);
+    await clicar(page, '#campAvancar'); await espera(600);
     await page.$eval('#campCorpo', (e) => { e.value = 'Oi {primeiro_nome}! Semana do check-up gratuito na IndyCar. Quer um horário? 🏁'; e.dispatchEvent(new Event('input')); });
     await clicar(page, '#campAvancar'); await espera(400);
     ok(larg, 'atendente: passo 3 avisa da aprovação', await visivel(page, '.dica.aprovacao') && /Pedir aprovação/.test(await texto(page, '#campAvancar')));

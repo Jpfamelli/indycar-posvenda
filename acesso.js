@@ -7,20 +7,18 @@
 // O servidor confere tudo isto em toda chamada — a tela só esconde botão.
 // -----------------------------------------------------------------------------
 
+import './public/apps.js'; // rodada 5: endereços dos apps num módulo só (tela e servidor)
+
 export const APP = 'comunicar';
 export const PAPEIS_EQUIPE = ['admin', 'gestor', 'atendente'];
 export const ehGestor = (u) => u?.papel === 'admin' || u?.papel === 'gestor';
 export const ehAdmin = (u) => u?.papel === 'admin';
 
-/* Endereços dos apps do ecossistema (links do sino e tela "sem acesso"). */
-export const APPS = {
-  atendimento: { nome: 'Atendimento', url: 'https://indycar-atendimento.onrender.com' },
-  crm:         { nome: 'CRM',         url: 'https://indycar-crm.onrender.com' },
-  agenda:      { nome: 'Agenda',      url: 'https://indycar-agendamentos.onrender.com' },
-  comunicar:   { nome: 'Comunicar',   url: 'https://indycar-posvenda.onrender.com' },
-  orcador:     { nome: 'Orçador',     url: 'https://indycar-orcador.netlify.app' },
-  ads:         { nome: 'Ads',         url: null },
-};
+/* Endereços dos apps do ecossistema (links do sino e tela "sem acesso") — vêm de public/apps.js. */
+export const APPS = Object.fromEntries(Object.entries(globalThis.IndyApps.APPS)
+  .filter(([k]) => ['atendimento', 'crm', 'agenda', 'comunicar', 'orcador', 'patio', 'ads'].includes(k))
+  .map(([k, v]) => [k, { nome: v.nome, url: v.url }]));
+export const LINKS = globalThis.IndyApps.LINKS;
 
 /**
  * Quem pode usar o Comunicar. Devolve { ok } ou { ok:false, status, codigo, erro, apps }.
@@ -59,6 +57,10 @@ export const PERMISSOES = {
   satisfacao_apagar: 'gestor',
   ia: 'equipe',                // escrever com IA, sugerir público, resumo
   conta: 'logado',             // meu perfil, sino, minhas tarefas (até com troca de senha pendente)
+  // rodada 5
+  teste_proprio: 'equipe',     // mandar o texto de uma campanha para o PRÓPRIO celular (perfis.telefone)
+  segmentos_salvar: 'equipe',  // guardar um segmento com nome para reutilizar
+  segmentos_apagar: 'gestor',  // apagar segmento salvo por outra pessoa
 };
 
 export function pode(usuario, permissao) {
@@ -81,6 +83,7 @@ export const MOTIVO_403 = {
   optout_religar: 'Só gestor volta a mandar mensagem para quem saiu da lista.',
   satisfacao_apagar: 'Só gestor apaga registro de satisfação.',
   cancelar_qualquer: 'Só gestor mexe em mensagem de régua ou de outra pessoa.',
+  segmentos_apagar: 'Só gestor apaga segmento salvo por outra pessoa.',
 };
 export const motivo403 = (permissao) => MOTIVO_403[permissao] || 'Você não tem permissão para isso.';
 
@@ -158,6 +161,17 @@ export const ROTAS = [
   ['GET',    '/api/aniversarios/sugestoes',              { perm: 'ver' }],
   ['POST',   '/api/pedir-gestor',                        { perm: 'ver', caro: true }],
   ['GET',    '/api/equipe/indicadores',                  { perm: 'ver' }],
+  // rodada 5
+  ['GET',    '/api/whatsapp/saude',                      { perm: 'ver' }],
+  ['POST',   '/api/whatsapp/reconferir',                 { perm: 'rodar', caro: true }],
+  ['GET',    '/api/segmentos/salvos',                    { perm: 'ver' }],
+  ['POST',   '/api/segmentos/salvos',                    { perm: 'segmentos_salvar' }],
+  ['DELETE', `/api/segmentos/salvos/${U}`,               { perm: 'segmentos_salvar' }],
+  ['POST',   '/api/envios/teste-meu',                    { perm: 'teste_proprio', caro: true }],
+  ['GET',    '/api/clientes/360',                        { perm: 'ver' }],
+  ['GET',    `/api/envios/${U}/ligacoes`,                { perm: 'ver' }],
+  ['GET',    '/api/relatorio/reguas',                    { perm: 'ver' }],
+  ['GET',    '/api/previa/mensagem',                     { perm: 'ver' }],
 ].map(([metodo, padrao, regra]) => ({ metodo, padrao, re: new RegExp(`^${padrao}$`), ...regra }));
 
 /** A regra da rota (ou null = não existe). `metodoErrado` quando o caminho existe com outro método. */

@@ -489,3 +489,139 @@ Testes e ferramentas
 12. **Modelo pronto "Convite para a Área do Cliente"** na biblioteca (`comunicar_modelos`, categoria relacionamento; SQL em `scripts/sql/2026-10-16_comunicar_modelo_area_cliente.sql`, só dado).
 13. `patio.js` com as regras puras e `scripts/testes-patio.mjs` (9 testes: tipos, pós-venda, chave → ordem, conferência do carteiro, `{link_area}`, Pronto para ligar e as rotas de campanha/avulsa por HTTP).
 14. Mock com avisos do Pátio na fila (enviado, na fila, respondido) e o modelo novo; roteiro de navegador 1440/375: filtro com os 4 tipos, lista filtrada, "Pronto para ligar" com o item do Pátio, sem rolagem lateral.
+
+## Rodada 5 (16/10/2026)
+
+Foco: carteiro à prova de falhas (CodeWords volta → a fila escoa com cadência segura), réguas com prévia real e links do Pátio/Área do Cliente, campanhas por segmento salvas, conectar com os outros apps pela ficha 360, e o preparo para a IndyCar Central (handler exportado, prefixo, caminhos relativos).
+
+Carteiro à prova de falhas (`whatsapp.js` novo, `carteiro.js`, `server.js`)
+
+1. A fiação do WhatsApp saiu do `server.js` para **`whatsapp.js`** (`criarWhatsApp({ configWhatsapp, fetchFn })`): enviar e status com a configuração e o `fetch` injetados — testável com um CodeWords de mentira.
+2. **Classes de erro** (`classificarErro`): `chave_recusada` ≠ `sem_chave` ≠ `sem_aparelho` ≠ `desconectado` ≠ `limite` ≠ `numero_invalido` ≠ `nao_entregue` ≠ `instabilidade` ≠ `desconhecido` — cada uma com título, motivo em português, "o que fazer" e para onde o botão leva.
+3. Cada classe diz se é **estrutural** (todos falhariam igual → a rodada para e a mensagem volta à fila sem gastar tentativa) ou **definitiva** (número sem WhatsApp → falha de vez) — antes isto era uma regex solta no `server.js`.
+4. `{"success": false}` com HTTP 200 **não é mais entrega** (antes `/success/i` no corpo casava com `"success":false`); a entrega exige `success: true` ou `status: success/sent/ok`.
+5. `status` do aparelho **"disconnected" não é mais lido como "connected"** (a regex antiga casava a substring); entra como classe `desconectado`, com o texto "ligue o celular da oficina / leia o QR de novo".
+6. Status do aparelho distingue **sem o aparelho na lista** (`sem_aparelho`) de **aparelho desconectado** (`desconectado`) e devolve o número.
+7. Timeout do CodeWords (20 s) vira classe `instabilidade` com texto claro ("demorou mais de 20 s"), não um `TimeoutError` cru.
+8. 429 do CodeWords vira classe `limite` ("pediu para esperar") — tenta de novo com espera, sem parar a rodada.
+9. **Re-tentativas com espera crescente**: 5, 15 e 45 min (`ESPERAS_MIN`), `MAX_TENTATIVAS = 4` (3 re-tentativas) — antes 5 e 15 e falhava na 3ª.
+10. `decidirFalha` aceita o veredito `definitivo` da classe (vale mais que a regex antiga, que continua como reserva).
+11. A classe do erro fica gravada em **`posvenda_envios.erro_classe`** (migração `comunicar_rodada5`, com índice parcial) em cada falha e em cada re-tentativa; limpa ao sair.
+12. **Limite por minuto** (`limite_por_minuto`, padrão 10, 1–60): pausa entre dois envios = 60 s ÷ limite (mínimo 1,2 s) com ±10 % de variação — sem rajada quando a fila acumulou.
+13. **Limite por dia** (`limite_por_dia`, padrão 300, 1–5.000): o carteiro para no limite com aviso "o resto sai amanhã"; conta o que saiu hoje no fuso da oficina (`enviadasHoje`).
+14. `vagasPorCadencia` junta os três limites (hora, dia, minuto × 15 min de rodada) e o lote máximo — testado.
+15. **Fila por prioridade** (`PRIORIDADE`/`ordenarFila`): pátio pronto › extra › lembrete › pátio recebido › avaliação › pós-venda › Área do Cliente › avulsa › revisão › orçamento › não fechou › aniversário › reativação › campanha; empate pela hora. Todo tipo tem prioridade (teste garante).
+16. Índice `posvenda_envios_pendente_tipo_idx (tipo, enviar_em) where status='pendente'` para a fila ordenada por tipo.
+17. **Intervalo entre mensagens ao mesmo cliente** (`intervalo_mesmo_cliente_min`, padrão 60, 0 desliga): dois avisos para o mesmo telefone na mesma rodada → o segundo é adiado N minutos com o motivo visível ("outra mensagem para o mesmo cliente saiu agora"); lembrete e avisos do Pátio nunca esperam (`separarMesmoCliente`, com/sem 55).
+18. **"Só horário da loja"** (`so_horario_comercial`): seg–sáb 8h–17h30 (`dentroDoHorarioComercial`) — fora disso o carteiro espera com o aviso certo; o padrão continua a janela 8h–20h.
+19. A rodada devolve `porClasse` (falhas por classe), `cadencia` (vagas, pausa, enviadas hoje) e `classe` do erro que parou — vai para `comunicar_carteiro_batidas`/`ultima_rodada`.
+20. O carteiro **grava o estado do WhatsApp que viu** (`posvenda_config.whatsapp_estado/_em/_motivo`, só quando muda): o painel sabe que a chave está recusada mesmo com o servidor recém-acordado e antes de falar com o CodeWords.
+21. A reserva (`enviando_em`) e a validade (`expira_em`) da rodada 4 seguem valendo; `enviosDevidos` continua pulando reservas e lendo colunas explícitas — sem regressão (testes da rodada 4 passam).
+22. **CodeWords de mentira nos testes** (`scripts/testes-rodada5.mjs`): um servidor HTTP local que responde 401, `success`, `skip`, número não registrado, `device offline`, 500, 429 e lento; confere URL (`/proxy/send/message?phone_id=`), telefone com 55, `Authorization` com a chave crua, e que sem chave/sem aparelho **não chama a rede**.
+23. `/api/rodar` e o "Rodar agora" continuam iguais; a rodada em andamento continua sendo compartilhada (rodada 4).
+
+Saúde do WhatsApp (Início)
+
+24. **Painel "Saúde do WhatsApp"** (`montarSaude`, puro; `GET /api/whatsapp/saude`, cache 20 s): estado (ok · chave recusada · sem chave · sem aparelho · desconectado · instável · sem resposta · desconhecido), cor, título, motivo e "o que fazer" em português.
+25. **Botão que leva ao lugar certo**: chave recusada/sem chave/sem aparelho/desconectado → "Colar a chave no Atendimento" abre `indycar-atendimento.onrender.com/?aba=integracoes` (Atendimento › Configurações › Integrações); número sem WhatsApp → "Ver as que falharam" abre Mensagens › Falharam.
+26. Conectado mas com 3+ falhas de instabilidade/não entregue nas 24 h → estado **"WhatsApp conectado, mas com falhas"** (laranja) com o último erro.
+27. Falhas das últimas 24 h **por classe** (`falhasPorClasse`, lê `erro_classe` e classifica os antigos pelo texto) como chips: "Número sem WhatsApp · 2", "Instabilidade · 5"…
+28. Detalhes: fila (pendentes e atrasadas há mais de 2 h, `resumoDaFila`), "carteiro rodou há N min" e chamadas do banco que acharam o servidor dormindo.
+29. Linha da **cadência** no painel: até N/min, N/h, N/dia · N min entre avisos ao mesmo cliente · janela · "só horário da loja".
+30. **"Conferir agora"** (gestor, `POST /api/whatsapp/reconferir`): esquece a chave em cache (5 min) e o status (60 s) — o João cola a chave nova e vê o verde na hora, sem esperar o cache; auditado (`whatsapp_reconferido`).
+31. Sem leitura ao vivo o painel usa o estado gravado pelo carteiro; sem nada, "ainda verificando" com "Conferir agora".
+32. Painel em vermelho quando a chave está recusada; ponto pulsante quando conectado; atendente vê tudo, só não tem o "Conferir agora".
+33. O "Pronto para ligar" aponta o item da chave para **Integrações** direto (`LINKS.integracoes()`), não mais para a raiz do Atendimento.
+34. Textos de todas as classes conferidos por teste contra o vocabulário proibido (prezado/efetuar/comparecer/veículo).
+
+Réguas
+
+35. Variável **`{link_os}`** (acompanhar a ordem do Pátio ligada ao agendamento) no lembrete e no pós-venda — o gerador busca `patio_os.token_publico` pelo `agendamento_id` e monta `{link_base}/acompanhar/?t=…` (`linkOs`, `ordensPorAgendamento`).
+36. Variável **`{link_area}`** (Área do Cliente, um link novo por cliente pela rpc `cliente_gerar_acesso`) em todas as réguas, com teto de 60 links por rodada.
+37. **Sem o link a mensagem não sai**: cliente sem cadastro (`{link_area}`) ou horário sem ordem no Pátio (`{link_os}`) vão para "pulados" da prévia com o motivo — nunca um link vazio para o cliente (`faltaLink`, `corpoDaRegua`).
+38. Os links são resolvidos **só quando o texto pede** (nenhuma consulta a mais nas réguas que não usam) e com cache por rodada (`ctx.links`).
+39. Em simulação (prévia) o `{link_area}` vira um marcador e **não gera token** de verdade.
+40. Chips `{link_os}`/`{link_area}` (tracejados, com dica) no editor de cada régua que os aceita; a prévia de exemplo mostra o link do Pátio.
+41. **"Ver como um cliente real"** em cada régua (`GET /api/previa/mensagem`): busca o cliente, mostra nome/carro/placa, o último horário dele, a mensagem como ele recebe (com os links dele) e avisa quando para ele a mensagem não sairia; lembra o último cliente escolhido.
+42. Cada cartão mostra a **prioridade** na fila e a **janela de silêncio** ("silêncio 7 d" para as réguas de relacionamento; "não espera silêncio" para lembrete, pós-venda, avaliação) — o chip acompanha o intervalo mínimo enquanto você digita.
+43. Faixa Envio ganhou **Por minuto**, **Por dia**, **Mesmo cliente** e **Só horário da loja** (salvos pelo `PUT /api/comunicar/config` com faixas validadas no servidor; mudar acende "1 alteração sem salvar").
+44. **Relatório por régua com período**: 8 semanas · 30 dias · 90 dias · este mês · escolher datas (de/até no fuso da oficina); `GET /api/relatorio?de&ate` (400 se "de" vem depois do "até").
+45. O relatório ganhou **pediram para parar** (opt-out), **negativas** e **falharam**, com taxa de opt-out; o gráfico de 8 semanas continua.
+46. **Tabela "Por régua"** no mesmo período (`GET /api/relatorio/reguas`, cache 60 s): enviadas, responderam (%), agendaram depois, pediram para parar, falharam — réguas sem envio aparecem zeradas; ordenado por enviadas.
+47. O período escolhido fica lembrado no aparelho.
+
+Campanhas
+
+48. **Segmentos salvos** (tabela `comunicar_segmentos`, RLS sem política = só o servidor): nome, filtro, valor, quem salvou, usos e último uso.
+49. Chips "Meus segmentos" no passo 1: clicar escolhe filtro e valor; o `×` apaga (confirmação).
+50. **"Salvar segmento"** na prévia (nome sugerido pelo filtro); qualquer um da equipe salva; **apagar segmento de outra pessoa só gestor** (403 claro "Só gestor apaga segmento salvo por outra pessoa"); nome com menos de 2 letras e filtro inventado = 400.
+51. Campanha disparada por um segmento salvo **conta o uso** (`usos`, `usado_em`) — os mais usados aparecem primeiro.
+52. **Prévia honesta**: quantos recebem e **quantos ficam de fora, com o motivo** (pediram para parar, sem telefone, repetidos) — `peneirarSegmento` é a MESMA peneira do envio (`/api/segmentos/previa` → `bruto`, `pulados`).
+53. Quem recebeu outra mensagem da oficina há menos de N dias aparece como **aviso** ("já receberam outra há menos de 7 dias — recebem mesmo assim"): campanha é decisão de gente, e a prévia bate com o que sai.
+54. **"Mandar para o meu celular"** no passo 2 (`POST /api/envios/teste-meu`, qualquer um da equipe): o texto chega no telefone do **próprio perfil**, prefixado "[teste]", fora da fila; sem telefone no perfil → aviso e abre "Meu perfil"; WhatsApp recusado → 502 com a classe; auditado com o telefone mascarado.
+55. **Limite diário nas campanhas**: o que não cabe hoje é **escalonado nos dias seguintes** na hora de envio, pulando domingo (se não envia) e feriado (`distribuirPorDia`); a resposta diz "escalonadas em N dias (limite de 300/dia)" e o passo 3 avisa antes.
+56. A campanha aprovada pelo gestor passa pela mesma distribuição diária.
+57. Resultado da campanha traz `puladosDetalhe` (quem pediu para parar × sem link da Área) e `porDia`.
+58. Agendamento da campanha ("Em uma data") continua e agora respeita o limite diário do dia escolhido.
+
+Conectar (ficha 360 e ligações)
+
+59. **`public/apps.js`**: UM lugar para os endereços dos apps (Agenda, CRM, Atendimento, Comunicar, Orçador, Pátio, Site) e os links que abrem o registro certo (`LINKS.conversa/conversaTel/lead/clienteCrm/agendamento/os/orcamento/integracoes`) — vale para a tela (`window.IndyApps`) e para o servidor (`globalThis.IndyApps`, importado por `acesso.js`). O mesmo arquivo roda nos dois lados (teste garante que não usa export/require).
+60. `acesso.APPS`, `conta.js`, `app.js` (ecossistema, ficha, "Abrir conversa"), `prontidao.js` e o `rodada5.js` leem de lá — nenhum endereço duplicado; o Pátio entrou no seletor "Ecossistema IndyCar".
+61. **Ficha do cliente › "Nos outros apps"** (rpc `cliente_360(p_telefone)` pelo telefone normalizado, `ligacoesDoCliente`/`montarLigacoes`): conversa no Atendimento (etapa, com quem está, esperando consultor → `/?conversa=`), **carro na oficina** (OS, etapa → `/?os=`), leads no CRM (status, serviço, responsável → `/?lead=`), horário na Agenda (`/?agendamento=`), orçamento (`/?orcamento=`), ficha completa no CRM.
+62. Na ficha: **tarefas abertas** ligadas ao cliente (com quem), indicações ("Indicou 2 amigos" / "Veio por indicação de…") e um resumo (mensagens trocadas, leads abertos, gasto, última visita).
+63. Sem a rpc (papel sem direito, cliente sem conversa) a ficha mostra os links pelo telefone — nada quebra.
+64. **"Onde toca"** em cada mensagem (`GET /api/envios/:id/ligacoes`): conversa (pelo `conversa_id` ou pelo telefone), lead, horário na Agenda, ordem do Pátio (pela `chave_unica` `patio_*` ou pela OS do agendamento) e ficha no CRM; diz quando a mensagem só está ligada à conversa.
+65. **`GET /api/clientes/360?tel=`** (com ou sem 55, com máscara): a ficha 360 de um telefone mesmo sem cadastro de cliente; modal "Ficha 360" (`R5.abrir360`).
+66. Busca de mensagens por telefone usa **`telefone_e164`** (coluna gerada, com índice): 10+ dígitos = igualdade exata, com ou sem 55; menos dígitos = contém (telefone e telefone_e164).
+67. `enviosDoTelefone(tel)` para a ficha 360 e o relatório por telefone.
+68. Links do sino/"sem acesso" e o "Abrir conversa" continuam funcionando — agora pelo `apps.js`.
+
+Preparo para a IndyCar Central (onda B2)
+
+69. **`server.js` exporta `{ handler, iniciar, ligarCarteiro, desligarCarteiro, normalizarPrefixo, VERSAO }`**; o `listen`, os timers do carteiro e os `SIGTERM/SIGINT` só acontecem quando o arquivo é o programa principal (`node server.js`) — importar o módulo não sobe servidor nem roda carteiro (teste importa e usa o handler).
+70. **`req.prefixo`** (mandado pela Central) ou a variável **`PREFIXO`** (`/comunicar`): o handler tira o prefixo do caminho antes de decidir entre API e arquivo; `GET /api/config` devolve `prefixo` para a tela.
+71. `normalizarPrefixo` aceita `comunicar/`, `/comunicar`, `/` → sem barra final, nunca `//`.
+72. **Frontend com caminhos RELATIVOS**: `api/…` (não `/api/…`) no `app.js`, `acordar.js` (sonda `api/ping` pela `baseURI`) e no CSV; `register('sw.js')`; `manifest.json`, `styles.css`, ícones, logo e scripts sem barra inicial — funciona em `/` e em `/comunicar/` (testado contra o servidor real com `PREFIXO=/comunicar`).
+73. **Service worker relativo** (`BASE = new URL('./', self.location).pathname`): casca, API (`${BASE}api/`) e navegação pelo prefixo; versão `comunicar-v5.0.0` (a antiga é apagada no `activate`).
+74. **Manifest relativo**: `start_url`/`scope` `./`, ícones `./icon-…`, atalhos `./?abrir=campanha` e `./?tela=mensagens`.
+75. O atalho do manifest **`?abrir=campanha`** passou a funcionar (abre "Nova campanha" e limpa a URL).
+76. `conta.js`: "esqueci a senha" volta para a raiz do app (`new URL('./', location)`), e "sair" recarrega a raiz do app — não `/` fixo.
+77. Versão `5.0.0` em `package.json`, `/api/ping`, `?v=5.0.0` nos arquivos e no service worker.
+78. **URL do pg_cron documentada** (README › Carteiro externo e `scripts/sql/trocar-carteiro-url.sql`): `posvenda_config.carteiro_url` = `https://indycar-posvenda.onrender.com/api/rodar`; trocar = um UPDATE (não foi trocado) + a URL fixa do `carteiro.yml`; o `RUNNER_TOKEN` da Central tem de ser o mesmo `runner_token`.
+79. `GET /api/ping` sem prefixo continua respondendo quando o prefixo está ligado (o vigia e o `publicar.mjs` não quebram).
+
+Banco (migração `comunicar_rodada5`, cópia em `scripts/sql/2026-10-16_comunicar_rodada5.sql`)
+
+80. `posvenda_config`: `limite_por_minuto`, `limite_por_dia`, `intervalo_mesmo_cliente_min`, `so_horario_comercial`, `whatsapp_estado` (check), `whatsapp_estado_em`, `whatsapp_motivo` — todas com padrão e check.
+81. `posvenda_envios.erro_classe` (check) + índice parcial; `posvenda_envios_pendente_tipo_idx`.
+82. `comunicar_segmentos` (check de filtro, FK em perfis, RLS ligado sem política, `revoke` de anon/authenticated, índice por criador) — mesmo padrão de `comunicar_campanhas`.
+83. Comentários nas colunas e na tabela; advisors de segurança sem WARN novo (só o INFO "RLS sem política" de propósito, igual às outras `comunicar_*`); nada das funções da base, de `patio_*` nem de `tocar_conversa` foi tocado.
+
+Mock, testes e ferramentas
+
+84. Mock (`npm run mock`): `?whatsapp=ok|recusada|desconectado|instavel` pinta cada estado da saúde; segmentos salvos de exemplo (reset com `?semente=1`); prévia do segmento com a peneira REAL; `/api/whatsapp/saude`, `/reconferir`, `/segmentos/salvos` (GET/POST/DELETE com a regra do dono), `/envios/teste-meu`, `/clientes/360`, `/envios/:id/ligacoes`, `/relatorio/reguas`, `/previa/mensagem`, ficha com `ligacoes` (dublê do `cliente_360`), `/api/config` com `prefixo`.
+85. `scripts/testes-rodada5.mjs` (**23 testes**, `npm test` = **126**): classes de erro, espera crescente, CodeWords falso (envio e status), prioridade, cadência, intervalo por cliente, horário comercial, limite diário por dias, saúde em todos os estados, `{link_os}`/`faltaLink`, relatório com opt-out/período/por régua, peneira do segmento, `montarLigacoes`, `apps.js` nos dois lados, caminhos relativos (varre `public/`), **handler exportado com prefixo** (sobe o `server.js` real sem listen), e a API de verdade: saúde/reconferir (403 para atendente), segmentos salvos (dono × gestor, 400, uso contado), escalonamento diário, teste-meu (sem telefone 400, recusado 502, auditoria mascarada), 360, ligações, relatório, prévia real, mapa de rotas e permissões.
+86. `scripts/navegador-rodada5.mjs` (`npm run navegador5`): **96 verificações** em 1440 e 375 px — saúde recusada/ok/conferir agora, cadência, chips de link, prioridade/silêncio, prévia real, salvar cadência, relatório com período e por régua, segmentos salvos (usar, salvar, apagar alheio = 403), pulados com motivo, teste no meu celular, "Onde toca", busca por telefone, ficha 360, atendente, atalho `?abrir=campanha`; zero erro de console, zero rolagem lateral.
+87. Roteiros antigos atualizados e verdes: rodada 4 (o "Pronto para ligar" tem 12 itens desde o Pátio) **104/104**; rodada 3 **137/137** (espera da campanha ajustada).
+88. `npm run check` cobre `whatsapp.js`, `public/apps.js` e `public/rodada5.js`; `capturas-r5/` no `.gitignore`.
+89. Corrigido na passada: `$$` virando `$` em dois seletores (bug do próprio patch, pego pelo roteiro de navegador — "`$(…).forEach is not a function`").
+
+Avisos do coordenador (fim da rodada)
+
+90. Tipo **`remarcacao`** (aviso de horário remarcado que a Agenda manda; antes entrava como `avulsa`): rótulo "Horário remarcado" e ícone 🔄 em todas as telas, filtro de Mensagens, seletor do relatório, rótulo nas automações/CSV, **prioridade igual à do lembrete** e sai na hora mesmo que o cliente tenha recebido outra mensagem agora (operacional).
+91. Campanha proposta pelo **CRM** (`comunicar_campanhas` com `aguardando`, lista de `destinos`, `criado_por_nome`; notificação `/?campanha=<id>`): a tela Campanhas abre a proposta em destaque e mostra o selo **"veio do CRM"** (coluna nova `comunicar_campanhas.origem`, padrão `comunicar`, migração `comunicar_rodada5_origem`; sem a coluna preenchida, lista de destinos sem segmento é lida como vinda do CRM); "lista de N clientes" no lugar de "clientes escolhidos"; aprovar enfileira pela lista com a mesma peneira.
+
+### Como foi verificado (16/10/2026, rodada 5)
+
+- `npm run check` limpo · `npm test` **127/127** (24 novos) · `npm run segredos` limpo.
+- Banco real: migrações `comunicar_rodada5` e `comunicar_rodada5_origem` aplicadas pelo MCP (`apply_migration`), colunas e tabela conferidas por leitura (`limite_por_minuto=10`, `limite_por_dia=300`, `intervalo_mesmo_cliente_min=60`, `whatsapp_estado=null`, `carteiro_url=https://indycar-posvenda.onrender.com/api/rodar`); `comunicar_segmentos` com RLS ligado e 0 políticas (de propósito); advisors de segurança sem WARN novo. Nada foi gravado na fila nem enviado.
+- Servidor real local (`CARTEIRO_DESLIGADO=1`, `PORT=3510`, `PREFIXO=/comunicar`): `/comunicar/api/ping` 5.0.0, `/comunicar/api/config` → `prefixo: "/comunicar"`, `/comunicar/api/whatsapp/saude` 401 sem login, `/comunicar/api/rodar` 403 sem token, `/comunicar/sw.js` e `/comunicar/app.js` (brotli) 200, `/api/ping` sem prefixo continua 200.
+- Mock na 3511 + puppeteer + Chrome: `navegador5` **96/96**, `navegador4` **104/104**, `navegador` (rodada 3) **137/137**, em 1440 e 375 px, zero erro de console, zero rolagem lateral. Capturas em `capturas-r5/`.
+- Produção: publicado pelo `publicar.mjs comunicar` e conferido no ar (ver o relatório da rodada).
+
+### Pendências (rodada 5)
+
+- O Atendimento ainda não abre a aba Integrações por `?aba=integracoes` — o link do Comunicar já manda assim (o botão abre o Atendimento e o João clica em Integrações até o agente do Atendimento ler o parâmetro).
+- O limite diário escalona campanhas, mas as **réguas** não são escalonadas (param no limite do dia e saem no dia seguinte, como antes).
+- Quando a Central nascer: trocar `posvenda_config.carteiro_url` (modelo em `scripts/sql/trocar-carteiro-url.sql`) e a URL do `carteiro.yml`; abrir o app sempre como `/comunicar/` (com a barra).

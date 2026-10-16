@@ -138,3 +138,96 @@ export async function comTentativas(fn, { vezes = 3, esperaMs = 700 } = {}) {
   }
   throw ultimo;
 }
+
+// =============================================================================
+// RODADA 5 (16/10/2026) — cadência segura quando o CodeWords volta, prioridade
+// entre tipos, intervalo por cliente e limite diário. Tudo PURO.
+// =============================================================================
+
+/** Ordem de saída quando a fila acumulou: quem o cliente está esperando sai primeiro. */
+export const PRIORIDADE = {
+  patio_pronto: 1, patio_extra: 2, lembrete: 3, remarcacao: 3, patio_entrada: 4, avaliacao: 5, posvenda: 6,
+  area_cliente: 7, avulsa: 8, retorno: 9, orcamento: 10, nao_fechou: 11, aniversario: 12, reativacao: 13, campanha: 14,
+};
+export const prioridadeDe = (tipo) => PRIORIDADE[tipo] ?? 20;
+
+/** Fila por prioridade e, dentro dela, pela ordem de envio (a mais antiga primeiro). */
+export function ordenarFila(fila = []) {
+  return [...fila].sort((a, b) => (prioridadeDe(a.tipo) - prioridadeDe(b.tipo)) || (String(a.enviar_em || '') < String(b.enviar_em || '') ? -1 : String(a.enviar_em || '') > String(b.enviar_em || '') ? 1 : 0));
+}
+
+/** Pausa entre dois envios para respeitar o limite por minuto (com um pouco de variação, sem cara de disparo). */
+export function pausaEntreEnvios(limitePorMinuto, { minimoMs = 1200, aleatorio = Math.random } = {}) {
+  const lim = Math.max(1, Number(limitePorMinuto) || 10);
+  const base = Math.max(minimoMs, Math.ceil(60000 / lim));
+  return Math.round(base * (0.9 + 0.2 * Math.min(1, Math.max(0, aleatorio()))));
+}
+
+/** Quantas cabem agora pelo limite por minuto e pelo limite diário (além do por hora, que já existe). */
+export function vagasPorCadencia({ limitePorMinuto = 10, limitePorDia = 300, enviadasHoje = 0, vagasHora = 25 } = {}) {
+  const porDia = Math.max(0, (Number(limitePorDia) || 300) - (Number(enviadasHoje) || 0));
+  return Math.max(0, Math.min(Number(vagasHora) || 0, porDia, Math.max(1, Number(limitePorMinuto) || 10) * 15));
+}
+
+const telDe = (t) => String(t ?? '').replace(/\D/g, '').replace(/^55(?=\d{10,11}$)/, '');
+/**
+ * Dois avisos para o MESMO cliente na mesma rodada: o segundo espera N minutos
+ * (o cliente não recebe duas mensagens da oficina em sequência).
+ * Devolve { agora: [...], adiados: [{ envio, enviar_em }] }. Avisos do Pátio e
+ * lembrete nunca são adiados por isto (são operacionais e têm hora).
+ */
+export function separarMesmoCliente(fila = [], { minutos = 60, agora = Date.now(), recentes = new Map() } = {}) {
+  const vistos = new Map(recentes); // tel → último instante em que saiu algo
+  const saem = [], adiados = [];
+  for (const e of ordenarFila(fila)) {
+    const tel = telDe(e.telefone);
+    const ultimo = tel ? vistos.get(tel) : null;
+    const operacional = e.tipo === 'lembrete' || e.tipo === 'remarcacao' || String(e.tipo || '').startsWith('patio_');
+    if (tel && ultimo !== undefined && ultimo !== null && !operacional && agora - ultimo < minutos * 60000) {
+      adiados.push({ envio: e, enviar_em: new Date(ultimo + minutos * 60000).toISOString() });
+      continue;
+    }
+    saem.push(e);
+    if (tel) vistos.set(tel, agora);
+  }
+  return { agora: saem, adiados };
+}
+
+/** Horário comercial da oficina (seg–sáb 8h–17h30) — quem quiser "só no horário da loja" liga isto. */
+export function dentroDoHorarioComercial({ diaSemana, hora, minuto = 0 }) {
+  if (diaSemana === 0) return false;
+  const m = hora * 60 + minuto;
+  return m >= 8 * 60 && m < 17 * 60 + 30;
+}
+
+/** Espera crescente entre tentativas de uma falha passageira: 5, 15 e 45 min. */
+export const ESPERAS_MIN = [5, 15, 45];
+export const esperaDaTentativa = (tentativas) => ESPERAS_MIN[Math.max(0, Math.min(ESPERAS_MIN.length - 1, (Number(tentativas) || 1) - 1))];
+
+/**
+ * Campanha grande respeita o limite diário: o que não cabe hoje é programado para os
+ * dias seguintes, na hora de envio, pulando domingo (se não envia) e feriado.
+ *   linhas      = envios já montados (sem enviar_em final)
+ *   jaHoje      = quantas já saíram/estão programadas para hoje
+ * Devolve as linhas com `enviar_em` e um resumo por dia.
+ */
+export function distribuirPorDia(linhas, { limitePorDia = 300, jaHoje = 0, inicioIso, hoje, horaEnvio = '09:30', enviaDomingo = false, feriado = () => null } = {}) {
+  const lim = Math.max(1, Number(limitePorDia) || 300);
+  const saida = [], porDia = {};
+  let dia = hoje, vagas = Math.max(0, lim - (Number(jaHoje) || 0)), quando = inicioIso;
+  const proximoDia = () => {
+    for (let i = 0; i < 14; i++) {
+      dia = somarDias(dia, 1);
+      const dow = new Date(dia + 'T12:00:00').getDay();
+      if (!feriado(dia) && (enviaDomingo || dow !== 0)) break;
+    }
+    vagas = lim; quando = instanteSP(dia, horaEnvio).toISOString();
+  };
+  for (const l of linhas) {
+    if (vagas <= 0) proximoDia();
+    saida.push({ ...l, enviar_em: quando });
+    porDia[dia] = (porDia[dia] || 0) + 1;
+    vagas--;
+  }
+  return { linhas: saida, porDia, dias: Object.keys(porDia).length };
+}

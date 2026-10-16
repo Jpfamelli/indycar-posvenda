@@ -68,6 +68,7 @@ const TIPO = {
                  param:{ campo:'meses_reativacao', antes:'Depois de', depois:'meses sem voltar', min:3, max:36 } },
   campanha:    { rotulo:'Campanha', emoji:'📣', cor:'purple' },
   avulsa:      { rotulo:'Avulsa', emoji:'✉️', cor:'gray' },
+  remarcacao:  { rotulo:'Horário remarcado', emoji:'🔄', cor:'blue', desc:'A Agenda avisa o cliente quando o horário muda (sai com a prioridade do lembrete).' },
   // Pátio (16/10/2026): quem enfileira é o banco (app do Pátio); aqui só aparecem
   patio_entrada: { rotulo:'Pátio: carro recebido', emoji:'🚗', cor:'blue', desc:'O carro entrou na oficina: o cliente recebe o link para acompanhar.' },
   patio_extra:   { rotulo:'Pátio: extra para aprovar', emoji:'🛠️', cor:'orange', desc:'A equipe achou um item: o cliente vê a foto e aprova pelo link.' },
@@ -76,6 +77,12 @@ const TIPO = {
 };
 const TIPOS_PATIO = ['patio_entrada', 'patio_extra', 'patio_pronto', 'area_cliente'];
 const VARS_COMUNS = ['nome', 'primeiro_nome', 'carro', 'placa', 'servico'];
+/* Rodada 5: variáveis de LINK nas réguas — {link_os} (acompanhar a ordem do Pátio do horário) para as
+   réguas que nascem de um agendamento; {link_area} (Área do Cliente, um link por cliente) em todas. */
+const VARS_LINK = { lembrete:['link_os'], posvenda:['link_os', 'link_area'], retorno:['link_area'], nao_fechou:['link_area'], aniversario:['link_area'], orcamento:['link_area'], reativacao:['link_area'], avaliacao:[] };
+/* Ordem de saída quando a fila acumula (espelho de carteiro.js › PRIORIDADE) e quem respeita a janela de silêncio. */
+const PRIORIDADE = { patio_pronto:1, patio_extra:2, lembrete:3, remarcacao:3, patio_entrada:4, avaliacao:5, posvenda:6, area_cliente:7, avulsa:8, retorno:9, orcamento:10, nao_fechou:11, aniversario:12, reativacao:13, campanha:14 };
+const RESPEITA_SILENCIO = new Set(['aniversario', 'retorno', 'reativacao', 'orcamento', 'nao_fechou', 'campanha', 'avulsa']);
 const STATUS_ENVIO = {
   pendente:['Na fila', 'bp-orange'], enviado:['Enviada', 'bp-green'], falhou:['Falhou', 'bp-red'],
   cancelado:['Cancelada', 'bp-gray'], pulado:['Pulada', 'bp-blue'],
@@ -86,18 +93,24 @@ const STATUS_AG = { aguardando:['Aguardando', 'bp-orange'], confirmado:['Confirm
   compareceu:['Na oficina', 'bp-blue'], nao_veio:['Não veio', 'bp-red'], concluido:['Concluído', 'bp-purple'], nao_fechou:['Não fechou', 'bp-orange'],
   cancelado:['Cancelado', 'bp-gray'] };
 const pillAg = (s) => { const [r, c] = STATUS_AG[s] || [s, 'bp-gray']; return `<span class="badge-pill ${c}">${esc(r)}</span>`; };
-const ATENDIMENTO_URL = 'https://indycar-atendimento.onrender.com';
-const CRM_URL = 'https://indycar-crm.onrender.com';
-const AGENDA_URL = 'https://indycar-agendamentos.onrender.com';
+/* Rodada 5: os endereços vêm de apps.js (um lugar só); a API é relativa à página. */
+const APPS_ECO = (window.IndyApps && window.IndyApps.APPS) || {};
+const LINKS = (window.IndyApps && window.IndyApps.LINKS) || {};
+const ATENDIMENTO_URL = APPS_ECO.atendimento?.url || 'https://indycar-atendimento.onrender.com';
+const CRM_URL = APPS_ECO.crm?.url || 'https://indycar-crm.onrender.com';
+const AGENDA_URL = APPS_ECO.agenda?.url || 'https://indycar-agendamentos.onrender.com';
+const PATIO_URL = APPS_ECO.patio?.url || 'https://indycar-patio.netlify.app';
+const API = 'api';
 
 /* Ecossistema IndyCar — os apps da oficina; este (Comunicar) vem marcado. */
 const ECOSSISTEMA = [
   { chave:'agenda',      nome:'Agenda',      desc:'horários e presença',   url:AGENDA_URL,                                  ico:I.calendar },
   { chave:'crm',         nome:'CRM',         desc:'leads e funil',         url:CRM_URL,                                     ico:I.flag },
   { chave:'atendimento', nome:'Atendimento', desc:'conversas do WhatsApp', url:ATENDIMENTO_URL,                             ico:I.wa },
-  { chave:'comunicar',   nome:'Comunicar',   desc:'lembretes e réguas',    url:'https://indycar-posvenda.onrender.com',     ico:I.send },
-  { chave:'orcador',     nome:'Orçador',     desc:'orçamentos com IA',     url:'https://indycar-orcador.netlify.app',       ico:I.money },
-  { chave:'site',        nome:'Site',        desc:'indycar-taubate',       url:'https://indycar-taubate.netlify.app',       ico:I.loja },
+  { chave:'comunicar',   nome:'Comunicar',   desc:'lembretes e réguas',    url:APPS_ECO.comunicar?.url || './',             ico:I.send },
+  { chave:'patio',       nome:'Pátio',       desc:'carro na oficina',      url:PATIO_URL,                                   ico:I.car },
+  { chave:'orcador',     nome:'Orçador',     desc:'orçamentos com IA',     url:APPS_ECO.orcador?.url || 'https://indycar-orcador.netlify.app', ico:I.money },
+  { chave:'site',        nome:'Site',        desc:'indycar-taubate',       url:APPS_ECO.site?.url || 'https://indycar-taubate.netlify.app', ico:I.loja },
 ];
 const APP_ATUAL = 'comunicar';
 
@@ -130,7 +143,8 @@ async function api(method, path, body, _repetiu = false) {
   let r;
   /* Rodada 4: o Acordar (acordar.js) espera o Render acordar e tenta de novo
      sozinho (até ~3 min) em vez de mostrar erro cru. */
-  try { r = await (window.Acordar ? window.Acordar.buscar('/api' + path, opt) : fetch('/api' + path, opt)); }
+  /* rodada 5: caminho RELATIVO — funciona em / e dentro da Central (/comunicar/) */
+  try { r = await (window.Acordar ? window.Acordar.buscar(API + path, opt) : fetch(API + path, opt)); }
   catch (err) {
     const e = new Error(/não acordou/.test(err?.message || '') ? err.message : 'Sem internet — confira a conexão e tente de novo. O que você escreveu continua aqui.');
     e.status = 0; throw e;
@@ -427,6 +441,7 @@ async function renderInicio() {
   $('#btnCarteiro').addEventListener('click', () => window.R4?.abrirCarteiro());
   pintarFaixaEquipe();
   window.R4?.pintarInicio();
+  window.R5?.pintarSaude();
   $$('[data-ir]', view).forEach(b => b.addEventListener('click', () => route(b.dataset.ir)));
 }
 
@@ -488,12 +503,14 @@ async function renderReguas() {
 
   const cartao = (tipo) => {
     const t = TIPO[tipo]; const ativo = !!v(`ativo_${tipo}`);
-    const vars = [...VARS_COMUNS, ...(t.vars || [])];
+    const vars = [...VARS_COMUNS, ...(t.vars || []), ...(VARS_LINK[tipo] || [])];
     const p = t.param;
+    const silencio = RESPEITA_SILENCIO.has(tipo);
     return `<article class="regua c-${t.cor}${ativo ? '' : ' off'}" data-regua="${tipo}">
       <div class="regua-head">
         <div class="regua-titulo"><span class="regua-ico" aria-hidden="true">${t.emoji}</span>
-          <div><h3>${esc(t.rotulo)}</h3><p>${esc(t.desc)}</p></div></div>
+          <div><h3>${esc(t.rotulo)}</h3><p>${esc(t.desc)}</p>
+            <div class="regua-meta"><span class="chip" title="Quando a fila acumula (WhatsApp voltou), sai nesta ordem: pátio pronto › lembrete › pós-venda › … › campanha">prioridade ${PRIORIDADE[tipo] || '—'}</span>${silencio ? `<span class="chip chip-sil" title="Não sai para quem recebeu outra mensagem de relacionamento há menos de ${esc(v('intervalo_minimo_dias'))} dias (janela de silêncio)">silêncio ${esc(v('intervalo_minimo_dias'))} d</span>` : '<span class="chip on" title="Sai na hora certa, mesmo que o cliente tenha recebido outra mensagem há pouco">não espera silêncio</span>'}</div></div></div>
         <label class="sw"><input type="checkbox" data-cfg="ativo_${tipo}" ${ativo ? 'checked' : ''} ${gestor ? '' : 'disabled'} aria-label="Ligar ${esc(t.rotulo)}"><span class="tr"></span><span class="sw-txt">${ativo ? 'Ligada' : 'Desligada'}</span></label>
       </div>
       <div class="regua-corpo">
@@ -505,10 +522,10 @@ async function renderReguas() {
           <div class="regua-nota">${svg(I.alerta)}<span>Dispara sozinha, uns minutos depois de o cliente responder bem ao pós-venda. Sem o link, não sai.</span></div>` : ''}
         <div class="field"><label for="msg_${tipo}">Mensagem</label>
           <textarea id="msg_${tipo}" data-cfg="msg_${tipo}" maxlength="1000" ${gestor ? '' : 'disabled'}>${esc(v(`msg_${tipo}`))}</textarea>
-          <div class="var-chips" aria-label="Variáveis: clique para inserir">${vars.map(x => `<button type="button" class="var-chip${(t.vars || []).includes(x) ? ' esp' : ''}" data-var="${x}" data-alvo="msg_${tipo}" ${gestor ? '' : 'disabled'}>{${x}}</button>`).join('')}
+          <div class="var-chips" aria-label="Variáveis: clique para inserir">${vars.map(x => `<button type="button" class="var-chip${(t.vars || []).includes(x) ? ' esp' : ''}${(VARS_LINK[tipo] || []).includes(x) ? ' link' : ''}" data-var="${x}" data-alvo="msg_${tipo}" ${gestor ? '' : 'disabled'} title="${x === 'link_os' ? 'Link para o cliente acompanhar a ordem do Pátio deste horário (sem ordem, a mensagem não sai)' : x === 'link_area' ? 'Link da Área do Cliente — um link só dele (sem cadastro, a mensagem não sai)' : ''}">{${x}}</button>`).join('')}
             <button type="button" class="var-chip ia-chip" data-ia="${tipo}" ${gestor ? '' : 'disabled'} title="Gera 3 opções no tom da casa">✨ Escrever com IA</button></div>
           <div class="ia-box" data-ia-box="${tipo}" hidden></div></div>
-        <div class="previa"><small>Prévia · como a ${esc(EXEMPLO.nome.split(' ')[0])} vê no celular</small>${celularWA(`<div class="bolha wa-rec" data-previa="${tipo}"></div>`)}</div>
+        <div class="previa"><small>Prévia · como a ${esc(EXEMPLO.nome.split(' ')[0])} vê no celular <button type="button" class="link-mini" data-previa-real="${tipo}" title="Escolher um cliente de verdade e ver a mensagem dele (com os links dele)">ver como um cliente real</button></small>${celularWA(`<div class="bolha wa-rec" data-previa="${tipo}"></div>`)}</div>
         ${tipo === 'retorno' ? `<div class="regras" id="regrasBox">${htmlRegras(regras, gestor)}</div>` : ''}
         <div class="regua-acoes">
           ${tipo !== 'avaliacao' ? `<button type="button" class="btn" data-quem="${tipo}">${svg(I.olho)} Quem receberia hoje</button>` : ''}
@@ -541,6 +558,17 @@ async function renderReguas() {
           <div class="field curto"><label for="cfg_lim">Limite por hora</label>
             <input id="cfg_lim" type="number" inputmode="numeric" min="1" max="500" value="${esc(v('limite_por_hora') ?? 60)}" data-cfg="limite_por_hora" ${gestor ? '' : 'disabled'}>
             <small>mensagens no máximo — sem cara de disparo</small></div>
+          <div class="field curto"><label for="cfg_min">Por minuto</label>
+            <input id="cfg_min" type="number" inputmode="numeric" min="1" max="60" value="${esc(v('limite_por_minuto') ?? 10)}" data-cfg="limite_por_minuto" ${gestor ? '' : 'disabled'}>
+            <small>cadência entre uma mensagem e outra</small></div>
+          <div class="field curto"><label for="cfg_dia">Por dia</label>
+            <input id="cfg_dia" type="number" inputmode="numeric" min="1" max="5000" value="${esc(v('limite_por_dia') ?? 300)}" data-cfg="limite_por_dia" ${gestor ? '' : 'disabled'}>
+            <small>campanha maior é escalonada nos dias seguintes</small></div>
+          <div class="field curto"><label for="cfg_mc">Mesmo cliente</label>
+            <input id="cfg_mc" type="number" inputmode="numeric" min="0" max="1440" value="${esc(v('intervalo_mesmo_cliente_min') ?? 60)}" data-cfg="intervalo_mesmo_cliente_min" ${gestor ? '' : 'disabled'}>
+            <small>minutos entre dois avisos para a mesma pessoa</small></div>
+          <div class="field curto"><span class="rot">Só horário da loja</span>
+            <label class="sw" style="padding:9px 0" title="Seg–sáb, 8h às 17h30: fora disso o carteiro espera a loja abrir"><input type="checkbox" data-cfg="so_horario_comercial" ${v('so_horario_comercial') ? 'checked' : ''} ${gestor ? '' : 'disabled'}><span class="tr"></span><span class="sw-txt">${v('so_horario_comercial') ? 'Seg–sáb 8h–17h30' : 'Janela acima'}</span></label></div>
           <div class="field"><label for="cfg_tel">Telefone de teste</label><input id="cfg_tel" type="tel" inputmode="tel" placeholder="(12) 99999-9999" value="${esc(telBR(v('telefone_teste')) === '—' ? '' : telBR(v('telefone_teste')))}" data-cfg="telefone_teste" ${gestor ? '' : 'disabled'}></div>
           <div class="field curto"><span class="rot">Domingo</span>
             <label class="sw" style="padding:9px 0"><input type="checkbox" data-cfg="envia_domingo" ${v('envia_domingo') ? 'checked' : ''} ${gestor ? '' : 'disabled'}><span class="tr"></span><span class="sw-txt">${v('envia_domingo') ? 'Envia' : 'Não envia'}</span></label></div>
@@ -584,6 +612,7 @@ async function renderReguas() {
     state._rascunhoRestaurado = 0;
   }
   window.R4?.pintarReguas();
+  window.R5?.pintarReguas();
 }
 
 /* Lê o valor de um campo de configuração do jeito que o servidor espera. */
@@ -610,6 +639,8 @@ function ligarCamposConfig() {
       if (campo.startsWith('ativo_')) { card.classList.toggle('off', !novo); $('.sw-txt', card).textContent = novo ? 'Ligada' : 'Desligada'; }
       if (campo === 'pausa_geral') { $('#pausaBox').classList.toggle('ligada', novo); $('#pausaBox .sw-txt').textContent = novo ? 'Pausado' : 'Enviando'; }
       if (campo === 'envia_domingo') el.closest('.sw').querySelector('.sw-txt').textContent = novo ? 'Envia' : 'Não envia';
+      if (campo === 'so_horario_comercial') el.closest('.sw').querySelector('.sw-txt').textContent = novo ? 'Seg–sáb 8h–17h30' : 'Janela acima';
+      if (campo === 'intervalo_minimo_dias') $$('.regua-meta .chip-sil', view).forEach(ch => { ch.textContent = `silêncio ${novo} d`; });
       if (campo === 'telefone_teste' && ev === 'input') { const f = telBR(novo); if (f !== '—' && soDigitos(novo).length >= 10) el.value = f; }
       if (card) { card.classList.toggle('alterada', Object.keys(state.cfgEdit).some(k => k.endsWith('_' + card.dataset.regua) || k === TIPO[card.dataset.regua]?.param?.campo || (card.dataset.regua === 'avaliacao' && k === 'link_avaliacao'))); atualizarPrevia(card.dataset.regua); }
       atualizarBarra();
@@ -629,7 +660,7 @@ function atualizarPrevia(tipo) {
   const el = $(`[data-previa="${tipo}"]`, view); if (!el) return;
   const corpo = $(`#msg_${tipo}`)?.value || '';
   const cfg = { ...state.cfg, ...state.cfgEdit };
-  const ctx = { ...EXEMPLO, meses: cfg.meses_retorno, link_avaliacao: cfg.link_avaliacao || 'https://g.page/r/indycar' };
+  const ctx = { ...EXEMPLO, meses: cfg.meses_retorno, link_avaliacao: cfg.link_avaliacao || 'https://g.page/r/indycar', link_os: `${PATIO_URL}/acompanhar/?t=…`, link_area: `${PATIO_URL}/minha/?c=…` };
   pintarBolha(el, renderTemplate(corpo, ctx), state.cfgEdit.hora_envio || state.cfg.hora_envio || '09:30', 'Escreva a mensagem acima para ver a prévia.');
 }
 function atualizarBarra() {
@@ -779,7 +810,7 @@ async function renderMensagens({ quieto } = {}) {
     return;
   }
   const pilula = (chave, rotulo) => `<button type="button" role="tab" aria-selected="${f.status === chave}" class="pilula ${f.status === chave ? 'ativa' : ''}" data-filtro="${chave}">${rotulo}</button>`;
-  const tipos = ['todos', ...REGUAS, 'campanha', 'avulsa', ...TIPOS_PATIO];
+  const tipos = ['todos', ...REGUAS, 'campanha', 'avulsa', 'remarcacao', ...TIPOS_PATIO];
 
   view.innerHTML = `
     <div class="toolbar">
@@ -872,6 +903,7 @@ function cartaoEnvio(e) {
         ${podeReenviar ? `<button type="button" class="btn btn-mini" data-reenviar="${esc(e.id)}">${svg(I.refresh)} Reenviar</button>` : ''}
         ${e.intencao && CHAMA_CONSULTOR.has(e.intencao) ? (e.encaminhado_em ? '<span class="badge-pill bp-green">✓ no Atendimento</span>' : `<button type="button" class="btn btn-mini primary" data-encaminhar="${esc(e.id)}">${svg(I.wa)} Passar ao Atendimento</button>`) : ''}
         ${e.status === 'enviado' || e.resposta ? `<a class="btn btn-mini ghost" href="${esc(linkConversa(e.telefone))}" target="_blank" rel="noopener">${svg(I.externo)} Abrir conversa</a>` : ''}
+        ${window.R5 ? window.R5.botaoLigacoes(e.id) : ''}
       </div>
     </div>
   </article>`;
@@ -959,9 +991,10 @@ async function carregarModelos() { if (!state.modelos) state.modelos = await api
 /* Modal "Nova campanha" em 3 passos: para quem → mensagem → quando. */
 window.openCampanhaModal = async function (pre = {}) {
   const c = { passo:1, alvo: pre.cliente ? 'cliente' : 'segmento', filtro:'todos', valor:'', cliente: pre.cliente || null,
-    previa:null, corpo: window.R4?.lerRascunho('campanha') || '', quando:'agora', enviar_em:'', sugestao:null };
+    previa:null, corpo: window.R4?.lerRascunho('campanha') || '', quando:'agora', enviar_em:'', sugestao:null, segSalvoId:null };
   if (c.corpo) setTimeout(() => toast('Recuperei a mensagem que você estava escrevendo.'), 300);
-  const [segmentos, modelos] = await Promise.all([carregarSegmentos(), carregarModelos()]);
+  // rodada 5: segmentos salvos chegam junto (em paralelo) com segmentos e modelos
+  const [segmentos, modelos, salvos] = await Promise.all([carregarSegmentos(), carregarModelos(), window.R5 ? window.R5.segmentosSalvos().catch(() => []) : Promise.resolve([])]);
 
   openModal(`<div class="modal-head"><h3>${svg(I.megafone)} Nova campanha</h3><button type="button" class="modal-close" aria-label="Fechar">×</button></div>
     <div class="passos" aria-label="Passos">
@@ -987,8 +1020,15 @@ window.openCampanhaModal = async function (pre = {}) {
       const seg = segmentos.find(s => s.id === c.filtro);
       const p = await api('GET', `/segmentos/previa?filtro=${encodeURIComponent(c.filtro)}&valor=${encodeURIComponent(seg?.valor !== undefined ? (c.valor || seg.valor) : '')}`);
       c.previa = p;
-      box.innerHTML = `<div class="top"><span class="n">${p.total}</span><span class="t">${p.total === 1 ? 'cliente recebe' : 'clientes recebem'} (sem quem pediu para parar)</span></div>
+      box.innerHTML = `<div class="top"><span class="n">${p.total}</span><span class="t">${p.total === 1 ? 'cliente recebe' : 'clientes recebem'}</span>
+          <button type="button" class="btn btn-mini" id="segSalvar" title="Guardar este segmento com um nome para usar de novo">${svg(I.plus)} Salvar segmento</button></div>
+        ${window.R5 ? window.R5.htmlPulados(p) : ''}
         ${p.amostra?.length ? `<div class="amostra">${p.amostra.slice(0, 8).map(a => `<span title="${esc(a.telefone || '')}">${esc(a.nome)}${a.carro ? ` · ${esc(a.carro)}` : ''}</span>`).join('')}${p.total > 8 ? `<span>+${p.total - 8}</span>` : ''}</div>` : ''}`;
+      $('#segSalvar')?.addEventListener('click', async () => {
+        const seg = segmentos.find(s => s.id === c.filtro);
+        const s = await window.R5?.salvarSegmento(c.filtro, seg?.valor !== undefined ? (c.valor || seg.valor) : null, `${seg?.rotulo || c.filtro}${c.valor ? ` ${c.valor}` : ''}`);
+        if (s) { c.segSalvoId = s.id; salvos.unshift(s); passo1(); }
+      });
     } catch (e) { box.innerHTML = `<p class="form-msg erro">${esc(e.message)}</p>`; }
   }, 350);
 
@@ -1002,6 +1042,7 @@ window.openCampanhaModal = async function (pre = {}) {
       <div id="alvoSeg" ${c.alvo === 'segmento' ? '' : 'hidden'}>
         <div class="ia-sugere"><button type="button" class="btn ia" id="campIA">✨ IA, quem devo chamar?</button><small class="muted">olha os números e sugere segmento + mensagem; você confirma</small></div>
         <div id="campIASug">${c.sugestao ? htmlSugestao(c.sugestao) : ''}</div>
+        ${window.R5 ? window.R5.htmlSegmentosSalvos(salvos, c.filtro, c.valor || segmentos.find(s => s.id === c.filtro)?.valor) : ''}
         <div class="campos-linha">
           <div class="field"><label for="campSeg">Segmento</label><select id="campSeg">${segmentos.map(s => `<option value="${esc(s.id)}" ${s.id === c.filtro ? 'selected' : ''}>${esc(s.rotulo)}</option>`).join('')}</select></div>
           <div class="field curto" id="campValorBox" ${seg?.valor !== undefined ? '' : 'hidden'}><label for="campValor">${esc(seg?.unidade === 'texto' ? 'Palavra' : seg?.unidade || 'Valor')}</label>
@@ -1031,7 +1072,13 @@ window.openCampanhaModal = async function (pre = {}) {
         });
       };
       ligarSugestao();
-      $('#campSeg').addEventListener('change', e => { c.filtro = e.target.value; c.valor = ''; passo1(); });
+      $('#campSeg').addEventListener('change', e => { c.filtro = e.target.value; c.valor = ''; c.segSalvoId = null; passo1(); });
+      $$('[data-seg-usar]', body).forEach(b => b.addEventListener('click', async (ev) => {
+        const ap = ev.target.closest('[data-seg-apagar]');
+        if (ap) { ev.stopPropagation(); if (await window.R5.apagarSegmento(ap.dataset.segApagar)) { const i = salvos.findIndex(x => x.id === ap.dataset.segApagar); if (i >= 0) salvos.splice(i, 1); passo1(); } return; }
+        const s = salvos.find(x => x.id === b.dataset.segUsar); if (!s) return;
+        c.filtro = s.filtro; c.valor = s.valor ?? ''; c.segSalvoId = s.id; passo1();
+      }));
       $('#campValor')?.addEventListener('input', e => { c.valor = e.target.value; atualizarSegPrevia(); });
       atualizarSegPrevia();
     } else {
@@ -1064,7 +1111,8 @@ window.openCampanhaModal = async function (pre = {}) {
       <div class="field"><label for="campCorpo">Mensagem</label>
         <textarea id="campCorpo" maxlength="2000" style="min-height:120px" placeholder="Oi {primeiro_nome}! …">${esc(c.corpo)}</textarea>
         <div class="var-chips">${['nome', 'primeiro_nome', 'carro', 'placa', 'detalhe', 'link_area'].map(v => `<button type="button" class="var-chip" data-var="${v}"${v === 'link_area' ? ' title="Link da Área do Cliente — cada cliente recebe um só dele"' : ''}>{${v}}</button>`).join('')}
-          <button type="button" class="var-chip ia-chip" id="campIAEscrever">✨ Escrever com IA</button></div>
+          <button type="button" class="var-chip ia-chip" id="campIAEscrever">✨ Escrever com IA</button>
+          <button type="button" class="var-chip teste-chip" id="campTesteMeu" title="Recebe este texto no SEU celular (o do seu perfil), fora da fila">📲 Mandar para o meu celular</button></div>
         <div class="ia-box" id="campIABox" hidden></div>
         <div class="contador" id="campCont">0 / 2000</div>
         <div class="dica" id="campAreaDica" hidden>🔑 Com <b>{link_area}</b> cada cliente recebe um link só dele para a Área do Cliente (até 300 por vez; quem não tem cadastro fica de fora).</div></div>
@@ -1074,7 +1122,7 @@ window.openCampanhaModal = async function (pre = {}) {
       c.corpo = ta.value;
       window.R4?.guardarRascunho('campanha', c.corpo);
       const cli = clienteDaPrevia() || EXEMPLO;
-      const txt = renderTemplate(c.corpo, { nome: cli.nome, carro: cli.carro, placa: cli.placa, detalhe:'…', link_area:'https://indycar-patio.netlify.app/minha/?c=…' });
+      const txt = renderTemplate(c.corpo, { nome: cli.nome, carro: cli.carro, placa: cli.placa, detalhe:'…', link_area:`${PATIO_URL}/minha/?c=…`, link_os:`${PATIO_URL}/acompanhar/?t=…` });
       const dicaArea = $('#campAreaDica'); if (dicaArea) dicaArea.hidden = !c.corpo.includes('{link_area}');
       pintarBolha(bolha, txt, horaBR(new Date()), 'Escreva para ver a prévia.');
       cont.textContent = `${c.corpo.length} / 2000`; cont.classList.toggle('alto', c.corpo.length > 700);
@@ -1084,6 +1132,7 @@ window.openCampanhaModal = async function (pre = {}) {
       aplicar: (t) => { ta.value = t; pintar(); ta.focus(); },
       exemplo: () => { const x = clienteDaPrevia(); return x ? { nome: x.nome, carro: x.carro, placa: x.placa } : null; } }));
     $('#campModelo').addEventListener('change', e => { const m = modelos.find(x => x.id === e.target.value); if (m) { ta.value = m.corpo; pintar(); ta.focus(); } });
+    $('#campTesteMeu').addEventListener('click', (e) => window.R5?.testeMeu(ta.value, e.currentTarget));
     $$('.var-chip', body).forEach(ch => ch.addEventListener('click', () => {
       const ini = ta.selectionStart ?? ta.value.length, fim = ta.selectionEnd ?? ini, tok = `{${ch.dataset.var}}`;
       ta.value = ta.value.slice(0, ini) + tok + ta.value.slice(fim); ta.focus(); ta.setSelectionRange(ini + tok.length, ini + tok.length); pintar();
@@ -1103,7 +1152,7 @@ window.openCampanhaModal = async function (pre = {}) {
         <div><span>Para quem</span><b>${esc(alvoResumo())}</b></div>
         <div><span>Mensagem</span><b>${c.corpo.length} caracteres</b></div>
         <div><span>Quando</span><b id="campQuandoTxt">${c.quando === 'agora' ? 'agora, dentro da janela' : (c.enviar_em ? esc(dataHoraBR(c.enviar_em)) : 'escolha a data')}</b></div>
-        ${quantos > 1 ? `<div class="dica">${quantos} mensagens de relacionamento: quem já recebeu outra há poucos dias pode ser pulado pelo intervalo mínimo.</div>` : ''}
+        ${quantos > 1 ? `<div class="dica">${quantos} mensagens de relacionamento: quem já recebeu outra há poucos dias pode ser pulado pelo intervalo mínimo.${state.saudeWA?.cadencia?.porDia && quantos > state.saudeWA.cadencia.porDia ? ` Passa do limite de <b>${state.saudeWA.cadencia.porDia} por dia</b>: o que não cabe hoje sai nos dias seguintes, na hora de envio.` : ''}</div>` : ''}
         ${precisaAprovar() ? `<div class="dica aprovacao">${svg(I.check)}<span>Campanha para um grupo passa pelo gestor: ela fica <b>aguardando aprovação</b> e só entra na fila quando ele aprovar. O gestor recebe o aviso no sino.</span></div>` : ''}
       </div>`;
     $$('[data-quando]', body).forEach(b => b.addEventListener('click', () => { c.quando = b.dataset.quando; passo3(); }));
@@ -1141,7 +1190,7 @@ window.openCampanhaModal = async function (pre = {}) {
       const corpo = c.corpo.trim();
       const payload = c.alvo === 'cliente'
         ? { tipo:'avulsa', corpo, enviar_em, destinos:[{ cliente_id:c.cliente.id, telefone:c.cliente.telefone, nome:c.cliente.nome, carro:c.cliente.carro, placa:c.cliente.placa }] }
-        : { corpo, enviar_em, segmento:{ filtro:c.filtro, valor: c.valor || segmentos.find(s => s.id === c.filtro)?.valor } };
+        : { corpo, enviar_em, segmento:{ filtro:c.filtro, valor: c.valor || segmentos.find(s => s.id === c.filtro)?.valor }, segmento_salvo_id: c.segSalvoId || undefined };
       const r = await api('POST', '/envios', payload);
       window.R4?.guardarRascunho('campanha', '');
       if (r.aguardando) {
@@ -1149,7 +1198,7 @@ window.openCampanhaModal = async function (pre = {}) {
         closeModal(); state.route === 'campanhas' ? route(null, { quieto:true }) : route('campanhas');
         return;
       }
-      toast(`${plural(r.enfileirados, 'mensagem', 'mensagens')} na fila${r.pulados ? ` · ${r.pulados} pulada(s) (pediu para parar ou recebeu outra há pouco)` : ''}.`, 'ok', 5000);
+      toast(`${plural(r.enfileirados, 'mensagem', 'mensagens')} na fila${r.pulados ? ` · ${r.pulados} pulada(s) (pediu para parar ou recebeu outra há pouco)` : ''}${r.dias > 1 ? ` · escalonadas em ${r.dias} dias (limite de ${r.limitePorDia}/dia)` : ''}.`, 'ok', 6000);
       closeModal(); refreshBadge();
       if (state.route === 'campanhas' || state.route === 'mensagens') route(null, { quieto:true });
     } catch (e) { toast(e.message, 'err'); btn.disabled = false; }
@@ -1293,6 +1342,7 @@ async function abrirFicha(id, quieto = false) {
         <div class="ficha-item${r.faltas ? ' atrasada' : ''}"><small>Faltas</small><b>${r.faltas ?? 0}</b><span>${r.proximo_horario ? `próximo ${esc(dataBR(r.proximo_horario))}` : 'sem horário marcado'}</span></div>
         <div class="ficha-item"><small>Satisfação</small><b>${f.respostas?.length ? Math.round((f.respostas.filter(x => x.satisfeito).length / f.respostas.length) * 100) + '%' : '—'}</b><span>${f.respostas?.length ? plural(f.respostas.length, 'resposta', 'respostas') : 'sem resposta'}</span></div>
       </div>
+      ${window.R5 ? window.R5.htmlLigacoes(f.ligacoes, c) : ''}
       <div class="g-sec"><h4>Mensagens <small>${plural(f.envios?.length || 0, 'recente', 'recentes')}</small></h4>
         ${f.envios?.length ? f.envios.map(e => `<div class="mini-envio"><div class="m-top"><span>${TIPO[e.tipo]?.emoji || '✉️'} ${esc(TIPO[e.tipo]?.rotulo || e.tipo)} · ${esc(dataHoraBR(e.enviado_em || e.enviar_em))}</span>${pillStatus(e.status)}${e.agendou_depois_id ? `<span class="selo-agendou">${svg(I.calendar)} agendou depois</span>` : ''}</div>
             <div class="m-corpo">${esc(e.corpo)}</div>
@@ -1535,7 +1585,7 @@ document.addEventListener('keydown', e => {
   else if (e.key === '/') { const busca = $('.view .search input'); if (busca) { e.preventDefault(); busca.focus(); busca.select(); } }
 });
 
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 
 /* ============================================================
    FAIXA DE SAÚDE — o vigia carimba em vigia_estado o problema atual.
@@ -1630,6 +1680,7 @@ async function abrirApp() {
   carregarSaude();
   await route('inicio');
   await abrirPorLink();
+  window.R5?.abrirAtalho();
   window.R4?.talvezTour();
 }
 
@@ -1855,6 +1906,7 @@ function pintarIntencoes(r, st) {
 
 /* ---- RELATÓRIO por régua (gráfico simples de 8 semanas) ---- */
 async function abrirRelatorio(regua = 'todas') {
+  if (window.R5?.abrirRelatorio) return window.R5.abrirRelatorio(regua); // rodada 5: período e por régua
   const titulo = regua === 'todas' ? 'Relatório · todas as mensagens' : `Relatório · ${TIPO[regua]?.rotulo || regua}`;
   openModal(`<div class="modal-head"><h3>📊 ${esc(titulo)}</h3><button type="button" class="modal-close" aria-label="Fechar">×</button></div>
     <div class="modal-body"><div class="field"><label for="relRegua">Régua</label><select id="relRegua">
@@ -1924,7 +1976,7 @@ $('#btnAjuda')?.addEventListener('click', abrirAjuda);
 
 /* ---- baixar CSV (precisa do login: vem por fetch e vira arquivo) ---- */
 async function baixarCSV(params) {
-  const r = await fetch('/api/envios.csv' + (params.toString() ? `?${params}` : ''), { headers: await authCabecalhos() });
+  const r = await fetch(API + '/envios.csv' + (params.toString() ? `?${params}` : ''), { headers: await authCabecalhos() });
   if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.erro || 'Não deu para exportar.'); }
   const blob = await r.blob();
   const a = document.createElement('a');
@@ -1950,7 +2002,7 @@ function htmlSugestao(sg) {
   let guardada = null;
   try { guardada = JSON.parse(localStorage.getItem('comunicar_config') || 'null'); } catch { /* sem localStorage */ }
   try {
-    const pedido = (window.Acordar ? window.Acordar.buscar('/api/config') : fetch('/api/config')).then(r => r.json());
+    const pedido = (window.Acordar ? window.Acordar.buscar(API + '/config') : fetch(API + '/config')).then(r => r.json());
     CONFIG = guardada?.configurado ? guardada : await pedido;
     pedido.then(c => { try { if (c?.configurado) localStorage.setItem('comunicar_config', JSON.stringify(c)); } catch { /* cheio */ } }).catch(() => {});
   }
@@ -2011,9 +2063,11 @@ async function pintarAprovacoes() {
       <span class="panel-sub">${r.aguardando ? plural(r.aguardando, 'aguardando', 'aguardando') : 'nenhuma aguardando'}</span></div>
     <div class="panel-body lista">${lista.map(c => {
       const [rot, cor] = STATUS_CAMP[c.status] || [c.status, 'bp-gray'];
-      const alvo = c.segmento?.filtro ? `${(state.segmentos || []).find(s => s.id === c.segmento.filtro)?.rotulo || c.segmento.filtro}${c.segmento.valor ? ` (${c.segmento.valor})` : ''}` : 'clientes escolhidos';
+      const alvo = c.segmento?.filtro ? `${(state.segmentos || []).find(s => s.id === c.segmento.filtro)?.rotulo || c.segmento.filtro}${c.segmento.valor ? ` (${c.segmento.valor})` : ''}` : `lista de ${Array.isArray(c.destinos) ? c.destinos.length : (c.total_previsto ?? '?')} clientes`;
+      // rodada 5: o CRM também propõe campanhas (origem 'crm'); sem a coluna, lista de destinos sem segmento é do CRM
+      const doCrm = c.origem === 'crm' || (!c.origem && !c.segmento && Array.isArray(c.destinos));
       return `<article class="aprov${c.id === state.campanhaEmFoco ? ' foco' : ''}" data-camp="${esc(c.id)}">
-        <div class="aprov-topo"><span class="badge-pill ${cor}">${esc(rot)}</span>
+        <div class="aprov-topo"><span class="badge-pill ${cor}">${esc(rot)}</span>${doCrm ? '<span class="badge-pill bp-purple" title="Proposta criada no CRM (leads/pipeline)">🚩 veio do CRM</span>' : ''}
           <small>${esc(c.criado_por_nome || 'atendente')} · ${esc(relativo(c.created_at))} · ${c.total_previsto ?? '?'} clientes · ${esc(alvo)}${c.enviar_em ? ` · para ${esc(dataHoraBR(c.enviar_em))}` : ''}</small></div>
         <div class="envio-corpo">${esc(c.corpo)}</div>
         ${c.status === 'recusada' && c.motivo_recusa ? `<p class="form-msg erro">Motivo: ${esc(c.motivo_recusa)}</p>` : ''}

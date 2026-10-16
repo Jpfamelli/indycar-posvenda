@@ -68,6 +68,16 @@ export function linkArea(linkBase, token) {
   return `${b}/minha/?c=${encodeURIComponent(token)}`;
 }
 
+/** O texto usa o link de acompanhamento da ordem do Pátio? */
+export const usaLinkOs = (corpo) => /\{link_os\}/.test(String(corpo || ''));
+
+/** {link_base}/acompanhar/?t=<token_publico> — o mesmo link que o Pátio manda ao cliente. */
+export function linkOs(linkBase, token) {
+  const b = String(linkBase || PATIO_URL).trim().replace(/\/+$/, '');
+  if (!/^https:\/\//i.test(b) || !TOKEN_RE.test(String(token || ''))) return null;
+  return `${b}/acompanhar/?t=${encodeURIComponent(token)}`;
+}
+
 /** O modelo pronto da biblioteca (o mesmo que vai para comunicar_modelos). */
 export const MODELO_CONVITE_AREA = {
   titulo: 'Convite para a Área do Cliente',

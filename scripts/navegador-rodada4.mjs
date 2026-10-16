@@ -51,9 +51,9 @@ for (const larg of [1440, 375]) {
   {
     const page = await abrir(larg, 'papel=admin&semente=1&saude=erro&tour=0');
     ok(larg, 'admin: "Pronto para ligar" aparece no Início', await visivel(page, '#painelPronto .pronto'));
-    ok(larg, 'pronto: 11 itens, a chave recusada é "falta" com o link do Atendimento', await conta(page, '.pronto-lista .pi') === 11
+    ok(larg, 'pronto: 12 itens, a chave recusada é "falta" com o link do Atendimento', await conta(page, '.pronto-lista .pi') === 12
       && await page.evaluate(() => !!document.querySelector('.pi.falta a[href*="indycar-atendimento"]')));
-    ok(larg, 'pronto: anel com a contagem acessível', /de 11 itens prontos/.test(await page.$eval('.pronto-anel', (e) => e.getAttribute('aria-label'))));
+    ok(larg, 'pronto: anel com a contagem acessível', /de 12 itens prontos/.test(await page.$eval('.pronto-anel', (e) => e.getAttribute('aria-label'))));
     ok(larg, 'indicadores por pessoa (Equipe · 30 dias)', await visivel(page, '#painelPessoas') && /Equipe/.test(await texto(page, '#painelPessoas h2')));
     ok(larg, 'início sem rolagem lateral', await semRolagemLateral(page));
     await foto(page, `admin-pronto-${larg}`);

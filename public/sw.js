@@ -2,13 +2,16 @@
 // rodada 4, abre a CASCA do app do cache quando o servidor está dormindo/fora
 // (Render gratuito: 503 "hibernate-wake-error"). Os dados continuam sempre da
 // rede — quem espera o servidor acordar é o acordar.js, com aviso na tela.
-const VERSAO = '4.0.0';
+// Rodada 5: tudo RELATIVO ao lugar onde o SW foi registrado (BASE) — funciona em
+// "/" sozinho e em "/comunicar/" dentro da IndyCar Central (escopo do prefixo).
+const VERSAO = '5.0.0';
 const CACHE = `comunicar-v${VERSAO}`;
 const EXTERNO = 'comunicar-externo-v1'; // supabase-js e fontes (versão fixa na URL)
+const BASE = new URL('./', self.location.href).pathname; // '/' ou '/comunicar/'
 /* Se QUALQUER item desta lista faltar, o addAll rejeita e o service worker
    NÃO instala. Mantenha só o que existe de verdade (e as MESMAS URLs do index.html). */
-const CORE = ['/', `/styles.css?v=${VERSAO}`, `/acordar.js?v=${VERSAO}`, `/conta.js?v=${VERSAO}`, `/app.js?v=${VERSAO}`,
-  `/rodada4.js?v=${VERSAO}`, '/manifest.json', '/icon-192.png', '/icon-512.png', '/logo.png'];
+const CORE = [BASE, ...['styles.css', 'apps.js', 'acordar.js', 'conta.js', 'app.js', 'rodada4.js', 'rodada5.js'].map((a) => `${BASE}${a}?v=${VERSAO}`),
+  `${BASE}manifest.json`, `${BASE}icon-192.png`, `${BASE}icon-512.png`, `${BASE}logo.png`];
 const EXTERNOS_OK = /^https:\/\/(cdn\.jsdelivr\.net\/npm\/@supabase\/supabase-js@\d|fonts\.googleapis\.com\/|fonts\.gstatic\.com\/)/;
 
 /* NUNCA entra no cache: a API (dado de cliente muda a cada minuto e carrega
@@ -17,7 +20,7 @@ function passaDireto(req) {
   if (req.method !== 'GET') return true;
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return !EXTERNOS_OK.test(req.url);
-  return url.pathname.startsWith('/api/') || url.pathname === '/api';
+  return url.pathname.startsWith(`${BASE}api/`) || url.pathname === `${BASE}api`;
 }
 
 self.addEventListener('install', (e) => {
@@ -52,11 +55,11 @@ self.addEventListener('fetch', (e) => {
   }
 
   // a página: rede por até 4 s; servidor fora (5xx), sem rede ou lento → a casca do cache
-  if (req.mode === 'navigate' || url.pathname === '/' || url.pathname === '/index.html') {
+  if (req.mode === 'navigate' || url.pathname === BASE || url.pathname === `${BASE}index.html`) {
     e.respondWith(
       redeAte(req, 4000)
-        .then((r) => (r.ok ? guardar(CACHE, '/', r) : caches.match('/').then((m) => m || r)))
-        .catch(() => caches.match('/').then((m) => m || fetch(req)))
+        .then((r) => (r.ok ? guardar(CACHE, BASE, r) : caches.match(BASE).then((m) => m || r)))
+        .catch(() => caches.match(BASE).then((m) => m || fetch(req)))
     );
     return;
   }
@@ -65,7 +68,7 @@ self.addEventListener('fetch', (e) => {
   e.respondWith(
     caches.match(req).then((m) => {
       const novo = fetch(req).then((r) => (r.ok && r.type === 'basic' ? guardar(CACHE, req, r) : r)).catch(() => null);
-      return m || novo.then((r) => r || caches.match('/'));
+      return m || novo.then((r) => r || caches.match(BASE));
     })
   );
 });

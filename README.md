@@ -83,6 +83,42 @@ A IA trabalha nas mensagens, mas **nunca fala sozinha com o cliente**:
   boas-vindas por papel e ajuda "Como faço…" com busca. Rascunhos no aparelho.
 - Migração `comunicar_rodada4` (`scripts/sql/2026-10-14_comunicar_rodada4.sql`).
 
+## Carteiro à prova de falhas, saúde do WhatsApp e Central (rodada 5)
+
+- **WhatsApp separado** (`whatsapp.js`, testado com um CodeWords de MENTIRA): cada erro vira
+  uma CLASSE — `chave_recusada` ≠ `numero_invalido` ≠ `instabilidade` ≠ `desconectado` ≠
+  `limite` ≠ `nao_entregue` — gravada em `posvenda_envios.erro_classe`. Estrutural para a
+  rodada (todos falhariam igual); definitivo falha de vez; o resto tenta de novo com
+  espera CRESCENTE (5, 15, 45 min; `MAX_TENTATIVAS=4`). `{"success":false}` não é entrega.
+- **Cadência segura** (Réguas › Envio): limite por minuto (padrão 10), por hora (60) e
+  por dia (300 — campanha maior é escalonada nos dias seguintes, na hora de envio),
+  `intervalo_mesmo_cliente_min` (60: dois avisos para o mesmo cliente não saem em
+  sequência; lembrete e Pátio não esperam) e "só horário da loja" (seg–sáb 8h–17h30).
+  Fila ordenada por PRIORIDADE (`carteiro.js › PRIORIDADE`: pátio pronto › extra ›
+  lembrete › … › campanha) para quando o CodeWords volta e a fila acumulou.
+- **Saúde do WhatsApp** (Início, `GET /api/whatsapp/saude`): estado, motivo em português,
+  o que fazer e o botão "Colar a chave no Atendimento" (`/?aba=integracoes`); falhas das
+  24 h por classe; `POST /api/whatsapp/reconferir` (gestor) esquece a chave em cache.
+  O carteiro grava o último estado em `posvenda_config.whatsapp_estado`.
+- **Réguas**: `{link_os}` (acompanhar a ordem do Pátio do horário) e `{link_area}`
+  (Área do Cliente, um link por cliente) — sem o link a mensagem NÃO sai (fica em
+  "pulados" da prévia com o motivo); "ver como um cliente real" (`GET /api/previa/mensagem`);
+  prioridade e janela de silêncio em cada cartão; relatório com período e por régua
+  (`GET /api/relatorio?de&ate`, `GET /api/relatorio/reguas`: enviadas, responderam,
+  agendaram depois, pediram para parar, falharam).
+- **Campanhas**: segmentos salvos (`comunicar_segmentos`, `GET/POST/DELETE /api/segmentos/salvos`),
+  prévia com quem fica de fora e por quê (`/api/segmentos/previa` → `pulados`, `recentes`),
+  "Mandar para o meu celular" (`POST /api/envios/teste-meu`, telefone do perfil).
+- **Conectar**: ficha com "Nos outros apps" (rpc `cliente_360` pelo telefone normalizado:
+  conversa, lead, carro na oficina, orçamentos, tarefas, indicações), "Onde toca" em cada
+  mensagem (`GET /api/envios/:id/ligacoes`), `GET /api/clientes/360?tel=`; buscas por
+  `telefone_e164`. Links de todos os apps num lugar só: `public/apps.js` (tela e servidor).
+- **Central (onda B2)**: `server.js` exporta `{ handler, iniciar, ligarCarteiro, VERSAO }`
+  e só dá `listen` quando é o programa principal; aceita `req.prefixo` ou a variável
+  `PREFIXO` (ex.: `/comunicar`) — `/api/config` devolve `prefixo`. Frontend, service
+  worker e manifest são RELATIVOS (funcionam em `/` e em `/comunicar/`). Abra sempre
+  com a barra final (`/comunicar/`). Migração `comunicar_rodada5`.
+
 ## Conectividade
 
 - "Abrir conversa" → `indycar-atendimento.onrender.com/?tel=<telefone>`; a ficha tem
@@ -101,10 +137,11 @@ npm start            # produção local (precisa de .env com SUPABASE_*)
 npm run dev          # com --watch
 npm run mock         # tela com dados de MENTIRA em http://localhost:3511 — sem login
 npm run check        # node --check em tudo
-npm test             # 94 testes (funções puras, IA falsa, carteiro, papéis, aprovação, automações, API, rodada 4) — sem banco
+npm test             # 126 testes (funções puras, IA falsa, carteiro, papéis, aprovação, automações, API, rodadas 4 e 5, CodeWords falso) — sem banco
 npm run segredos     # nenhuma chave nos arquivos versionados nem no histórico
 npm run navegador    # roteiro puppeteer da rodada 3 em 1440 e 375 px contra o mock (precisa do mock no ar)
 npm run navegador4   # roteiro da rodada 4 (pronto, carteiro, 30 dias, aniversários, tour, acordando)
+npm run navegador5   # roteiro da rodada 5 (saúde do WhatsApp, cadência, prévia real, relatório, segmentos, onde toca, ficha 360)
 node scripts/conferir-banco.mjs [--ia] [--tudo]   # leituras no banco real (+ poucas chamadas reais de IA)
 node scripts/conferir-rodada4.mjs                 # leituras da rodada 4 no banco real (nada é gravado)
 ```
@@ -144,7 +181,9 @@ No modo `mock` (o porteiro é o `acesso.js` de verdade):
 - `public/conta.js` — login, senha, duas etapas, sem acesso, menu do perfil, sino e tarefas
 - `dados.js` — réguas (geradores), segmentos, porteiro de consentimento, resumo, feriados, histórico no Atendimento, relatório, CSV
 - `ia.js` — IA: escrever, ler respostas, sugerir público, resumo; validação das regras da casa
-- `carteiro.js` — regras puras do envio tolerante (validade, reserva, lembrete, reforço, resumo 24 h)
+- `carteiro.js` — regras puras do envio tolerante (validade, reserva, lembrete, reforço, resumo 24 h, prioridade, cadência, limite diário)
+- `whatsapp.js` — CodeWords: enviar/status com configuração injetada, classes de erro e o painel "Saúde do WhatsApp" (puro)
+- `public/apps.js` — endereços e links dos apps do ecossistema (tela E servidor) · `public/rodada5.js` — telas da rodada 5
 - `prontidao.js` · `projecao.js` · `aniversarios.js` — checklist, prévia do mês e leitura de aniversários (puros)
 - `estaticos.js` — arquivos da tela em memória, br/gzip e ETag
 - `public/acordar.js` — "o sistema está acordando" · `public/rodada4.js` — telas da rodada 4
@@ -159,3 +198,11 @@ No modo `mock` (o porteiro é o `acesso.js` de verdade):
 O Render gratuito dorme. O `pg_cron` do Supabase (de 15 em 15 min + reforço de 5 em 5
 quando a chamada falha) e o GitHub Actions chamam `POST /api/rodar?origem=…` com o
 `RUNNER_TOKEN` para acordar o carteiro. Histórico das 24 h: Início › "carteiro rodou…".
+
+**A URL que o pg_cron chama** fica em `posvenda_config.carteiro_url` — hoje
+`https://indycar-posvenda.onrender.com/api/rodar` (jobs `comunicar-carteiro` e
+`comunicar-carteiro-reforco` → funções `comunicar_carteiro_chamar`/`comunicar_carteiro_reforco`,
+que leem a URL e o `runner_token` dessa linha). Quando o Comunicar passar a viver na Central
+(`/comunicar/`), troque SÓ esse valor com um UPDATE (modelo pronto em
+`scripts/sql/trocar-carteiro-url.sql`) e a URL fixa em `.github/workflows/carteiro.yml`;
+o `RUNNER_TOKEN` do servidor da Central tem de ser o mesmo `runner_token`.

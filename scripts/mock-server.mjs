@@ -36,7 +36,11 @@ import { projetarMes } from '../projecao.js';
 import { resumirCarteiro } from '../carteiro.js';
 import { lerLista, casarComClientes, resumirAnalise, montarSugestoes, lerData } from '../aniversarios.js';
 import { montarIndicadores } from '../dados.js';
-import { MODELO_CONVITE_AREA, usaLinkArea, linkArea } from '../patio.js';
+import { MODELO_CONVITE_AREA, usaLinkArea, linkArea, linkOs, PATIO_URL } from '../patio.js';
+// rodada 5: as MESMAS funções puras do servidor (saúde do WhatsApp, pulados do segmento, relatório por régua, ligações)
+import { montarSaude, classificarErro } from '../whatsapp.js';
+import { peneirarSegmento, montarRelatorioPorRegua, montarLigacoes } from '../dados.js';
+import { LINKS } from '../acesso.js';
 
 /* IA de MENTIRA: o mock usa as funções REAIS do ia.js (validação, correção de
    vocabulário, prévia) com um cliente falso — nada vai para a Anthropic. */
@@ -85,7 +89,7 @@ const mes = hoje().slice(5, 7);
 const PID = (n) => `00000000-0000-4000-9000-${String(n).padStart(12, '0')}`;
 const TODOS_APPS = ['atendimento', 'crm', 'agenda', 'comunicar', 'orcador', 'ads'];
 const PERFIS = {
-  admin:        { id: PID(1), nome:'João Pedro Famelli', email:'joao@indycartaubate.com', papel:'admin', ativo:true, apps: TODOS_APPS, cargo:'Dono' },
+  admin:        { id: PID(1), nome:'João Pedro Famelli', email:'joao@indycartaubate.com', papel:'admin', ativo:true, apps: TODOS_APPS, cargo:'Dono', telefone:'12988887777' },
   gestor:       { id: PID(2), nome:'Gisele Prado', email:'gisele@indycartaubate.com', papel:'gestor', ativo:true, apps:['comunicar', 'crm', 'atendimento'], cargo:'Gerente' },
   atendente:    { id: PID(3), nome:'Leonardo', email:'leonardo@indycartaubate.com', papel:'atendente', ativo:true, apps:['comunicar', 'atendimento', 'crm', 'agenda'], cargo:'Consultor' },
   atendente2:   { id: PID(4), nome:'Bia Ramos', email:'bia@indycartaubate.com', papel:'atendente', ativo:true, apps:['comunicar', 'atendimento'] },
@@ -140,6 +144,9 @@ const CFG = {
   intervalo_minimo_dias:7, janela_inicio:8, janela_fim:20, hora_envio:'09:30', link_avaliacao:'https://g.page/r/indycar-taubate/review',
   envia_domingo:false, pausa_geral:false, telefone_teste:'12988887777', carteiro_configurado:true, updated_at: diasAtras(3),
   limite_por_hora:60, ia_resumo:null, ia_resumo_em:null,
+  // rodada 5: cadência segura e o estado do WhatsApp que o carteiro gravou
+  limite_por_minuto:10, limite_por_dia:300, intervalo_mesmo_cliente_min:60, so_horario_comercial:false,
+  whatsapp: { estado:'chave_recusada', em: diasAtras(8), motivo:'A chave do CodeWords foi recusada (401).' },
 };
 
 // ---- regras de retorno e modelos (iguais ao SQL da migração) ---------------
@@ -201,6 +208,7 @@ const ENVIOS_SEMENTE = [
   env(C(2), 'patio_extra', { corpo: `Oi ${C(2).nome.split(' ')[0]}, encontramos um item que precisa da sua decisão no ${C(2).carro}. Veja a foto e aprove ou recuse por aqui: https://indycar-patio.netlify.app/acompanhar/?t=ab12…`, criado_por:'patio', enviar_em: horasAtras(0.5), created_at: horasAtras(0.5) }),
   env(C(5), 'patio_pronto', { corpo: `Boa notícia, ${C(5).nome.split(' ')[0]}! O ${C(5).carro} está pronto para retirada. Seg a sáb, 8h às 17h30. 🏁`, criado_por:'patio', ...enviado(8, { resposta:'Passo aí às 17h!', respondido_em: horasAtras(7.5) }) }),
   env(C(8), 'area_cliente', { corpo: `Oi ${C(8).nome.split(' ')[0]}! Agora você tem a sua Área do Cliente da IndyCar… https://indycar-patio.netlify.app/minha/?c=f00d… 🏁`, criado_por:'Leonardo', ...enviado(30) }),
+  env(C(10), 'remarcacao', { corpo: `Oi ${C(10).nome.split(' ')[0]}! Seu horário na IndyCar mudou: agora é ${quandoRelativo(somarDias(hoje(), 2), '14:00')}. Qualquer coisa, é só responder. 🏁`, criado_por:'agenda', ...enviado(1) }),
   env(C(0), 'lembrete', { corpo: renderTemplate(CFG.msg_lembrete, { nome:C(0).nome, carro:C(0).carro, servico:'revisão de freios', quando: quandoRelativo(somarDias(hoje(), 1), '09:00') }), enviar_em: horasAtras(-2) }),
   env(C(10), 'lembrete', { corpo: renderTemplate(CFG.msg_lembrete, { nome:C(10).nome, carro:C(10).carro, servico:'diagnóstico com scanner', quando: quandoRelativo(hoje(), '15:30') }), ...enviado(3, { resposta:'Confirmado, obrigado!', respondido_em: horasAtras(2.5) }) }),
   env(C(1), 'posvenda', { corpo: renderTemplate(CFG.msg_posvenda, { nome:C(1).nome, carro:C(1).carro, servico:'troca de óleo de câmbio' }), ...enviado(26, { resposta:'Ficou ótimo, carro tá outro! 👍', respondido_em: horasAtras(25) }) }),
@@ -251,6 +259,8 @@ function semearR3() {
   TAREFAS.push(tarefa(PID(1), 'Conferir a chave do CodeWords', 'Régua Reativação: 3 mensagens falharam.', null, 2, 20, { origem:'manual' }));
   CAMPANHAS.push({ id: uuid(), status:'aguardando', corpo: MODELOS[0].corpo, detalhe:null, segmento:{ filtro:'todos', valor:null }, destinos:null, total_previsto: 10,
     enviar_em:null, criado_por: PID(3), criado_por_nome:'Leonardo', decidido_por:null, decidido_por_nome:null, decidido_em:null, motivo_recusa:null, created_at: horasAtras(3) });
+  CAMPANHAS.push({ id: uuid(), status:'aguardando', origem:'crm', corpo: 'Oi {primeiro_nome}! Seu orçamento do {carro} ainda está de pé — quer que eu reserve um horário? 🏁', detalhe:null, segmento:null, destinos:[C(1), C(3), C(4)].map((c) => ({ cliente_id: c.id, telefone: c.telefone, nome: c.nome, carro: c.carro, placa: c.placa })), total_previsto: 3,
+    enviar_em:null, criado_por: PID(3), criado_por_nome:'Leonardo (CRM)', decidido_por:null, decidido_por_nome:null, decidido_em:null, motivo_recusa:null, created_at: horasAtras(1) });
   CAMPANHAS.push({ id: uuid(), status:'recusada', corpo: MODELOS[1].corpo, detalhe:null, segmento:{ filtro:'sem_voltar', valor:6 }, destinos:null, total_previsto: 4,
     enviar_em:null, criado_por: PID(3), criado_por_nome:'Leonardo', decidido_por: PID(2), decidido_por_nome:'Gisele Prado', decidido_em: horasAtras(50), motivo_recusa:'Esta semana não: o pátio está cheio.', created_at: horasAtras(52) });
 }
@@ -278,6 +288,13 @@ let RESPOSTAS = [
 
 // ---- saúde e carteiro -------------------------------------------------------
 let SAUDE_OK = false;
+let WA_MODO = null; // rodada 5 (null = segue SAUDE_OK)
+let SEGMENTOS_SALVOS = [];
+const semearSegmentos = () => { SEGMENTOS_SALVOS = [
+  { id: uuid(), nome:'Sumidos há 6 meses', filtro:'sem_voltar', valor:'6', criado_por: PID(1), criado_por_nome:'João Pedro Famelli', usado_em: diasAtras(3), usos: 2, created_at: diasAtras(20) },
+  { id: uuid(), nome:'Fizeram óleo', filtro:'servico', valor:'óleo', criado_por: PID(3), criado_por_nome:'Leonardo', usado_em: null, usos: 0, created_at: diasAtras(2) },
+]; };
+semearSegmentos();
 // rodada 4: Render dormindo de mentira e o histórico do carteiro (24 h com dois 503 e um tempo esgotado)
 let DORMIR_ATE = 0, CHAMADAS_DORMINDO = 0, PRONTO_TUDO = false;
 const minAtras = (n) => new Date(Date.now() - n * 60000).toISOString();
@@ -405,6 +422,45 @@ window.supabase={createClient:function(){return{auth:{
     enroll:async function(){var f={id:'f'+(fatores.length+2),status:'unverified',friendly_name:'Comunicar'};fatores.push(f);return{data:{id:f.id,totp:{qr_code:'data:image/svg+xml;utf8,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="180" height="180"><rect width="180" height="180" fill="#fff"/><rect x="20" y="20" width="40" height="40"/><rect x="120" y="20" width="40" height="40"/><rect x="20" y="120" width="40" height="40"/><rect x="80" y="80" width="20" height="20"/></svg>'),secret:'JBSWY3DPEHPK3PXP'}},error:null}},
     unenroll:async function(a){fatores=fatores.filter(function(f){return f.id!==a.factorId});return{data:{},error:null}}}}}}};})();</script>`;
 
+/** Status do WhatsApp conforme ?whatsapp= (rodada 5) ou ?saude= */
+function statusWA() {
+  const modo = WA_MODO || (SAUDE_OK ? 'ok' : 'recusada');
+  if (modo === 'ok') return { ok:true, conectado:true, numero:'5512997000000' };
+  if (modo === 'desconectado') return { ok:true, conectado:false, classe:'desconectado', situacao:'disconnected', numero:'5512997000000' };
+  if (modo === 'instavel') return { ok:false, classe:'instabilidade', erro:'O CodeWords respondeu 502.' };
+  if (modo === 'numero') return { ok:true, conectado:true, numero:'5512997000000' };
+  return { ok:false, chaveRecusada:true, classe:'chave_recusada', erro:'A chave do CodeWords foi recusada (401).' };
+}
+/** Candidatos BRUTOS do segmento (antes de tirar opt-out/sem telefone) — a peneira real decide. */
+function segmentarBruto(filtro, valor) {
+  switch (filtro) {
+    case 'todos': return CLIENTES.slice();
+    case 'aniversariantes_mes': return CLIENTES.filter((c) => c.nascimento && c.nascimento.slice(5, 7) === mes);
+    case 'atendidos': { const d = Number(valor) || 90; const ids = new Set(AG.filter((a) => a.status === 'concluido' && a.data >= somarDias(hoje(), -d)).map((a) => a.cliente.id)); return CLIENTES.filter((c) => ids.has(c.id)); }
+    case 'sem_voltar': { const mz = Number(valor) || 6; const ids = new Set(AG.filter((a) => a.status === 'concluido' && a.data <= somarDias(hoje(), -mz * 30)).map((a) => a.cliente.id)); return CLIENTES.filter((c) => ids.has(c.id)); }
+    case 'faltaram': { const ids = new Set(AG.filter((a) => a.status === 'nao_veio').map((a) => a.cliente.id)); return CLIENTES.filter((c) => ids.has(c.id)); }
+    case 'servico': { const pz = String(valor || '').toLowerCase(); if (pz.length < 2) return []; const ids = new Set(AG.filter((a) => a.status === 'concluido' && a.servico.toLowerCase().includes(pz)).map((a) => a.cliente.id)); return CLIENTES.filter((c) => ids.has(c.id)); }
+    default: return null;
+  }
+}
+/** O que a rpc cliente_360 devolveria para um cliente de mentira (conversa, lead, pátio, tarefas). */
+function c360Mock(c, tel) {
+  if (!c) return { telefone: tel, conversa: null, leads: [], patio: [], orcamentos: [], tarefas: [], agendamentos: [], indicacoes: {}, resumo: null };
+  const ags = AG.filter((a) => a.cliente.id === c.id);
+  const i = CLIENTES.indexOf(c);
+  return {
+    telefone: digitos(c.telefone),
+    conversa: i % 3 !== 1 ? { id: PID(500 + i), status:'aberta', etapa: ['Novo contato', 'Orçamento', 'Agendado'][i % 3], atribuida_a_nome: i % 2 ? 'Leonardo' : null, aguardando_consultor: i === 2 } : null,
+    leads: i % 2 === 0 ? [{ id: PID(600 + i), status: ['orcamento', 'agendado', 'concluido'][i % 3], servico: ags[0]?.servico || 'Revisão', valor_orcado: 450, responsavel_nome: 'Leonardo', created_at: diasAtras(5) }] : [],
+    patio: i === 0 ? [{ id: PID(700), numero: 1042, etapa:'em_execucao', veiculo: c.carro, placa: c.placa, extras_pendentes: 1, link_cliente: `${PATIO_URL}/acompanhar/?t=ab12cd34ef56ab12cd34ef56` }] : (i === 5 ? [{ id: PID(705), numero: 1031, etapa:'entregue', veiculo: c.carro, placa: c.placa, extras_pendentes: 0 }] : []),
+    orcamentos: i === 2 ? [{ id: PID(800), status:'enviado', total: 890, created_at: diasAtras(2) }] : [],
+    tarefas: TAREFAS.filter((t) => t.cliente_id === c.id && t.status === 'aberta').map((t) => ({ id: t.id, titulo: t.titulo, vence_em: t.vence_em, responsavel_nome: nomeDe(t.responsavel_id), origem: t.origem })),
+    agendamentos: ags.slice(0, 5).map((a) => ({ id: a.id, data: a.data, hora: a.hora, servico: a.servico, status: a.status, consultor_nome: 'Leonardo' })),
+    indicacoes: i === 7 ? { fez: [{}, {}], foi_indicado_por: null } : (i === 8 ? { fez: [], foi_indicado_por: { nome: 'Maria Aparecida Souza' } } : {}),
+    resumo: { mensagens_total: 12 + i, leads_abertos: i % 2 === 0 ? 1 : 0, total_gasto: ags.filter((a) => a.status === 'concluido').reduce((s2, a) => s2 + a.valor, 0), ultima_visita: ags.find((a) => a.status === 'concluido')?.data || null },
+  };
+}
+
 http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const p = url.pathname, m = req.method;
@@ -412,13 +468,15 @@ http.createServer(async (req, res) => {
     if (p === '/' || p === '/index.html') {
       if (url.searchParams.has('papel')) { const k = url.searchParams.get('papel'); PAPEL = PERFIS[k] ? k : 'admin'; }
       LOGADO = url.searchParams.get('logado') !== '0';
-      if (url.searchParams.get('semente') === '1') { semearEnvios(); semearR3(); for (const c of CLIENTES) c.nascimento = NASC0.get(c.id) ?? null; }
+      if (url.searchParams.get('semente') === '1') { semearEnvios(); semearR3(); semearSegmentos(); WA_MODO = null; for (const c of CLIENTES) c.nascimento = NASC0.get(c.id) ?? null; }
       if (url.searchParams.has('saude')) SAUDE_OK = url.searchParams.get('saude') === 'ok';
       if (url.searchParams.has('ia')) IA_LIGADA = url.searchParams.get('ia') !== 'off';
       // rodada 4: ?dormir=20 → por 20 s toda a API responde 503 em HTML (como o Render acordando)
       if (url.searchParams.has('dormir')) DORMIR_ATE = Date.now() + (Number(url.searchParams.get('dormir')) || 20) * 1000;
       // ?pronto=tudo → o checklist sai todo verde (WhatsApp ok, réguas, datas…)
       if (url.searchParams.has('pronto')) PRONTO_TUDO = url.searchParams.get('pronto') === 'tudo';
+      // rodada 5: ?whatsapp=ok|recusada|desconectado|instavel|numero → o painel "Saúde do WhatsApp" em cada estado
+      if (url.searchParams.has('whatsapp')) WA_MODO = url.searchParams.get('whatsapp') || 'recusada';
       const html = fs.readFileSync(path.join(PUBLIC, 'index.html'), 'utf8')
         .replace(/<script src="https:\/\/cdn\.jsdelivr\.net\/npm\/@supabase[^"]*"><\/script>/, dubleSupabase());
       res.writeHead(200, { 'Content-Type': MIME['.html'] }); return res.end(html);
@@ -441,7 +499,7 @@ http.createServer(async (req, res) => {
   const naoGestor = () => json(res, 403, { erro:'Só gestor altera as réguas.' });
   let mm;
 
-  if (p === '/api/config') return json(res, 200, { configurado:true, supabaseUrl:'http://mock.local', supabaseAnonKey:'mock', app:'IndyCar Comunicar', versao:'4.0.0-mock' });
+  if (p === '/api/config') return json(res, 200, { configurado:true, supabaseUrl:'http://mock.local', supabaseAnonKey:'mock', app:'IndyCar Comunicar', versao:'5.0.0-mock', prefixo:'' });
   if (p === '/api/ping') return json(res, 200, { ok:true, versao:'4.0.0-mock' });
 
   /* Porteiro: as MESMAS regras do servidor (acesso.js) — rota, acesso ao app,
@@ -525,7 +583,64 @@ http.createServer(async (req, res) => {
   if (p === '/api/saude') return json(res, 200, SAUDE_OK
     ? { ok:true, problema:null, desde:null, checado_em: agora(), resumo:null, whatsappParado:false, versao:'2.0.0-mock', ultimaRodada }
     : { ok:false, problema:'codewords-fora', desde: diasAtras(8), checado_em: agora(), resumo:'CodeWords respondeu 401 nas últimas 3 checagens.', whatsappParado:true, versao:'2.0.0-mock', ultimaRodada });
-  if (p === '/api/whatsapp/status') return json(res, 200, SAUDE_OK ? { ok:true, conectado:true, numero:'5512997000000' } : { ok:false, chaveRecusada:true, erro:'A chave do CodeWords foi recusada (401).' });
+  if (p === '/api/whatsapp/status') return json(res, 200, statusWA());
+
+  // ---- rodada 5 -------------------------------------------------------------------
+  if (p === '/api/whatsapp/saude' || (p === '/api/whatsapp/reconferir' && m === 'POST')) {
+    if (p.endsWith('reconferir') && !ehGestor()) return json(res, 403, { erro: A.motivo403('rodar'), codigo:'sem_permissao' });
+    const falhas = {};
+    for (const e of ENVIOS) if (e.erro && ['falhou', 'pendente'].includes(e.status)) { const cl = e.erro_classe || classificarErro({ texto: e.erro }).classe; const x = (falhas[cl] ||= { total:0, ultimoErro:null, ultimoEm:null }); x.total++; if (!x.ultimoErro) { x.ultimoErro = e.erro; x.ultimoEm = e.enviar_em; } }
+    const pend = ENVIOS.filter((e) => e.status === 'pendente');
+    const s = montarSaude({ status: statusWA(), falhas24h: falhas, fila: { pendentes: pend.length, atrasados: pend.filter((e) => e.enviar_em <= horasAtras(2)).length }, carteiro: { ultimaEm: ultimaRodada.em, falhas24h: 3 }, estadoGravado: CFG.whatsapp });
+    return json(res, 200, { ...s, cadencia: { porMinuto: CFG.limite_por_minuto, porHora: CFG.limite_por_hora, porDia: CFG.limite_por_dia, mesmoCliente: CFG.intervalo_mesmo_cliente_min, janela: { inicio: CFG.janela_inicio, fim: CFG.janela_fim }, soHorarioComercial: !!CFG.so_horario_comercial }, conferidoEm: agora() });
+  }
+  if (p === '/api/segmentos/salvos' && m === 'GET') return json(res, 200, SEGMENTOS_SALVOS.slice().sort((a, b) => String(b.usado_em || '').localeCompare(String(a.usado_em || '')) || (a.created_at < b.created_at ? 1 : -1)));
+  if (p === '/api/segmentos/salvos' && m === 'POST') {
+    const nome = String(body.nome || '').trim();
+    if (nome.length < 2) return json(res, 400, { erro:'Dê um nome ao segmento (2 a 60 letras).' });
+    if (!SEGMENTOS.some((x) => x.id === body.filtro)) return json(res, 400, { erro:'Segmento desconhecido.' });
+    const sg = { id: uuid(), nome: nome.slice(0, 60), filtro: body.filtro, valor: body.valor == null || body.valor === '' ? null : String(body.valor), criado_por: eu.id, criado_por_nome: eu.nome, usado_em: null, usos: 0, created_at: agora() };
+    SEGMENTOS_SALVOS.unshift(sg); return json(res, 200, sg);
+  }
+  if ((mm = p.match(/^\/api\/segmentos\/salvos\/([0-9a-f-]+)$/)) && m === 'DELETE') {
+    const sg = SEGMENTOS_SALVOS.find((x) => x.id === mm[1]); if (!sg) return json(res, 404, { erro:'Não encontrado.' });
+    if (sg.criado_por !== eu.id && !ehGestor()) return json(res, 403, { erro: A.motivo403('segmentos_apagar'), codigo:'sem_permissao' });
+    SEGMENTOS_SALVOS = SEGMENTOS_SALVOS.filter((x) => x.id !== mm[1]); return json(res, 200, { ok:true });
+  }
+  if (p === '/api/envios/teste-meu' && m === 'POST') {
+    if (!digitos(eu.telefone || '')) return json(res, 400, { erro:'Cadastre seu celular em "Meu perfil" para receber o teste.', codigo:'sem_telefone' });
+    if (!String(body.corpo || '').trim()) return json(res, 400, { erro:'Escreva a mensagem antes de testar.' });
+    if (statusWA().chaveRecusada) return json(res, 502, { erro:'A chave do CodeWords foi recusada (401). Gere uma nova em runtime.codewords.ai e cole em Atendimento › Configurações › Integrações.', classe:'chave_recusada' });
+    return json(res, 200, { ok:true, telefone: '…' + digitos(eu.telefone).slice(-4) });
+  }
+  if (p === '/api/clientes/360') {
+    const tel = digitos(url.searchParams.get('tel') || '');
+    if (tel.length < 10) return json(res, 400, { erro:'Informe o telefone com DDD.' });
+    const c = CLIENTES.find((x) => digitos(x.telefone).endsWith(tel.slice(-10)));
+    return json(res, 200, { telefone: tel, cliente: c ? { id: c.id, nome: c.nome, telefone: c.telefone, carro_modelo: c.carro_modelo, placa: c.placa } : null, ligacoes: montarLigacoes(c360Mock(c, tel)), resumo: null });
+  }
+  if ((mm = p.match(/^\/api\/envios\/([0-9a-f-]+)\/ligacoes$/)) && m === 'GET') {
+    const e = ENVIOS.find((x) => x.id === mm[1]); if (!e) return json(res, 404, { erro:'Não encontrado.' });
+    const c = porId(e.cliente_id); const lig = montarLigacoes(c360Mock(c, e.telefone));
+    const osId = e.tipo?.startsWith('patio_') ? uuid() : null;
+    return json(res, 200, { envio: { id: e.id, tipo: e.tipo, status: e.status, nome: e.nome, telefone: e.telefone, cliente_id: e.cliente_id },
+      links: { conversa: lig?.conversa?.link || LINKS.conversaTel(e.telefone), lead: lig?.leads?.[0]?.link || null, agendamento: e.agendamento_id ? LINKS.agendamento(e.agendamento_id) : (lig?.agendamentos?.[0]?.link || null), os: LINKS.os(osId || lig?.carroNaOficina?.id || null), cliente_crm: LINKS.clienteCrm(e.cliente_id, e.telefone) }, ligacoes: lig });
+  }
+  if (p === '/api/relatorio/reguas') {
+    const de = dataBanco(url.searchParams.get('de')) || somarDias(hoje(), -30), ate = dataBanco(url.searchParams.get('ate')) || hoje();
+    const l = ENVIOS.filter((e) => e.enviar_em >= instanteSP(de, '00:00').toISOString() && e.enviar_em < instanteSP(somarDias(ate, 1), '00:00').toISOString());
+    return json(res, 200, { periodo: { de, ate }, linhas: montarRelatorioPorRegua(l) });
+  }
+  if (p === '/api/previa/mensagem') {
+    const c = porId(url.searchParams.get('cliente_id')); if (!c) return json(res, 404, { erro:'Não encontrado.' });
+    const corpo = String(url.searchParams.get('corpo') || '');
+    const a = AG.filter((x) => x.cliente.id === c.id).sort((x, y) => (x.data < y.data ? 1 : -1))[0] || null;
+    const temOs = a && c.id === C(0).id;
+    const links = { link_os: /\{link_os\}/.test(corpo) ? (temOs ? linkOs(null, 'ab12cd34ef56ab12cd34ef56') : '') : undefined, link_area: /\{link_area\}/.test(corpo) ? `${PATIO_URL}/minha/?c=(link-do-cliente)` : undefined };
+    const falta = /\{link_os\}/.test(corpo) && !links.link_os ? 'sem ordem no Pátio para este horário (o {link_os} ficaria vazio)' : null;
+    const texto = renderTemplate(corpo, { nome: c.nome, carro: c.carro, placa: c.placa, servico: a?.servico || 'o serviço', meses: CFG.meses_retorno, quando: a ? quandoRelativo(a.data, a.hora) : 'amanhã às 09:00', link_avaliacao: CFG.link_avaliacao, detalhe:'…', ...links });
+    return json(res, 200, { cliente: { id: c.id, nome: c.nome, telefone: c.telefone, carro: c.carro, placa: c.placa }, agendamento: a ? { id: a.id, data: a.data, hora: a.hora, servico: a.servico, status: a.status } : null, texto, falta });
+  }
 
   if ((p === '/api/comunicar/config' || p === '/api/posvenda/config') && m === 'GET') return json(res, 200, CFG);
   if ((p === '/api/comunicar/config' || p === '/api/posvenda/config') && m === 'PUT') {
@@ -722,9 +837,11 @@ http.createServer(async (req, res) => {
   // ---- segmentos, modelos, regras
   if (p === '/api/segmentos') return json(res, 200, SEGMENTOS);
   if (p === '/api/segmentos/previa') {
-    const l = segmentar(url.searchParams.get('filtro') || 'todos', url.searchParams.get('valor'));
-    if (!l) return json(res, 400, { erro:'Segmento desconhecido.' });
-    return json(res, 200, { total: l.length, amostra: l.slice(0, 12).map((c) => ({ id:c.id, nome:c.nome, telefone:c.telefone, carro:c.carro })) });
+    const bruto = segmentarBruto(url.searchParams.get('filtro') || 'todos', url.searchParams.get('valor'));
+    if (!bruto) return json(res, 400, { erro:'Segmento desconhecido.' });
+    const recentes = new Set(ENVIOS.filter((e) => ['enviado', 'pendente'].includes(e.status) && ['campanha', 'avulsa', 'retorno', 'reativacao', 'orcamento', 'nao_fechou', 'aniversario'].includes(e.tipo) && e.enviar_em >= diasAtras(CFG.intervalo_minimo_dias)).map((e) => e.cliente_id));
+    const r = peneirarSegmento(bruto, { porteiro: { podeReceber: ({ cliente_id }) => ({ ok: !recentes.has(cliente_id) }) } });
+    return json(res, 200, { total: r.recebem.length, bruto: r.total, pulados: r.pulados, recentes: r.recentes, intervalo_dias: CFG.intervalo_minimo_dias, amostra: r.recebem.slice(0, 12).map((c) => ({ id:c.id, nome:c.nome, telefone:c.telefone, carro:c.carro, placa:c.placa })) });
   }
   if (p === '/api/modelos') return json(res, 200, MODELOS);
   if (p === '/api/regras-retorno' && m === 'GET') return json(res, 200, REGRAS.slice().sort((a, b) => a.ordem - b.ordem));
@@ -784,6 +901,7 @@ http.createServer(async (req, res) => {
       agendamentos: ags.slice(0, 6).map(({ cliente, ...a }) => a),
       envios: ENVIOS.filter((e) => e.cliente_id === c.id).slice(0, 10),
       respostas: RESPOSTAS.filter((r) => r.cliente_id === c.id).slice(0, 5),
+      ligacoes: montarLigacoes(c360Mock(c, c.telefone)),
     });
   }
   if ((mm = p.match(/^\/api\/clientes\/([0-9a-f-]+)$/)) && m === 'PUT') {

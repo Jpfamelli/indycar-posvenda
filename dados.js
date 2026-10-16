@@ -17,9 +17,10 @@ import {
   selecionar, selecionarUm, selecionarTudo,
   inserir, inserirUm, atualizar, atualizarUm, remover, contar, rpc,
 } from './supabase.js';
-import { validadeDoEnvio } from './carteiro.js';
-import { TIPOS_PATIO, ROTULO_PATIO, linkArea, PATIO_URL } from './patio.js';
-import { mesclarPreferencias } from './acesso.js';
+import { validadeDoEnvio, esperaDaTentativa } from './carteiro.js';
+import { TIPOS_PATIO, ROTULO_PATIO, linkArea, linkOs, usaLinkArea, usaLinkOs, PATIO_URL } from './patio.js';
+import { mesclarPreferencias, LINKS } from './acesso.js';
+import { classificarErro } from './whatsapp.js';
 
 const T = {
   clientes: 'clientes',
@@ -48,7 +49,7 @@ export const REGUAS = [
 ];
 /** Tipos que contam como "relacionamento" para o intervalo mínimo entre mensagens. */
 const TIPOS_RELACIONAMENTO = new Set(['aniversario', 'retorno', 'reativacao', 'orcamento', 'nao_fechou', 'campanha', 'avulsa']);
-export const TIPOS_ENVIO = ['aniversario', 'posvenda', 'retorno', 'campanha', 'avulsa', 'lembrete', 'orcamento', 'nao_fechou', 'reativacao', 'avaliacao', ...TIPOS_PATIO];
+export const TIPOS_ENVIO = ['aniversario', 'posvenda', 'retorno', 'campanha', 'avulsa', 'lembrete', 'remarcacao', 'orcamento', 'nao_fechou', 'reativacao', 'avaliacao', ...TIPOS_PATIO];
 
 // ============================================================================
 // UTILIDADES PURAS (sem banco) — testáveis com `npm test`
@@ -190,6 +191,7 @@ export const ROTULO_TIPO = {
   lembrete: 'Lembrete de horário', posvenda: 'Pós-venda', avaliacao: 'Avaliação no Google',
   retorno: 'Revisão', aniversario: 'Aniversário', orcamento: 'Orçamento parado',
   nao_fechou: 'Não fechou', reativacao: 'Reativação', campanha: 'Campanha', avulsa: 'Avulsa',
+  remarcacao: 'Horário remarcado', // rodada 5: aviso que a Agenda manda quando remarca (antes entrava como avulsa)
   ...ROTULO_PATIO,   // Pátio (16/10/2026): avisos da oficina e convite da Área do Cliente
 };
 
@@ -350,6 +352,8 @@ export async function fichaCliente(id) {
       regra: regra?.rotulo || 'padrão', servico: ultimoServico.servico,
     };
   }
+  // rodada 5: o que os outros apps sabem deste cliente (rpc cliente_360 pelo telefone normalizado)
+  const ligacoes = cliente.telefone ? await ligacoesDoCliente(cliente.telefone).catch(() => null) : null;
   return {
     cliente,
     resumo: v360 ? {
@@ -357,8 +361,132 @@ export async function fichaCliente(id) {
       total_gasto: Number(v360.total_gasto) || 0, ultimo_servico_em: v360.ultimo_servico_em,
       proximo_horario: v360.proximo_horario,
     } : null,
-    ultimoServico, proximaRevisao, agendamentos: ultimos, envios, respostas,
+    ultimoServico, proximaRevisao, agendamentos: ultimos, envios, respostas, ligacoes,
   };
+}
+
+// ============================================================================
+// RODADA 5 — ficha 360 (rpc cliente_360), ligações cruzadas e links nas réguas
+// ============================================================================
+
+/** A ficha inteira de um telefone, como o banco devolve (rpc cliente_360). null sem telefone válido. */
+export async function cliente360(telefone) {
+  const t = telefoneNacional(telefone);
+  if (!t || t.length < 10) return null;
+  const r = await rpc('cliente_360', { p_telefone: t });
+  return r && typeof r === 'object' ? r : null;
+}
+
+/** Pura: do JSON do cliente_360 para os links que a tela mostra (conversa, leads, OS, orçamentos, tarefas). */
+export function montarLigacoes(c360) {
+  if (!c360 || typeof c360 !== 'object') return null;
+  const conv = c360.conversa || null;
+  const leads = Array.isArray(c360.leads) ? c360.leads : [];
+  const patio = Array.isArray(c360.patio) ? c360.patio : [];
+  const orcs = Array.isArray(c360.orcamentos) ? c360.orcamentos : [];
+  const tarefas = Array.isArray(c360.tarefas) ? c360.tarefas : [];
+  const ags = Array.isArray(c360.agendamentos) ? c360.agendamentos : [];
+  const ind = c360.indicacoes || {};
+  const naOficina = patio.find((o) => o && !['entregue', 'cancelado'].includes(o.etapa)) || null;
+  return {
+    telefone: c360.telefone || null,
+    conversa: conv ? { id: conv.id, status: conv.status || null, etapa: conv.etapa || null, atribuida_a: conv.atribuida_a_nome || conv.atribuida_a || null, aguardando_consultor: !!conv.aguardando_consultor, link: LINKS.conversa(conv.id) } : null,
+    leads: leads.slice(0, 5).map((l) => ({ id: l.id, status: l.status, servico: l.servico || null, valor_orcado: l.valor_orcado ?? null, responsavel: l.responsavel_nome || null, created_at: l.created_at || null, link: LINKS.lead(l.id) })),
+    patio: patio.slice(0, 5).map((o) => ({ id: o.id, numero: o.numero ?? null, etapa: o.etapa, veiculo: o.veiculo || null, placa: o.placa || null, extras_pendentes: Number(o.extras_pendentes) || 0, link: LINKS.os(o.id), link_cliente: o.link_cliente || null })),
+    carroNaOficina: naOficina ? { id: naOficina.id, numero: naOficina.numero ?? null, etapa: naOficina.etapa, link: LINKS.os(naOficina.id), link_cliente: naOficina.link_cliente || null } : null,
+    orcamentos: orcs.slice(0, 5).map((o) => ({ id: o.id, status: o.status, total: o.total ?? o.valor ?? null, created_at: o.created_at || null, link: LINKS.orcamento(o.id) })),
+    agendamentos: ags.slice(0, 5).map((a) => ({ id: a.id, data: a.data, hora: a.hora, servico: a.servico, status: a.status, consultor: a.consultor_nome || null, link: LINKS.agendamento(a.id) })),
+    tarefas: tarefas.slice(0, 5).map((t) => ({ id: t.id, titulo: t.titulo, vence_em: t.vence_em || null, responsavel: t.responsavel_nome || null, origem: t.origem || null })),
+    indicacoes: { fez: Array.isArray(ind.fez) ? ind.fez.length : 0, foiIndicadoPor: ind.foi_indicado_por?.nome || ind.foi_indicado_por || null },
+    resumo: c360.resumo || null,
+  };
+}
+
+/** Ligações de um telefone (conversa, lead, pátio, orçamentos, tarefas) — pela rpc. */
+export async function ligacoesDoCliente(telefone) {
+  return montarLigacoes(await cliente360(telefone));
+}
+
+/** Ordens do Pátio pelos agendamentos (para {link_os} nas réguas e para a ficha do envio). */
+export async function ordensPorAgendamento(ids) {
+  const lista = [...new Set((ids || []).filter(ehUuid))];
+  if (!lista.length) return new Map();
+  const linhas = await selecionar('patio_os', `select=id,numero,etapa,agendamento_id,token_publico&agendamento_id=in.(${lista.join(',')})&order=created_at.desc`).catch(() => []);
+  const mapa = new Map();
+  for (const o of linhas) if (!mapa.has(o.agendamento_id)) mapa.set(o.agendamento_id, o);
+  return mapa;
+}
+
+/**
+ * Ficha de um envio: onde ele toca nos outros apps — conversa (Atendimento),
+ * lead (CRM), horário (Agenda) e ordem (Pátio). Busca pelo telefone normalizado
+ * o que o envio não trouxe gravado.
+ */
+export async function ligacoesDoEnvio(id) {
+  if (!ehUuid(id)) return null;
+  const e = await selecionarUm(T.envios, `select=${CAMPOS_ENVIO}&id=eq.${id}`);
+  if (!e) return null;
+  const c360 = await cliente360(e.telefone).catch(() => null);
+  const lig = montarLigacoes(c360) || {};
+  let osId = /^patio_(entrada|extra|pronto):([0-9a-f-]{36})/i.exec(String(e.chave_unica || ''))?.[2] || null;
+  if (!osId && e.agendamento_id) osId = (await ordensPorAgendamento([e.agendamento_id])).get(e.agendamento_id)?.id || null;
+  const conversaId = e.conversa_id || lig.conversa?.id || null;
+  return {
+    envio: { id: e.id, tipo: e.tipo, status: e.status, nome: e.nome, telefone: e.telefone, cliente_id: e.cliente_id, enviar_em: e.enviar_em, enviado_em: e.enviado_em },
+    links: {
+      conversa: conversaId ? LINKS.conversa(conversaId) : LINKS.conversaTel(e.telefone),
+      lead: LINKS.lead(e.lead_id || lig.leads?.[0]?.id || null),
+      agendamento: LINKS.agendamento(e.agendamento_id),
+      os: LINKS.os(osId || lig.carroNaOficina?.id || null),
+      cliente_crm: LINKS.clienteCrm(e.cliente_id, e.telefone),
+    },
+    ligacoes: lig,
+  };
+}
+
+/**
+ * Links que uma régua pode usar no texto: {link_os} (acompanhar a ordem do Pátio
+ * ligada ao agendamento) e {link_area} (Área do Cliente — um link novo por
+ * cliente). O gerador só gasta consulta/rpc quando o texto pede.
+ *   ctx.links = { os: Map(agendamento_id → link|null), area: Map(cliente_id → link|null) }
+ * Em simulação o {link_area} vira um marcador (a rpc gera um token de verdade).
+ */
+export async function linksDaRegua(template, { cliente_id = null, agendamento_id = null }, ctx = {}) {
+  const saida = {};
+  ctx.links ||= { os: new Map(), area: new Map(), areaGastos: 0 };
+  if (usaLinkOs(template)) {
+    let link = null;
+    if (ehUuid(agendamento_id)) {
+      if (!ctx.links.os.has(agendamento_id)) {
+        const o = (await ordensPorAgendamento([agendamento_id]).catch(() => new Map())).get(agendamento_id);
+        const cfgP = await patioConfig().catch(() => null);
+        ctx.links.os.set(agendamento_id, o?.token_publico ? linkOs(cfgP?.link_base || PATIO_URL, o.token_publico) : null);
+      }
+      link = ctx.links.os.get(agendamento_id);
+    }
+    saida.link_os = link || '';
+  }
+  if (usaLinkArea(template)) {
+    let link = null;
+    if (ehUuid(cliente_id)) {
+      if (ctx.simular) link = `${PATIO_URL}/minha/?c=(link-do-cliente)`;
+      else if (ctx.links.area.has(cliente_id)) link = ctx.links.area.get(cliente_id);
+      else if (ctx.links.areaGastos < 60) { // teto por rodada: a rpc gera um token por chamada
+        ctx.links.areaGastos++;
+        link = await gerarLinkArea(cliente_id).catch(() => null);
+        ctx.links.area.set(cliente_id, link);
+      }
+    }
+    saida.link_area = link || '';
+  }
+  return saida;
+}
+
+/** Pura: o texto tem {link_os}/{link_area} mas o cliente não tem o link? Então a mensagem não sai (link quebrado não vai para o cliente). */
+export function faltaLink(template, links) {
+  if (usaLinkOs(template) && !links?.link_os) return 'sem ordem no Pátio para este horário (o {link_os} ficaria vazio)';
+  if (usaLinkArea(template) && !links?.link_area) return 'sem cadastro de cliente para gerar o {link_area}';
+  return null;
 }
 
 // ============================================================================
@@ -369,10 +497,13 @@ const FAIXAS = {
   dias_posvenda: [0, 30], meses_retorno: [1, 24], horas_lembrete: [1, 72], dias_orcamento: [1, 30],
   dias_nao_fechou: [1, 60], meses_reativacao: [3, 36], intervalo_minimo_dias: [0, 60],
   janela_inicio: [0, 23], janela_fim: [1, 24], limite_por_hora: [1, 500],
+  // rodada 5: cadência segura
+  limite_por_minuto: [1, 60], limite_por_dia: [1, 5000], intervalo_mesmo_cliente_min: [0, 1440],
 };
-const PADRAO_NUM = {
+export const PADRAO_NUM = {
   dias_posvenda: 2, meses_retorno: 6, horas_lembrete: 20, dias_orcamento: 3, dias_nao_fechou: 7,
   meses_reativacao: 12, intervalo_minimo_dias: 7, janela_inicio: 8, janela_fim: 20, limite_por_hora: 60,
+  limite_por_minuto: 10, limite_por_dia: 300, intervalo_mesmo_cliente_min: 60,
 };
 
 export async function obterConfig() {
@@ -393,7 +524,18 @@ export async function obterConfig() {
   cfg.ia_resumo = c.ia_resumo || null;
   cfg.ia_resumo_em = c.ia_resumo_em || null;
   cfg.updated_at = c.updated_at || null;
+  // rodada 5: só horário comercial (seg–sáb 8h–17h30) e o estado do WhatsApp que o carteiro gravou
+  cfg.so_horario_comercial = !!c.so_horario_comercial;
+  cfg.whatsapp = { estado: c.whatsapp_estado || null, em: c.whatsapp_estado_em || null, motivo: c.whatsapp_motivo || null };
   return cfg;
+}
+
+/** O carteiro grava o estado do WhatsApp que viu (o Render dorme e perde a memória) — só quando muda. */
+export async function gravarEstadoWhatsapp(estado, motivo = null, atual = null) {
+  const a = atual || (await selecionarUm(T.config, `select=whatsapp_estado,whatsapp_motivo&${LINHA_UNICA}`).catch(() => null)) || {};
+  if (a.whatsapp_estado === estado && (a.whatsapp_motivo || null) === (motivo || null)) return false;
+  await atualizarUm(T.config, LINHA_UNICA, { whatsapp_estado: estado, whatsapp_estado_em: new Date().toISOString(), whatsapp_motivo: motivo ? String(motivo).slice(0, 300) : null }).catch(() => null);
+  return true;
 }
 
 export async function salvarConfig(dados) {
@@ -424,6 +566,7 @@ export async function salvarConfig(dados) {
   }
   if (dados.envia_domingo !== undefined) campos.envia_domingo = dados.envia_domingo === true;
   if (dados.pausa_geral !== undefined) campos.pausa_geral = dados.pausa_geral === true;
+  if (dados.so_horario_comercial !== undefined) campos.so_horario_comercial = dados.so_horario_comercial === true;
   if (dados.telefone_teste !== undefined) {
     const t = soDigitos(dados.telefone_teste);
     campos.telefone_teste = t.length >= 10 ? t : null;
@@ -509,12 +652,21 @@ export async function listarEnvios({ status, tipo, q, de, ate, intencao, limite 
     const t = termoBusca(q);
     const dig = soDigitos(q);
     const partes = [`nome.ilike.${t}`, `corpo.ilike.${t}`, `resposta.ilike.${t}`];
-    if (dig.length >= 4) partes.push(`telefone.ilike."*${dig}*"`);
+    // rodada 5: telefone normalizado (coluna gerada telefone_e164, com índice) — com ou sem 55, com máscara
+    if (dig.length >= 10) partes.push(`telefone_e164.eq.${telefoneNacional(dig)}`);
+    else if (dig.length >= 4) partes.push(`telefone.ilike."*${dig}*"`, `telefone_e164.ilike."*${dig}*"`);
     p.set('or', `(${partes.join(',')})`);
   }
   p.set('order', 'enviar_em.desc');
   p.set('limit', String(Math.min(Number(limite) || 300, 5000)));
   return Number(limite) > 1000 ? selecionarTudo(T.envios, p) : selecionar(T.envios, p);
+}
+
+/** Envios de um telefone (qualquer formato) pela coluna normalizada — a ficha e o 360 usam. */
+export async function enviosDoTelefone(telefone, limite = 20) {
+  const t = telefoneNacional(telefone);
+  if (!t) return [];
+  return selecionar(T.envios, `select=${CAMPOS_ENVIO}&telefone_e164=eq.${t}&order=created_at.desc&limit=${Math.min(Number(limite) || 20, 100)}`);
 }
 
 /**
@@ -696,6 +848,19 @@ async function entregarAoPorteiro(porteiro, dados, ctx) {
 
 const A_SEL = 'select=id,cliente_id,lead_id,cliente_nome,telefone,servico,veiculo,placa,data,hora,status';
 
+/**
+ * Rodada 5: monta o corpo de uma régua, resolvendo {link_os}/{link_area} quando o
+ * texto pede. Sem o link (cliente sem cadastro, horário sem ordem no Pátio) a
+ * mensagem NÃO sai — vai para "pulados" da prévia com o motivo. null = não manda.
+ */
+async function corpoDaRegua(template, vars, ids, ctx, info = {}) {
+  const precisa = usaLinkOs(template) || usaLinkArea(template);
+  const extra = precisa ? await linksDaRegua(template, ids, ctx) : {};
+  const falta = precisa ? faltaLink(template, extra) : null;
+  if (falta) { ctx.pulados.push({ ...info, motivo: falta, definitivo: false }); return null; }
+  return renderTemplate(template, { ...vars, ...extra });
+}
+
 /** Lembrete de horário: X horas antes do agendamento (aguardando/confirmado). */
 export async function gerarLembretes(cfg, porteiro, ctx) {
   const h = hoje();
@@ -709,10 +874,11 @@ export async function gerarLembretes(cfg, porteiro, ctx) {
     if (!soDigitos(a.telefone)) continue;
     const faltam = (instanteSP(a.data, a.hora || '08:00').getTime() - agora) / 36e5;
     if (faltam < 1 || faltam > cfg.horas_lembrete) continue; // tarde demais, ou ainda cedo
-    const corpo = renderTemplate(cfg.msg_lembrete, {
+    const corpo = await corpoDaRegua(cfg.msg_lembrete, {
       nome: a.cliente_nome, carro: a.veiculo, placa: a.placa, servico: a.servico || 'o atendimento',
       quando: quandoRelativo(a.data, a.hora, h),
-    });
+    }, { cliente_id: a.cliente_id, agendamento_id: a.id }, ctx, { tipo: 'lembrete', nome: a.cliente_nome, telefone: a.telefone, cliente_id: a.cliente_id });
+    if (corpo === null) continue;
     await entregarAoPorteiro(porteiro, {
       cliente_id: a.cliente_id, agendamento_id: a.id, lead_id: a.lead_id, telefone: a.telefone, nome: a.cliente_nome,
       tipo: 'lembrete', corpo, enviar_em: new Date().toISOString(), chave_unica: `lembrete:${a.id}`, criado_por: 'gerador',
@@ -736,9 +902,10 @@ export async function gerarAniversarios(cfg, porteiro, ctx) {
     for (const c of clientes) {
       if (String(c.nascimento || '').slice(5) !== mmdd) continue;
       if (!soDigitos(c.telefone)) continue;
-      const corpo = renderTemplate(cfg.msg_aniversario, {
+      const corpo = await corpoDaRegua(cfg.msg_aniversario, {
         nome: c.nome, carro: [c.carro_modelo, c.carro_ano].filter(Boolean).join(' '), placa: c.placa,
-      });
+      }, { cliente_id: c.id }, ctx, { tipo: 'aniversario', nome: c.nome, telefone: c.telefone, cliente_id: c.id });
+      if (corpo === null) continue;
       await entregarAoPorteiro(porteiro, {
         cliente_id: c.id, telefone: c.telefone, nome: c.nome, tipo: 'aniversario', corpo,
         enviar_em: dia === d ? hojeAs(cfg.hora_envio) : new Date().toISOString(),
@@ -759,9 +926,10 @@ export async function gerarPosvenda(cfg, porteiro, ctx) {
   p.append('data', `lte.${ate}`);
   for (const a of await selecionar(T.agendamentos, p)) {
     if (!soDigitos(a.telefone)) continue;
-    const corpo = renderTemplate(cfg.msg_posvenda, {
+    const corpo = await corpoDaRegua(cfg.msg_posvenda, {
       nome: a.cliente_nome, carro: a.veiculo, placa: a.placa, servico: a.servico || 'o serviço',
-    });
+    }, { cliente_id: a.cliente_id, agendamento_id: a.id }, ctx, { tipo: 'posvenda', nome: a.cliente_nome, telefone: a.telefone, cliente_id: a.cliente_id });
+    if (corpo === null) continue;
     await entregarAoPorteiro(porteiro, {
       cliente_id: a.cliente_id, agendamento_id: a.id, lead_id: a.lead_id, telefone: a.telefone, nome: a.cliente_nome,
       tipo: 'posvenda', corpo, enviar_em: hojeAs(cfg.hora_envio), chave_unica: `posvenda:${a.id}`, criado_por: 'gerador',
@@ -818,9 +986,10 @@ export async function gerarRetornos(cfg, porteiro, ctx, regras) {
     const chaveCliente = a.cliente_id || telefoneNacional(a.telefone);
     if (jaConvidado.has(chaveCliente)) continue;                                   // um convite por cliente
     jaConvidado.add(chaveCliente);
-    const corpo = renderTemplate(a.regra?.mensagem || cfg.msg_retorno, {
+    const corpo = await corpoDaRegua(a.regra?.mensagem || cfg.msg_retorno, {
       nome: a.cliente_nome, carro: a.veiculo, placa: a.placa, servico: a.servico || 'o último serviço', meses: a.meses,
-    });
+    }, { cliente_id: a.cliente_id, agendamento_id: a.id }, ctx, { tipo: 'retorno', nome: a.cliente_nome, telefone: a.telefone, cliente_id: a.cliente_id });
+    if (corpo === null) continue;
     await entregarAoPorteiro(porteiro, {
       cliente_id: a.cliente_id, agendamento_id: a.id, lead_id: a.lead_id, telefone: a.telefone, nome: a.cliente_nome,
       tipo: 'retorno', corpo, enviar_em: hojeAs(cfg.hora_envio), chave_unica: `retorno:${a.id}`, criado_por: 'gerador',
@@ -839,9 +1008,10 @@ export async function gerarOrcamentos(cfg, porteiro, ctx) {
   p.append('updated_at', `gte.${desde}`);
   for (const l of await selecionar(T.leads, p)) {
     if (!soDigitos(l.telefone)) continue;
-    const corpo = renderTemplate(cfg.msg_orcamento, {
+    const corpo = await corpoDaRegua(cfg.msg_orcamento, {
       nome: l.nome, carro: l.carro_modelo, placa: l.placa, servico: l.servico || 'o serviço',
-    });
+    }, { cliente_id: l.cliente_id }, ctx, { tipo: 'orcamento', nome: l.nome, telefone: l.telefone, cliente_id: l.cliente_id });
+    if (corpo === null) continue;
     await entregarAoPorteiro(porteiro, {
       cliente_id: l.cliente_id, lead_id: l.id, telefone: l.telefone, nome: l.nome,
       tipo: 'orcamento', corpo, enviar_em: hojeAs(cfg.hora_envio), chave_unica: `orcamento:${l.id}`, criado_por: 'gerador',
@@ -864,9 +1034,10 @@ export async function gerarNaoFechou(cfg, porteiro, ctx) {
   for (const a of lista) {
     if (!soDigitos(a.telefone)) continue;
     if (a.cliente_id && (voltaram.get(a.cliente_id) || '') > a.data) continue;
-    const corpo = renderTemplate(cfg.msg_nao_fechou, {
+    const corpo = await corpoDaRegua(cfg.msg_nao_fechou, {
       nome: a.cliente_nome, carro: a.veiculo, placa: a.placa, servico: a.servico || 'o serviço',
-    });
+    }, { cliente_id: a.cliente_id, agendamento_id: a.id }, ctx, { tipo: 'nao_fechou', nome: a.cliente_nome, telefone: a.telefone, cliente_id: a.cliente_id });
+    if (corpo === null) continue;
     await entregarAoPorteiro(porteiro, {
       cliente_id: a.cliente_id, agendamento_id: a.id, lead_id: a.lead_id, telefone: a.telefone, nome: a.cliente_nome,
       tipo: 'nao_fechou', corpo, enviar_em: hojeAs(cfg.hora_envio), chave_unica: `nao_fechou:${a.id}`, criado_por: 'gerador',
@@ -910,9 +1081,10 @@ export async function gerarReativacao(cfg, porteiro, ctx) {
     const c = fichas.get(clienteId);
     const telefone = c?.telefone || u.telefone;
     if (!soDigitos(telefone)) continue;
-    const corpo = renderTemplate(cfg.msg_reativacao, {
+    const corpo = await corpoDaRegua(cfg.msg_reativacao, {
       nome: c?.nome || u.cliente_nome, carro: c?.carro || u.veiculo, placa: c?.placa || u.placa, servico: u.servico,
-    });
+    }, { cliente_id: clienteId, agendamento_id: u.id }, ctx, { tipo: 'reativacao', nome: c?.nome || u.cliente_nome, telefone, cliente_id: clienteId });
+    if (corpo === null) continue;
     await entregarAoPorteiro(porteiro, {
       cliente_id: clienteId, agendamento_id: u.id, telefone, nome: c?.nome || u.cliente_nome,
       tipo: 'reativacao', corpo, enviar_em: hojeAs(cfg.hora_envio),
@@ -980,34 +1152,22 @@ export const SEGMENTOS = [
   { id: 'servico', rotulo: 'Fizeram um serviço (palavra)', valor: 'óleo', unidade: 'texto' },
 ];
 
-export async function segmentar(filtro, valor) {
-  const optOut = new Set((await selecionarTudo(T.clientes, 'select=id&aceita_mensagens=is.false')).map((c) => c.id));
-  const limpar = (lista) => {
-    const vistos = new Set();
-    return lista.filter((c) => {
-      if (!c || !soDigitos(c.telefone) || optOut.has(c.id) || vistos.has(c.id)) return false;
-      vistos.add(c.id);
-      return true;
-    });
-  };
+/** Os candidatos BRUTOS de um segmento (antes de tirar opt-out, sem telefone e repetidos). */
+async function candidatosDoSegmento(filtro, valor) {
   const h = hoje();
-
   switch (filtro) {
     case 'todos':
-      return limpar((await selecionarTudo(T.clientes, `select=${CAMPOS_CLIENTE}&telefone=not.is.null&order=nome.asc`)).map(lerCliente));
-
+      return (await selecionarTudo(T.clientes, `select=${CAMPOS_CLIENTE}&telefone=not.is.null&order=nome.asc`)).map(lerCliente);
     case 'aniversariantes_mes': {
       const mes = h.slice(5, 7);
       const lista = await selecionarTudo(T.clientes, `select=${CAMPOS_CLIENTE}&nascimento=not.is.null&order=nome.asc`);
-      return limpar(lista.filter((c) => String(c.nascimento).slice(5, 7) === mes).map(lerCliente));
+      return lista.filter((c) => String(c.nascimento).slice(5, 7) === mes).map(lerCliente);
     }
-
     case 'atendidos': {
       const dias = Math.min(Math.max(Number(valor) || 90, 1), 3650);
       const ags = await selecionarTudo(T.agendamentos, `select=cliente_id&status=eq.concluido&data=gte.${somarDias(h, -dias)}&cliente_id=not.is.null`);
-      return limpar(await clientesPorIds(ags.map((a) => a.cliente_id)));
+      return clientesPorIds(ags.map((a) => a.cliente_id));
     }
-
     case 'sem_voltar': {
       const meses = Math.min(Math.max(Number(valor) || 6, 1), 60);
       const limite = somarDias(h, -meses * 30);
@@ -1016,14 +1176,12 @@ export async function segmentar(filtro, valor) {
       for (const [id, info] of historico) {
         if (info.ultimoServico && info.ultimoServico.data <= limite && (info.ultimaVisita || '') <= info.ultimoServico.data) ids.push(id);
       }
-      return limpar(await clientesPorIds(ids));
+      return clientesPorIds(ids);
     }
-
     case 'faltaram': {
       const ags = await selecionarTudo(T.agendamentos, `select=cliente_id&status=eq.nao_veio&data=gte.${somarDias(h, -30)}&cliente_id=not.is.null`);
-      return limpar(await clientesPorIds(ags.map((a) => a.cliente_id)));
+      return clientesPorIds(ags.map((a) => a.cliente_id));
     }
-
     case 'servico': {
       const palavra = String(valor || '').trim();
       if (palavra.length < 2) return [];
@@ -1032,12 +1190,75 @@ export async function segmentar(filtro, valor) {
       p.set('cliente_id', 'not.is.null');
       p.set('servico', `ilike.*${palavra.replace(/[%*,()]/g, ' ')}*`);
       const ags = await selecionarTudo(T.agendamentos, p);
-      return limpar(await clientesPorIds(ags.map((a) => a.cliente_id)));
+      return clientesPorIds(ags.map((a) => a.cliente_id));
     }
-
     default:
       throw new Error('Segmento desconhecido.');
   }
+}
+
+/** Pura: separa quem recebe de quem é pulado (e por quê). Quem recebeu outra mensagem há menos de N dias RECEBE mesmo assim
+ *  (campanha é decisão de gente), mas é contado em `recentes` para a prévia avisar. */
+export function peneirarSegmento(lista, { optOut = new Set(), porteiro = null } = {}) {
+  const vistos = new Set();
+  const recebem = [];
+  const pulados = { nao_quer: 0, sem_telefone: 0, repetido: 0 };
+  let recentes = 0;
+  for (const c of lista) {
+    if (!c) continue;
+    if (vistos.has(c.id)) { pulados.repetido++; continue; }
+    vistos.add(c.id);
+    if (!soDigitos(c.telefone)) { pulados.sem_telefone++; continue; }
+    if (optOut.has(c.id) || c.aceita_mensagens === false) { pulados.nao_quer++; continue; }
+    if (porteiro && !porteiro.podeReceber({ cliente_id: c.id, telefone: c.telefone, tipo: 'campanha' }).ok) recentes++;
+    recebem.push(c);
+  }
+  return { recebem, pulados, recentes, total: lista.filter(Boolean).length };
+}
+
+export async function segmentar(filtro, valor) {
+  const optOut = new Set((await selecionarTudo(T.clientes, 'select=id&aceita_mensagens=is.false')).map((c) => c.id));
+  return peneirarSegmento(await candidatosDoSegmento(filtro, valor), { optOut }).recebem;
+}
+
+/**
+ * Rodada 5: a prévia honesta da campanha — quantos recebem e quantos ficam de fora, com o motivo
+ * (pediu para parar, sem telefone, repetido, recebeu outra mensagem há menos de N dias).
+ */
+export async function segmentarComMotivos(filtro, valor, cfg = null) {
+  const c = cfg || await obterConfig();
+  const [bruto, porteiro] = await Promise.all([candidatosDoSegmento(filtro, valor), carregarPorteiro(c)]);
+  const r = peneirarSegmento(bruto, { porteiro });
+  return { lista: r.recebem, total: r.recebem.length, bruto: r.total, pulados: r.pulados, recentes: r.recentes, intervalo_dias: Number(c.intervalo_minimo_dias) || 0 };
+}
+
+// ---- segmentos salvos (rodada 5) -----------------------------------------------
+T.segmentos = 'comunicar_segmentos';
+const CAMPOS_SEG = 'id,nome,filtro,valor,criado_por,criado_por_nome,usado_em,usos,created_at';
+export async function listarSegmentosSalvos() {
+  return selecionar(T.segmentos, `select=${CAMPOS_SEG}&order=usado_em.desc.nullslast,created_at.desc&limit=60`);
+}
+export async function salvarSegmento({ nome, filtro, valor, criado_por, criado_por_nome }) {
+  const n = String(nome || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+  if (n.length < 2) throw new Error('Dê um nome ao segmento (2 a 60 letras).');
+  if (!SEGMENTOS.some((s) => s.id === filtro)) throw new Error('Segmento desconhecido.');
+  const seg = SEGMENTOS.find((s) => s.id === filtro);
+  const v = seg.valor === undefined ? null : (seg.unidade === 'texto' ? String(valor ?? '').trim().slice(0, 60) || null : (Number.isFinite(Number(valor)) ? Number(valor) : null));
+  return inserirUm(T.segmentos, { nome: n, filtro, valor: v === null ? null : String(v), criado_por: uuidOuNulo(criado_por), criado_por_nome: criado_por_nome || null }, `select=${CAMPOS_SEG}`);
+}
+export async function obterSegmentoSalvo(id) {
+  if (!ehUuid(id)) return null;
+  return selecionarUm(T.segmentos, `select=${CAMPOS_SEG}&id=eq.${id}`);
+}
+export async function apagarSegmentoSalvo(id) {
+  if (!ehUuid(id)) return false;
+  return (await remover(T.segmentos, `id=eq.${id}`)).length > 0;
+}
+export async function marcarSegmentoUsado(id) {
+  if (!ehUuid(id)) return null;
+  const s = await obterSegmentoSalvo(id);
+  if (!s) return null;
+  return atualizarUm(T.segmentos, `id=eq.${id}&select=id`, { usado_em: new Date().toISOString(), usos: (Number(s.usos) || 0) + 1 }).catch(() => null);
 }
 
 // ============================================================================
@@ -1204,21 +1425,57 @@ export function proximoDiaDeEnvio(dataIso, horaHM = '09:30', enviaDomingo = fals
   return instanteSP(d, horaHM).toISOString();
 }
 
-export const MAX_TENTATIVAS = 3;
+export const MAX_TENTATIVAS = 4; // rodada 5: 3 re-tentativas (5, 15 e 45 min) antes de falhar de vez
 /** Erro que não melhora tentando de novo (número inválido, sem WhatsApp). */
 const ERRO_DEFINITIVO = /inv[aá]lid|not.*(registered|on whatsapp|exist)|n[aã]o (tem|possui|est[aá] no) whatsapp|n[aã]o existe/i;
 
 /**
  * O que fazer com um envio que falhou (erro não estrutural):
- * transitório e abaixo de 3 tentativas → volta à fila com espera (5, 15 min);
- * senão → falhou de vez.
+ * transitório e abaixo do máximo → volta à fila com espera CRESCENTE (5, 15, 45 min);
+ * número inválido (ou `definitivo` dito pela classificação) → falhou de vez.
  */
-export function decidirFalha(erro, tentativas, agora = Date.now()) {
-  if (ERRO_DEFINITIVO.test(String(erro || '')) || tentativas >= MAX_TENTATIVAS) {
+export function decidirFalha(erro, tentativas, agora = Date.now(), definitivo = null) {
+  const def = definitivo === null ? ERRO_DEFINITIVO.test(String(erro || '')) : !!definitivo;
+  if (def || tentativas >= MAX_TENTATIVAS) {
     return { status: 'falhou', enviar_em: null };
   }
-  const esperaMin = tentativas <= 1 ? 5 : 15;
+  const esperaMin = esperaDaTentativa(tentativas);
   return { status: 'pendente', enviar_em: new Date(agora + esperaMin * 60000).toISOString(), esperaMin };
+}
+
+/** Quantas saíram hoje (fuso da oficina) — limite diário da cadência. */
+export async function enviadasHoje() {
+  return contar(T.envios, `status=eq.enviado&enviado_em=gte.${encodeURIComponent(instanteSP(hoje(), '00:00').toISOString())}`);
+}
+
+/** Falhas por CLASSE de erro desde `desdeIso` (chave recusada ≠ número inválido ≠ instabilidade). */
+export async function falhasPorClasse(desdeIso) {
+  const p = new URLSearchParams('select=tipo,erro,erro_classe,enviar_em,status');
+  p.set('status', 'in.(falhou,pendente)');
+  p.set('erro', 'not.is.null');
+  p.set('enviar_em', `gte.${desdeIso}`);
+  p.set('order', 'enviar_em.desc');
+  p.set('limit', '500');
+  const saida = {};
+  for (const e of await selecionar(T.envios, p)) {
+    const classe = e.erro_classe || classificarErro({ texto: e.erro }).classe;
+    const s = (saida[classe] ||= { total: 0, ultimoErro: null, ultimoEm: null, tipos: {} });
+    s.total++;
+    s.tipos[e.tipo] = (s.tipos[e.tipo] || 0) + 1;
+    if (!s.ultimoErro && e.erro) { s.ultimoErro = String(e.erro).slice(0, 160); s.ultimoEm = e.enviar_em; }
+  }
+  return saida;
+}
+
+/** A fila, em números, para o painel de saúde: pendentes, atrasadas (> 2 h) e a mais antiga. */
+export async function resumoDaFila() {
+  const duasHoras = new Date(Date.now() - 2 * 3600000).toISOString();
+  const [pendentes, atrasados, antiga] = await Promise.all([
+    contar(T.envios, 'status=eq.pendente'),
+    contar(T.envios, `status=eq.pendente&enviar_em=lte.${encodeURIComponent(duasHoras)}`),
+    selecionarUm(T.envios, 'select=enviar_em&status=eq.pendente&order=enviar_em.asc&limit=1').catch(() => null),
+  ]);
+  return { pendentes, atrasados, maisAntigoEm: antiga?.enviar_em || null };
 }
 
 /** Quantas cabem nesta rodada sem passar do limite por hora (e do lote máximo). */
@@ -1450,28 +1707,69 @@ export function semanasDoRelatorio(envios, semanas = 8, hojeIso = hoje()) {
   return lista;
 }
 
-/** Relatório de uma régua (ou de todas): 8 semanas, taxas e intenções. */
-export async function relatorioRegua(tipo = null, semanas = 8) {
-  const desde = instanteSP(somarDias(hoje(), -7 * semanas - 7), '00:00').toISOString();
-  const p = new URLSearchParams('select=tipo,status,enviado_em,respondido_em,resposta_tipo,agendou_depois_id,intencao');
-  p.set('status', 'eq.enviado');
-  p.set('enviado_em', `gte.${desde}`);
+/** Relatório de uma régua (ou de todas): 8 semanas, taxas e intenções. Rodada 5: aceita período (de/até). */
+export async function relatorioRegua(tipo = null, semanas = 8, { de = null, ate = null } = {}) {
+  const dIni = dataBanco(de), dFim = dataBanco(ate);
+  const desde = dIni ? instanteSP(dIni, '00:00').toISOString() : instanteSP(somarDias(hoje(), -7 * semanas - 7), '00:00').toISOString();
+  const p = new URLSearchParams('select=tipo,status,enviado_em,respondido_em,resposta_tipo,agendou_depois_id,intencao,erro_classe');
+  p.set('status', 'in.(enviado,falhou)');
+  p.set('enviar_em', `gte.${desde}`);
+  if (dFim) p.append('enviar_em', `lt.${instanteSP(somarDias(dFim, 1), '00:00').toISOString()}`);
   if (tipo && tipo !== 'todas') p.set('tipo', `eq.${tipo}`);
   const envios = await selecionarTudo(T.envios, p);
-  return montarRelatorio(envios, tipo, semanas);
+  return montarRelatorio(envios, tipo, semanas, hoje(), { de: dIni, ate: dFim });
 }
 
-/** Pura: relatório a partir dos envios (o mock usa a mesma). */
-export function montarRelatorio(envios, tipo = null, semanas = 8, hojeIso = hoje()) {
+/** Pura: relatório a partir dos envios (o mock usa a mesma). Rodada 5: opt-out, falhas e período. */
+export function montarRelatorio(envios, tipo = null, semanas = 8, hojeIso = hoje(), periodo = {}) {
   const linhas = semanasDoRelatorio(envios, semanas, hojeIso);
-  const tot = linhas.reduce((a, s) => ({ enviadas: a.enviadas + s.enviadas, respondidas: a.respondidas + s.respondidas, agendaram: a.agendaram + s.agendaram }), { enviadas: 0, respondidas: 0, agendaram: 0 });
+  const enviados = envios.filter((e) => e.status === 'enviado');
+  const tot = {
+    enviadas: enviados.length,
+    respondidas: enviados.filter((e) => e.respondido_em).length,
+    agendaram: enviados.filter((e) => e.agendou_depois_id).length,
+    positivas: enviados.filter((e) => e.resposta_tipo === 'positiva').length,
+    negativas: enviados.filter((e) => e.resposta_tipo === 'negativa').length,
+    optout: enviados.filter((e) => e.resposta_tipo === 'parar').length,
+    falharam: envios.filter((e) => e.status === 'falhou').length,
+  };
   const intencoes = {};
   for (const e of envios) if (e.intencao) intencoes[e.intencao] = (intencoes[e.intencao] || 0) + 1;
+  const pct = (n) => (tot.enviadas ? Math.round((n / tot.enviadas) * 100) : null);
   return {
-    tipo: tipo || 'todas', semanas: linhas, total: tot, intencoes,
-    taxaResposta: tot.enviadas ? Math.round((tot.respondidas / tot.enviadas) * 100) : null,
-    taxaAgendamento: tot.enviadas ? Math.round((tot.agendaram / tot.enviadas) * 100) : null,
+    tipo: tipo || 'todas', semanas: linhas, total: tot, intencoes, periodo: { de: periodo.de || null, ate: periodo.ate || null },
+    taxaResposta: pct(tot.respondidas), taxaAgendamento: pct(tot.agendaram), taxaOptout: pct(tot.optout),
   };
+}
+
+/** Pura: uma linha por régua/tipo no período (enviadas, responderam, agendaram depois, pediram para parar, falharam). */
+export function montarRelatorioPorRegua(envios, tipos = TIPOS_ENVIO) {
+  const linhas = {};
+  for (const t of tipos) linhas[t] = { tipo: t, rotulo: ROTULO_TIPO[t] || t, enviadas: 0, respondidas: 0, agendaram: 0, optout: 0, negativas: 0, falharam: 0 };
+  for (const e of envios) {
+    const l = linhas[e.tipo] || (linhas[e.tipo] = { tipo: e.tipo, rotulo: ROTULO_TIPO[e.tipo] || e.tipo, enviadas: 0, respondidas: 0, agendaram: 0, optout: 0, negativas: 0, falharam: 0 });
+    if (e.status === 'falhou') { l.falharam++; continue; }
+    if (e.status !== 'enviado') continue;
+    l.enviadas++;
+    if (e.respondido_em) l.respondidas++;
+    if (e.agendou_depois_id) l.agendaram++;
+    if (e.resposta_tipo === 'parar') l.optout++;
+    if (e.resposta_tipo === 'negativa') l.negativas++;
+  }
+  return Object.values(linhas).filter((l) => l.enviadas || l.falharam || REGUAS.includes(l.tipo))
+    .map((l) => ({ ...l, taxaResposta: l.enviadas ? Math.round((l.respondidas / l.enviadas) * 100) : null, taxaAgendamento: l.enviadas ? Math.round((l.agendaram / l.enviadas) * 100) : null }))
+    .sort((a, b) => b.enviadas - a.enviadas || a.rotulo.localeCompare(b.rotulo));
+}
+
+/** Relatório por régua num período (padrão: 30 dias). */
+export async function relatorioPorRegua({ de = null, ate = null } = {}) {
+  const dIni = dataBanco(de) || somarDias(hoje(), -30), dFim = dataBanco(ate) || hoje();
+  const p = new URLSearchParams('select=tipo,status,enviar_em,respondido_em,resposta_tipo,agendou_depois_id');
+  p.set('status', 'in.(enviado,falhou)');
+  p.set('enviar_em', `gte.${instanteSP(dIni, '00:00').toISOString()}`);
+  p.append('enviar_em', `lt.${instanteSP(somarDias(dFim, 1), '00:00').toISOString()}`);
+  const envios = await selecionarTudo(T.envios, p);
+  return { periodo: { de: dIni, ate: dFim }, linhas: montarRelatorioPorRegua(envios) };
 }
 
 /** Pura: CSV (separador ; e BOM, abre direto no Excel em pt-BR). Fórmulas neutralizadas. */
@@ -1717,7 +2015,7 @@ export async function obterEnvio(id) {
 }
 
 // ---- campanhas com aprovação --------------------------------------------------
-const CAMPOS_CAMPANHA = 'id,status,corpo,detalhe,segmento,destinos,total_previsto,enviar_em,criado_por,criado_por_nome,decidido_por,decidido_por_nome,decidido_em,motivo_recusa,lote,enfileirados,pulados,created_at';
+const CAMPOS_CAMPANHA = 'id,status,corpo,detalhe,segmento,destinos,total_previsto,enviar_em,criado_por,criado_por_nome,decidido_por,decidido_por_nome,decidido_em,motivo_recusa,lote,enfileirados,pulados,created_at,origem';
 export async function criarPropostaCampanha(c) {
   return inserirUm(T.campanhas, {
     status: 'aguardando', corpo: String(c.corpo).slice(0, 2000), detalhe: c.detalhe ? String(c.detalhe).slice(0, 200) : null,
@@ -1975,4 +2273,20 @@ export async function gerarLinkArea(clienteId) {
   const token = await rpc('cliente_gerar_acesso', { p_cliente: clienteId });
   const cfg = await patioConfig().catch(() => null);
   return linkArea(cfg?.link_base || PATIO_URL, typeof token === 'string' ? token : null);
+}
+
+/** Quantas já saíram hoje + quantas estão programadas para hoje (limite diário das campanhas). */
+export async function cargaDeHoje() {
+  const ini = instanteSP(hoje(), '00:00').toISOString(), fim = instanteSP(somarDias(hoje(), 1), '00:00').toISOString();
+  const [saiu, programadas] = await Promise.all([
+    contar(T.envios, `status=eq.enviado&enviado_em=gte.${encodeURIComponent(ini)}`),
+    contar(T.envios, `status=eq.pendente&enviar_em=gte.${encodeURIComponent(ini)}&enviar_em=lt.${encodeURIComponent(fim)}`),
+  ]);
+  return (Number(saiu) || 0) + (Number(programadas) || 0);
+}
+
+/** Últimos agendamentos de um cliente (para a prévia real das réguas). */
+export async function agendamentosDoCliente(clienteId, limite = 3) {
+  if (!ehUuid(clienteId)) return [];
+  return selecionar(T.agendamentos, `${A_SEL}&cliente_id=eq.${clienteId}&order=data.desc,hora.desc&limit=${Math.min(Number(limite) || 3, 20)}`);
 }
