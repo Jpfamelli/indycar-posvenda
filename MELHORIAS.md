@@ -473,3 +473,19 @@ Testes e ferramentas
 - `node scripts/conferir-rodada4.mjs` no banco real (só leitura): pronto 4/11, prévia 13 mensagens em 30 dias com tudo ligado (0 com as ligadas hoje), lista de teste casou 3 de 4.
 - Servidor real local (3510, `CARTEIRO_DESLIGADO=1`): ping 4.0.0, 401/403 nas rotas novas, `/api/rodar?origem=reforco` com token, app.js em brotli com ETag e 304; navegador: login sem erro de console em 1440/375, service worker no controle, config guardada e, **com o servidor derrubado**, a casca abre do cache com a faixa "acordando".
 - Mock + puppeteer: `navegador4` **104/104** verificações em 1440 e 375 px (zero erro de console); `navegador` (rodada 3) 137/137 — sem regressão.
+
+## Pátio (16/10/2026)
+1. Tipos novos na fila: **🚗 Pátio: carro recebido** (`patio_entrada`), **🛠️ Pátio: extra para aprovar** (`patio_extra`), **✅ Pátio: carro pronto** (`patio_pronto`) e **🔑 Área do Cliente** (`area_cliente`) — rótulo, ícone e cor em todas as telas (Início, Mensagens, ficha do cliente, campanhas).
+2. Filtro "tipo" das Mensagens e seletor do Relatório com os quatro tipos; relatório por tipo aceita os novos (`TIPOS_ENVIO`), e o painel "por régua" mostra os do Pátio quando houver envio.
+3. Rótulos também no servidor (`ROTULO_TIPO`, CSV, automações e notificações).
+4. **"Pronto para ligar"** ganhou o item "Avisos do Pátio": lê `patio_config` (carro recebido / extra / pronto ligados), avisa se estão desligados ou se há aviso parado na fila há mais de 2 h, com o botão "Abrir o Pátio".
+5. **O carteiro confere a ordem antes de mandar** (pela `chave_unica` `patio_<tipo>:<os_id>`): "pronto" não sai se o carro já foi entregue ou voltou para o serviço; "extra" não sai se o cliente já decidiu; "recebido" não sai se já está pronto/entregue; ordem cancelada/apagada → pulado com o motivo.
+6. Validade dos avisos do Pátio: recebido 24 h, extra 48 h, pronto 72 h — passou disso, vira "pulado" (o servidor pode ter dormido).
+7. Os avisos do Pátio não esperam feriado nem atendimento em andamento (são operacionais) e **não contam no intervalo mínimo** das réguas de relacionamento.
+8. **Pós-venda continua igual**: `patio_pronto` não substitui nem duplica a régua (ela sai dias depois do serviço, como sempre); teste garante.
+9. Variável **`{link_area}`** nas campanhas e avulsas: cada cliente recebe um link NOVO e só dele para a Área do Cliente (rpc `cliente_gerar_acesso`, o banco guarda só o hash); o envio vira tipo `area_cliente`.
+10. Sem cadastro de cliente não manda convite com link quebrado (pulado com o motivo); no máximo 300 convites por vez (400 com recado claro); links gerados de 5 em 5.
+11. Chip `{link_area}` no editor de campanha, prévia com o link de exemplo e dica explicando "um link por cliente".
+12. **Modelo pronto "Convite para a Área do Cliente"** na biblioteca (`comunicar_modelos`, categoria relacionamento; SQL em `scripts/sql/2026-10-16_comunicar_modelo_area_cliente.sql`, só dado).
+13. `patio.js` com as regras puras e `scripts/testes-patio.mjs` (9 testes: tipos, pós-venda, chave → ordem, conferência do carteiro, `{link_area}`, Pronto para ligar e as rotas de campanha/avulsa por HTTP).
+14. Mock com avisos do Pátio na fila (enviado, na fila, respondido) e o modelo novo; roteiro de navegador 1440/375: filtro com os 4 tipos, lista filtrada, "Pronto para ligar" com o item do Pátio, sem rolagem lateral.

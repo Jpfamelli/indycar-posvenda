@@ -18,7 +18,9 @@ import * as carteiroPuro from './carteiro.js';
 import * as prontidao from './prontidao.js';
 import * as projecao from './projecao.js';
 import * as aniv from './aniversarios.js';
+import * as patio from './patio.js';
 
+const LIMITE_AREA = 300;      // convite da Área do Cliente: um link (rpc) por pessoa
 const LIMITE_CORPO = 2_000_000; // importação de planilha pode ser grande
 
 /* Cliente de exemplo para a prévia das variações da IA. */
@@ -88,18 +90,36 @@ export function criarApi(deps) {
     const lote = randomUUID();
     const linhas = [];
     let pulados = 0;
+    // Pátio (16/10): {link_area} = convite da Área do Cliente, um link NOVO por cliente
+    const area = patio.usaLinkArea(corpo);
+    const tipo = area ? 'area_cliente' : 'campanha';
+    const links = area ? await linksDaArea(destinos) : null;
     for (const d of destinos) {
       const clienteId = d.cliente_id ?? d.id ?? null;
-      const v = porteiro.podeReceber({ cliente_id: clienteId, telefone: d.telefone, tipo: 'campanha' });
+      const v = porteiro.podeReceber({ cliente_id: clienteId, telefone: d.telefone, tipo });
       if (!v.ok) { pulados++; continue; }
+      const linkArea = area ? links.get(clienteId) : '';
+      if (area && !linkArea) { pulados++; continue; }   // sem cadastro de cliente não dá para gerar o link
       linhas.push({
-        cliente_id: clienteId, telefone: d.telefone, nome: d.nome ?? null, tipo: 'campanha',
-        corpo: dados.renderTemplate(corpo, { nome: d.nome, carro: d.carro, placa: d.placa, detalhe: detalhe || '' }),
+        cliente_id: clienteId, telefone: d.telefone, nome: d.nome ?? null, tipo,
+        corpo: dados.renderTemplate(corpo, { nome: d.nome, carro: d.carro, placa: d.placa, detalhe: detalhe || '', link_area: linkArea }),
         enviar_em: enviarEm, criado_por: criador?.nome || null, criado_por_id: criador?.id || null, lote, campanha_id: campanhaId,
       });
     }
     const enfileirados = linhas.length ? await dados.enfileirarVarios(linhas) : 0;
     return { enfileirados, pulados, lote };
+  }
+
+  /** Um link da Área do Cliente por cliente (de 5 em 5; quem não tem cadastro fica sem). */
+  async function linksDaArea(destinos) {
+    const ids = [...new Set(destinos.map((d) => d.cliente_id ?? d.id ?? null).filter((x) => /^[0-9a-f-]{36}$/i.test(String(x || ''))))].slice(0, LIMITE_AREA);
+    const mapa = new Map();
+    for (let i = 0; i < ids.length; i += 5) {
+      const parte = ids.slice(i, i + 5);
+      const feitos = await Promise.all(parte.map((id) => dados.gerarLinkArea(id).catch(() => null)));
+      parte.forEach((id, k) => { if (feitos[k]) mapa.set(id, feitos[k]); });
+    }
+    return mapa;
   }
 
   const segmentoValido = (f) => (dados.SEGMENTOS || []).some((s) => s.id === f);
@@ -278,6 +298,9 @@ export function criarApi(deps) {
     if (destinos === null) return bad(res, 'Segmento desconhecido.');
     if (!destinos.length) return bad(res, 'Escolha pelo menos um cliente.');
     const detalhe = body.detalhe ? String(body.detalhe).slice(0, 200) : '';
+    if (patio.usaLinkArea(corpo) && destinos.length > LIMITE_AREA) {
+      return bad(res, `O convite da Área do Cliente gera um link por pessoa: no máximo ${LIMITE_AREA} clientes por vez.`);
+    }
     const caminho = auto.destinoDoPedido(usuario, destinos.length);
 
     if (caminho === 'proposta') {
@@ -300,9 +323,12 @@ export function criarApi(deps) {
       const porteiro = await dados.carregarPorteiro({ intervalo_minimo_dias: 0 });
       const v = porteiro.podeReceber({ cliente_id: d.cliente_id ?? d.id ?? null, telefone: d.telefone, tipo: 'avulsa' });
       if (!v.ok) return ok(res, { ok: true, enfileirados: 0, pulados: 1, motivo: v.motivo || 'cliente fora da lista' });
+      const area = patio.usaLinkArea(corpo);
+      const linkArea = area ? await dados.gerarLinkArea(d.cliente_id ?? d.id ?? null).catch(() => null) : '';
+      if (area && !linkArea) return ok(res, { ok: true, enfileirados: 0, pulados: 1, motivo: 'sem cadastro de cliente: não dá para gerar o link da Área do Cliente' });
       const criado = await dados.enfileirar({
-        cliente_id: d.cliente_id ?? d.id ?? null, telefone: d.telefone, nome: d.nome ?? null, tipo: 'avulsa',
-        corpo: dados.renderTemplate(corpo, { nome: d.nome, carro: d.carro, placa: d.placa, detalhe }),
+        cliente_id: d.cliente_id ?? d.id ?? null, telefone: d.telefone, nome: d.nome ?? null, tipo: area ? 'area_cliente' : 'avulsa',
+        corpo: dados.renderTemplate(corpo, { nome: d.nome, carro: d.carro, placa: d.placa, detalhe, link_area: linkArea }),
         enviar_em: enviarEm.toISOString(), criado_por: usuario.nome || usuario.email, criado_por_id: usuario.id,
       });
       auditar(usuario, 'mensagem_avulsa', 'posvenda_envios', criado?.id, { cliente_id: d.cliente_id ?? d.id ?? null });
@@ -552,7 +578,7 @@ export function criarApi(deps) {
 
   rota('GET', '/api/pronto', async ({ res, usuario }) => {
     const fatos = await emCache('pronto', 30_000, async () => {
-      const [cfg, wa, carteiroR, comData, total, iaCfg, chave, testeOk] = await Promise.all([
+      const [cfg, wa, carteiroR, comData, total, iaCfg, chave, testeOk, patioCfg, patioFila] = await Promise.all([
         dados.obterConfig(),
         Promise.resolve(whatsapp.status?.()).catch(() => ({ ok: false })),
         resumoDoCarteiro().catch(() => ({})),
@@ -561,8 +587,11 @@ export function criarApi(deps) {
         dados.iaConfig().catch(() => ({})),
         dados.chaveIA().catch(() => null),
         dados.ultimoTesteOk().catch(() => null),
+        dados.patioConfig?.().catch(() => null) ?? null,
+        dados.filaDoPatio?.().catch(() => ({})) ?? {},
       ]);
-      return { cfg, whatsapp: wa || {}, carteiro: carteiroR, aniversarios: { comData, total }, ia: { ativo: iaCfg.ativo, temChave: !!chave }, teste: { ultimoOkEm: testeOk } };
+      return { cfg, whatsapp: wa || {}, carteiro: carteiroR, aniversarios: { comData, total }, ia: { ativo: iaCfg.ativo, temChave: !!chave }, teste: { ultimoOkEm: testeOk },
+        patio: { cfg: patioCfg, fila: patioFila } };
     });
     const r = prontidao.montarProntidao({ ...fatos, agora: relogio() });
     return ok(res, { ...r, gestor: A.ehGestor(usuario) });

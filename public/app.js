@@ -68,7 +68,13 @@ const TIPO = {
                  param:{ campo:'meses_reativacao', antes:'Depois de', depois:'meses sem voltar', min:3, max:36 } },
   campanha:    { rotulo:'Campanha', emoji:'📣', cor:'purple' },
   avulsa:      { rotulo:'Avulsa', emoji:'✉️', cor:'gray' },
+  // Pátio (16/10/2026): quem enfileira é o banco (app do Pátio); aqui só aparecem
+  patio_entrada: { rotulo:'Pátio: carro recebido', emoji:'🚗', cor:'blue', desc:'O carro entrou na oficina: o cliente recebe o link para acompanhar.' },
+  patio_extra:   { rotulo:'Pátio: extra para aprovar', emoji:'🛠️', cor:'orange', desc:'A equipe achou um item: o cliente vê a foto e aprova pelo link.' },
+  patio_pronto:  { rotulo:'Pátio: carro pronto', emoji:'✅', cor:'green', desc:'O carro está pronto para retirar (o pós-venda continua saindo depois).' },
+  area_cliente:  { rotulo:'Área do Cliente', emoji:'🔑', cor:'cyan', desc:'Convite com o link da Área do Cliente (um link por cliente).' },
 };
+const TIPOS_PATIO = ['patio_entrada', 'patio_extra', 'patio_pronto', 'area_cliente'];
 const VARS_COMUNS = ['nome', 'primeiro_nome', 'carro', 'placa', 'servico'];
 const STATUS_ENVIO = {
   pendente:['Na fila', 'bp-orange'], enviado:['Enviada', 'bp-green'], falhou:['Falhou', 'bp-red'],
@@ -773,7 +779,7 @@ async function renderMensagens({ quieto } = {}) {
     return;
   }
   const pilula = (chave, rotulo) => `<button type="button" role="tab" aria-selected="${f.status === chave}" class="pilula ${f.status === chave ? 'ativa' : ''}" data-filtro="${chave}">${rotulo}</button>`;
-  const tipos = ['todos', ...REGUAS, 'campanha', 'avulsa'];
+  const tipos = ['todos', ...REGUAS, 'campanha', 'avulsa', ...TIPOS_PATIO];
 
   view.innerHTML = `
     <div class="toolbar">
@@ -1057,17 +1063,19 @@ window.openCampanhaModal = async function (pre = {}) {
           ${cats.map(cat => `<optgroup label="${esc(cat)}">${modelos.filter(m => (m.categoria || 'geral') === cat).map(m => `<option value="${esc(m.id)}">${esc(m.titulo)}</option>`).join('')}</optgroup>`).join('')}</select></div>
       <div class="field"><label for="campCorpo">Mensagem</label>
         <textarea id="campCorpo" maxlength="2000" style="min-height:120px" placeholder="Oi {primeiro_nome}! …">${esc(c.corpo)}</textarea>
-        <div class="var-chips">${['nome', 'primeiro_nome', 'carro', 'placa', 'detalhe'].map(v => `<button type="button" class="var-chip" data-var="${v}">{${v}}</button>`).join('')}
+        <div class="var-chips">${['nome', 'primeiro_nome', 'carro', 'placa', 'detalhe', 'link_area'].map(v => `<button type="button" class="var-chip" data-var="${v}"${v === 'link_area' ? ' title="Link da Área do Cliente — cada cliente recebe um só dele"' : ''}>{${v}}</button>`).join('')}
           <button type="button" class="var-chip ia-chip" id="campIAEscrever">✨ Escrever com IA</button></div>
         <div class="ia-box" id="campIABox" hidden></div>
-        <div class="contador" id="campCont">0 / 2000</div></div>
+        <div class="contador" id="campCont">0 / 2000</div>
+        <div class="dica" id="campAreaDica" hidden>🔑 Com <b>{link_area}</b> cada cliente recebe um link só dele para a Área do Cliente (até 300 por vez; quem não tem cadastro fica de fora).</div></div>
       <div class="previa"><small>Prévia · como ${esc(clienteDaPrevia()?.nome?.split(' ')[0] || EXEMPLO.nome.split(' ')[0])} vê no celular</small>${celularWA('<div class="bolha wa-rec" id="campBolha"></div>')}</div>`;
     const ta = $('#campCorpo'), bolha = $('#campBolha'), cont = $('#campCont');
     const pintar = () => {
       c.corpo = ta.value;
       window.R4?.guardarRascunho('campanha', c.corpo);
       const cli = clienteDaPrevia() || EXEMPLO;
-      const txt = renderTemplate(c.corpo, { nome: cli.nome, carro: cli.carro, placa: cli.placa, detalhe:'…' });
+      const txt = renderTemplate(c.corpo, { nome: cli.nome, carro: cli.carro, placa: cli.placa, detalhe:'…', link_area:'https://indycar-patio.netlify.app/minha/?c=…' });
+      const dicaArea = $('#campAreaDica'); if (dicaArea) dicaArea.hidden = !c.corpo.includes('{link_area}');
       pintarBolha(bolha, txt, horaBR(new Date()), 'Escreva para ver a prévia.');
       cont.textContent = `${c.corpo.length} / 2000`; cont.classList.toggle('alto', c.corpo.length > 700);
     };
@@ -1850,7 +1858,7 @@ async function abrirRelatorio(regua = 'todas') {
   const titulo = regua === 'todas' ? 'Relatório · todas as mensagens' : `Relatório · ${TIPO[regua]?.rotulo || regua}`;
   openModal(`<div class="modal-head"><h3>📊 ${esc(titulo)}</h3><button type="button" class="modal-close" aria-label="Fechar">×</button></div>
     <div class="modal-body"><div class="field"><label for="relRegua">Régua</label><select id="relRegua">
-      <option value="todas">Todas</option>${[...REGUAS, 'campanha', 'avulsa'].map(t => `<option value="${t}" ${t === regua ? 'selected' : ''}>${TIPO[t]?.emoji || ''} ${esc(TIPO[t]?.rotulo || t)}</option>`).join('')}</select></div>
+      <option value="todas">Todas</option>${[...REGUAS, 'campanha', 'avulsa', ...TIPOS_PATIO].map(t => `<option value="${t}" ${t === regua ? 'selected' : ''}>${TIPO[t]?.emoji || ''} ${esc(TIPO[t]?.rotulo || t)}</option>`).join('')}</select></div>
       <div id="relCorpo"><div class="skel" style="height:220px"></div></div></div>`, { larga:true });
   const pintar = async (r) => {
     const box = $('#relCorpo'); if (!box) return;

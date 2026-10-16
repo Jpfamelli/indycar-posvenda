@@ -24,6 +24,7 @@ export const TAREFA_POR_INTENCAO = {
 const ROTULO_REGUA = {
   aniversario: 'Aniversário', posvenda: 'Pós-venda', retorno: 'Revisão', campanha: 'Campanha', avulsa: 'Avulsa',
   lembrete: 'Lembrete', orcamento: 'Orçamento parado', nao_fechou: 'Não fechou', reativacao: 'Reativação', avaliacao: 'Avaliação',
+  patio_entrada: 'Pátio: carro recebido', patio_extra: 'Pátio: extra', patio_pronto: 'Pátio: carro pronto', area_cliente: 'Área do Cliente',
 };
 
 const nomeDo = (e) => String(e?.nome || '').trim() || e?.telefone || 'Cliente';

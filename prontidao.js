@@ -8,6 +8,7 @@
 // acao.tipo: 'rota' (abre uma tela do Comunicar) · 'link' (outro app) · 'modal'
 // -----------------------------------------------------------------------------
 import { REGUAS, ROTULO_TIPO } from './dados.js';
+import { itemPatioProntidao } from './patio.js';
 
 const ATENDIMENTO = 'https://indycar-atendimento.onrender.com';
 
@@ -106,6 +107,12 @@ export function montarProntidao(f) {
   // 11. IA (opcional)
   if (ia.ativo && ia.temChave) item('ia', 'IA lendo as respostas', 'ok', 'A IA lê as respostas e avisa quem quer agendar ou reclamou.');
   else item('ia', 'IA lendo as respostas', 'aviso', ia.ativo === false ? 'A IA está desligada (Atendimento › Configurações › IA). O Comunicar funciona sem ela.' : 'A IA está sem chave. O Comunicar funciona sem ela.');
+
+  // 12. avisos do Pátio (16/10/2026) — ligados no app do Pátio, saem por esta fila
+  if (f.patio !== undefined) {
+    const it = itemPatioProntidao(f.patio?.cfg ?? null, f.patio?.fila || {}, agora);
+    item(it.id, it.titulo, it.estado, it.texto, it.acao);
+  }
 
   const prontos = itens.filter((i) => i.estado === 'ok').length;
   const faltamEssenciais = itens.filter((i) => i.essencial && i.estado === 'falta');

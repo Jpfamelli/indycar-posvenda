@@ -36,6 +36,7 @@ import { projetarMes } from '../projecao.js';
 import { resumirCarteiro } from '../carteiro.js';
 import { lerLista, casarComClientes, resumirAnalise, montarSugestoes, lerData } from '../aniversarios.js';
 import { montarIndicadores } from '../dados.js';
+import { MODELO_CONVITE_AREA, usaLinkArea, linkArea } from '../patio.js';
 
 /* IA de MENTIRA: o mock usa as funções REAIS do ia.js (validação, correção de
    vocabulário, prévia) com um cliente falso — nada vai para a Anthropic. */
@@ -164,6 +165,7 @@ const MODELOS = [
   ['Aviso de horário especial', 'aviso', 'Oi {primeiro_nome}! Avisando que a IndyCar terá horário especial: {detalhe}. Qualquer coisa, é só chamar por aqui. 🏁'],
   ['Reagendar quem faltou', 'relacionamento', 'Oi {primeiro_nome}, sentimos sua falta no horário de hoje. Aconteceu algum imprevisto? Me diz um dia e horário bons para você que eu reservo de novo. 🏁'],
   ['Pesquisa rápida', 'relacionamento', 'Oi {primeiro_nome}! De 0 a 10, quanto você indicaria a IndyCar para um amigo? Sua resposta ajuda a gente a melhorar. 🙏'],
+  [MODELO_CONVITE_AREA.titulo, MODELO_CONVITE_AREA.categoria, MODELO_CONVITE_AREA.corpo],
 ].map(([titulo, categoria, corpo], i) => ({ id: uuid(), titulo, categoria, corpo, ordem:(i + 1) * 10 }));
 
 // ---- agendamentos (só para a ficha) ------------------------------------------
@@ -194,6 +196,11 @@ const env = (c, tipo, extra = {}) => {
 };
 const enviado = (h, extra = {}) => ({ status:'enviado', enviado_em: horasAtras(h), enviar_em: horasAtras(h + 0.2), created_at: horasAtras(h + 1), tentativas:1, ...extra });
 const ENVIOS_SEMENTE = [
+  // Pátio (16/10): avisos que o banco enfileira pelo app do Pátio
+  env(C(2), 'patio_entrada', { corpo: `Oi ${C(2).nome.split(' ')[0]}! O ${C(2).carro} já está com a gente na IndyCar. Você pode acompanhar cada etapa por aqui: https://indycar-patio.netlify.app/acompanhar/?t=ab12… 🏁`, criado_por:'patio', ...enviado(5) }),
+  env(C(2), 'patio_extra', { corpo: `Oi ${C(2).nome.split(' ')[0]}, encontramos um item que precisa da sua decisão no ${C(2).carro}. Veja a foto e aprove ou recuse por aqui: https://indycar-patio.netlify.app/acompanhar/?t=ab12…`, criado_por:'patio', enviar_em: horasAtras(0.5), created_at: horasAtras(0.5) }),
+  env(C(5), 'patio_pronto', { corpo: `Boa notícia, ${C(5).nome.split(' ')[0]}! O ${C(5).carro} está pronto para retirada. Seg a sáb, 8h às 17h30. 🏁`, criado_por:'patio', ...enviado(8, { resposta:'Passo aí às 17h!', respondido_em: horasAtras(7.5) }) }),
+  env(C(8), 'area_cliente', { corpo: `Oi ${C(8).nome.split(' ')[0]}! Agora você tem a sua Área do Cliente da IndyCar… https://indycar-patio.netlify.app/minha/?c=f00d… 🏁`, criado_por:'Leonardo', ...enviado(30) }),
   env(C(0), 'lembrete', { corpo: renderTemplate(CFG.msg_lembrete, { nome:C(0).nome, carro:C(0).carro, servico:'revisão de freios', quando: quandoRelativo(somarDias(hoje(), 1), '09:00') }), enviar_em: horasAtras(-2) }),
   env(C(10), 'lembrete', { corpo: renderTemplate(CFG.msg_lembrete, { nome:C(10).nome, carro:C(10).carro, servico:'diagnóstico com scanner', quando: quandoRelativo(hoje(), '15:30') }), ...enviado(3, { resposta:'Confirmado, obrigado!', respondido_em: horasAtras(2.5) }) }),
   env(C(1), 'posvenda', { corpo: renderTemplate(CFG.msg_posvenda, { nome:C(1).nome, carro:C(1).carro, servico:'troca de óleo de câmbio' }), ...enviado(26, { resposta:'Ficou ótimo, carro tá outro! 👍', respondido_em: horasAtras(25) }) }),
@@ -561,6 +568,7 @@ http.createServer(async (req, res) => {
       : { cfg: { ...CFG, link_avaliacao: SAUDE_OK ? CFG.link_avaliacao : '' }, whatsapp: SAUDE_OK ? { ok: true, conectado: true } : { ok: false, chaveRecusada: true },
           carteiro: resumirCarteiro({ batidas: BATIDAS(), chamadas: CHAMADAS() }), aniversarios: { comData: CLIENTES.filter((c) => c.nascimento).length, total: CLIENTES.filter((c) => c.telefone).length },
           ia: { ativo: IA_LIGADA, temChave: true }, teste: { ultimoOkEm: null } };
+    fatos.patio = { cfg: { avisar_pronto: true, avisar_extra: true, enviar_link_entrada: true }, fila: { pendentes: ENVIOS.filter((e) => e.status === 'pendente' && e.tipo?.startsWith('patio_')).length, maisAntigoEm: null } };
     return json(res, 200, { ...montarProntidao(fatos), gestor: ehGestor() });
   }
   if (p === '/api/projecao') {
@@ -679,13 +687,15 @@ http.createServer(async (req, res) => {
       const avisados = await auto.avisarPropostaDeCampanha({ campanha: c, loja: lojaMock });
       return json(res, 200, { ok:true, aguardando:true, campanha:c, avisados, enfileirados:0, pulados:0 });
     }
-    const tipo = caminho === 'avulsa' ? 'avulsa' : 'campanha';
+    const area = usaLinkArea(corpo);
+    const tipo = area ? 'area_cliente' : caminho === 'avulsa' ? 'avulsa' : 'campanha';
     const lote = tipo === 'campanha' ? uuid() : null;
     let enfileirados = 0, pulados = 0;
     for (const d of destinos) {
       const c = porId(d.cliente_id);
       if (c?.aceita_mensagens === false) { pulados++; continue; }
-      ENVIOS.unshift(env(c, tipo, { lote, telefone:d.telefone, nome:d.nome, corpo: renderTemplate(corpo, { nome:d.nome, carro:d.carro, placa:d.placa, detalhe:'' }),
+      if (area && !c) { pulados++; continue; }
+      ENVIOS.unshift(env(c, tipo, { lote, telefone:d.telefone, nome:d.nome, corpo: renderTemplate(corpo, { nome:d.nome, carro:d.carro, placa:d.placa, detalhe:'', link_area: area ? linkArea(null, 'f00d' + uuid().replace(/-/g, '')) : '' }),
         enviar_em: body.enviar_em || agora(), created_at: agora(), criado_por: eu.nome, criado_por_id: eu.id }));
       enfileirados++;
     }

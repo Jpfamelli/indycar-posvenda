@@ -16,6 +16,7 @@ import * as ia from './ia.js';
 import * as acesso from './acesso.js';
 import * as auto from './automacoes.js';
 import * as carteiro from './carteiro.js';
+import * as patio from './patio.js';
 import { criarApi } from './rotas.js';
 import { criarEstaticos } from './estaticos.js';
 import { selecionarUm, conferirConfiguracao } from './supabase.js';
@@ -198,6 +199,8 @@ async function umaRodada() {
   const fila = await dados.enviosDevidos(Math.min(vagas + 10, 40)); // folga: alguns serão adiados
   // lembretes: confere o horário de AGORA (cancelado/remarcado enquanto o servidor dormia)
   const agendas = await dados.agendamentosPorIds(fila.filter((e) => e.tipo === 'lembrete').map((e) => e.agendamento_id)).catch(() => null);
+  // avisos do Pátio: confere a ordem de AGORA (carro já entregue não recebe "está pronto")
+  const ordensPatio = await dados.ordensDoPatio(fila.map((e) => patio.osIdDaChave(e.chave_unica)).filter(Boolean)).catch(() => null);
   let enviados = 0, falhas = 0, adiados = 0, reagendados = 0, pulados = 0, parouPor = null;
   for (const envio of fila) {
     if (enviados >= vagas) break;
@@ -215,6 +218,12 @@ async function umaRodada() {
         if (c.enviar_em) { reagendados++; continue; }
         envio.corpo = c.corpo;
       }
+    }
+    if (envio.tipo?.startsWith('patio_')) {
+      const osId = patio.osIdDaChave(envio.chave_unica);
+      const os = osId && ordensPatio ? (ordensPatio.get(osId) || null) : undefined;
+      const c = patio.conferirPatio(envio, os, os?.extras || []);
+      if (c.acao === 'pular') { await dados.marcarEnvio(envio.id, 'pulado', null, undefined, { motivo_pulado: c.motivo }).catch(() => {}); pulados++; continue; }
     }
     // alguém está atendendo o cliente agora → espera 3 h
     let ocup = { ocupada: false, conversa: undefined };

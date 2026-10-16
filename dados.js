@@ -18,6 +18,7 @@ import {
   inserir, inserirUm, atualizar, atualizarUm, remover, contar, rpc,
 } from './supabase.js';
 import { validadeDoEnvio } from './carteiro.js';
+import { TIPOS_PATIO, ROTULO_PATIO, linkArea, PATIO_URL } from './patio.js';
 import { mesclarPreferencias } from './acesso.js';
 
 const T = {
@@ -47,7 +48,7 @@ export const REGUAS = [
 ];
 /** Tipos que contam como "relacionamento" para o intervalo mínimo entre mensagens. */
 const TIPOS_RELACIONAMENTO = new Set(['aniversario', 'retorno', 'reativacao', 'orcamento', 'nao_fechou', 'campanha', 'avulsa']);
-export const TIPOS_ENVIO = ['aniversario', 'posvenda', 'retorno', 'campanha', 'avulsa', 'lembrete', 'orcamento', 'nao_fechou', 'reativacao', 'avaliacao'];
+export const TIPOS_ENVIO = ['aniversario', 'posvenda', 'retorno', 'campanha', 'avulsa', 'lembrete', 'orcamento', 'nao_fechou', 'reativacao', 'avaliacao', ...TIPOS_PATIO];
 
 // ============================================================================
 // UTILIDADES PURAS (sem banco) — testáveis com `npm test`
@@ -189,6 +190,7 @@ export const ROTULO_TIPO = {
   lembrete: 'Lembrete de horário', posvenda: 'Pós-venda', avaliacao: 'Avaliação no Google',
   retorno: 'Revisão', aniversario: 'Aniversário', orcamento: 'Orçamento parado',
   nao_fechou: 'Não fechou', reativacao: 'Reativação', campanha: 'Campanha', avulsa: 'Avulsa',
+  ...ROTULO_PATIO,   // Pátio (16/10/2026): avisos da oficina e convite da Área do Cliente
 };
 
 // ============================================================================
@@ -565,7 +567,7 @@ export async function reenfileirar(id) {
 }
 
 /** Pendentes que já venceram — o carteiro do server.js chama isto. */
-export const CAMPOS_FILA = 'id,cliente_id,agendamento_id,lead_id,telefone,nome,tipo,corpo,enviar_em,tentativas,status,enviando_em,expira_em,mensagem_id,criado_por_id';
+export const CAMPOS_FILA = 'id,cliente_id,agendamento_id,lead_id,telefone,nome,tipo,corpo,enviar_em,tentativas,status,enviando_em,expira_em,mensagem_id,criado_por_id,chave_unica,created_at';
 export async function enviosDevidos(limite = 25) {
   const p = new URLSearchParams(`select=${CAMPOS_FILA}`);
   p.set('status', 'eq.pendente');
@@ -1932,3 +1934,45 @@ export const buscarClientesPorIds = (ids) => clientesPorIds(ids);
 /** Para o checklist: quantos clientes têm aniversário e quantos têm telefone. */
 export const contarComNascimento = () => contar(T.clientes, 'nascimento=not.is.null');
 export const contarClientesComTelefone = () => contar(T.clientes, 'telefone=not.is.null');
+
+// ============================================================================
+// PÁTIO + ÁREA DO CLIENTE (16/10/2026) — só leitura do Pátio e o link da Área
+// ============================================================================
+/** Ordens do pátio (etapa + extras) por id, para o carteiro conferir antes de enviar. */
+export async function ordensDoPatio(ids) {
+  const lista = [...new Set((ids || []).filter(ehUuid))];
+  if (!lista.length) return new Map();
+  const [ordens, extras] = await Promise.all([
+    selecionar('patio_os', `select=id,etapa&id=in.(${lista.join(',')})`),
+    selecionar('patio_extras', `select=os_id,status&os_id=in.(${lista.join(',')})&limit=1000`),
+  ]);
+  return new Map(ordens.map((o) => [o.id, { ...o, extras: extras.filter((e) => e.os_id === o.id) }]));
+}
+
+let _patioCfg = { em: 0, valor: null };
+/** patio_config (avisos ligados e link_base), cache de 60 s; null se não deu para ler. */
+export async function patioConfig() {
+  if (_patioCfg.valor && Date.now() - _patioCfg.em < 60_000) return _patioCfg.valor;
+  const c = await selecionarUm('patio_config', 'select=link_base,avisar_pronto,avisar_extra,enviar_link_entrada&id=is.true').catch(() => null);
+  if (c) _patioCfg = { em: Date.now(), valor: c };
+  return c;
+}
+
+/** Avisos do Pátio parados na fila (para o "Pronto para ligar"). */
+export async function filaDoPatio() {
+  const p = new URLSearchParams('select=id,enviar_em');
+  p.set('status', 'eq.pendente');
+  p.set('tipo', 'in.(patio_entrada,patio_extra,patio_pronto)');
+  p.set('order', 'enviar_em.asc');
+  p.set('limit', '200');
+  const l = await selecionar(T.envios, p);
+  return { pendentes: l.length, maisAntigoEm: l[0]?.enviar_em || null };
+}
+
+/** Link NOVO da Área do Cliente (a rpc devolve o token uma vez; o banco guarda só o hash). */
+export async function gerarLinkArea(clienteId) {
+  if (!ehUuid(clienteId)) return null;
+  const token = await rpc('cliente_gerar_acesso', { p_cliente: clienteId });
+  const cfg = await patioConfig().catch(() => null);
+  return linkArea(cfg?.link_base || PATIO_URL, typeof token === 'string' ? token : null);
+}
