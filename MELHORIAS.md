@@ -618,7 +618,7 @@ Avisos do coordenador (fim da rodada)
 - Banco real: migrações `comunicar_rodada5` e `comunicar_rodada5_origem` aplicadas pelo MCP (`apply_migration`), colunas e tabela conferidas por leitura (`limite_por_minuto=10`, `limite_por_dia=300`, `intervalo_mesmo_cliente_min=60`, `whatsapp_estado=null`, `carteiro_url=https://indycar-posvenda.onrender.com/api/rodar`); `comunicar_segmentos` com RLS ligado e 0 políticas (de propósito); advisors de segurança sem WARN novo. Nada foi gravado na fila nem enviado.
 - Servidor real local (`CARTEIRO_DESLIGADO=1`, `PORT=3510`, `PREFIXO=/comunicar`): `/comunicar/api/ping` 5.0.0, `/comunicar/api/config` → `prefixo: "/comunicar"`, `/comunicar/api/whatsapp/saude` 401 sem login, `/comunicar/api/rodar` 403 sem token, `/comunicar/sw.js` e `/comunicar/app.js` (brotli) 200, `/api/ping` sem prefixo continua 200.
 - Mock na 3511 + puppeteer + Chrome: `navegador5` **96/96**, `navegador4` **104/104**, `navegador` (rodada 3) **137/137**, em 1440 e 375 px, zero erro de console, zero rolagem lateral. Capturas em `capturas-r5/`.
-- Produção: publicado pelo `publicar.mjs comunicar` e conferido no ar (ver o relatório da rodada).
+- Produção (commit d105b31, deploy dep-db9336brjlhs73e1uefg `live`): ping 5.0.0, `/api/config` com `prefixo`, index com os 6 scripts `?v=5.0.0` relativos, manifest `./`, SW 5.0.0, `apps.js`/`rodada5.js` 200; sem login 401 em saúde/segmentos/teste-meu/360, carteiro 403 sem token, origem de fora 403, CSP + HSTS; a primeira rodada da v5 (`inicio`, 14:16 UTC) ficou anotada em `comunicar_carteiro_batidas` com `versao=5.0.0`, ok, 0 falhas.
 
 ### Pendências (rodada 5)
 
