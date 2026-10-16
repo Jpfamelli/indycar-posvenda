@@ -28,7 +28,7 @@ jobs:
             [ "$espera" -gt 0 ] && { echo "HTTP $code — o Render está acordando; tento de novo em ${espera}s…"; sleep "$espera"; }
             code=$(curl -s -o resposta.json -w "%{http_code}" --max-time 60 \
               -X POST -H "X-Runner-Token: $RUNNER_TOKEN" -H "X-Origem: github" \
-              "https://indycar-posvenda.onrender.com/api/rodar?origem=github") || code=000
+              "https://indycar-agendamentos.onrender.com/comunicar/api/rodar?origem=github") || code=000
             if [ "$code" = "200" ] || [ "$code" = "202" ]; then break; fi
           done
           cat resposta.json || true

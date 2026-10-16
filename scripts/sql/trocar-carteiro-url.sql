@@ -1,11 +1,12 @@
--- MODELO (não executado) — quando o Comunicar passar a viver dentro da IndyCar Central.
+-- EXECUTADO em 16/10/2026 (IndyCar Central). Era o MODELO — quando o Comunicar passar a viver dentro da IndyCar Central.
 --
 -- Quem acorda o carteiro é o pg_cron do Supabase:
 --   job `comunicar-carteiro`         ('5,20,35,50 11-23 * * *' UTC = 8h–20h SP) → comunicar_carteiro_chamar('cron')
 --   job `comunicar-carteiro-reforco` ('2-59/5 11-23 * * *')                     → comunicar_carteiro_reforco()
 -- As duas funções leem a URL de posvenda_config.carteiro_url e o token de
 -- posvenda_config.runner_token e fazem POST <carteiro_url>?origem=… com o cabeçalho
--- X-Runner-Token. HOJE: https://indycar-posvenda.onrender.com/api/rodar
+-- X-Runner-Token. ANTES: https://indycar-posvenda.onrender.com/api/rodar — TROCADO em 16/10/2026 (Central) para
+-- https://indycar-agendamentos.onrender.com/comunicar/api/rodar
 --
 -- Para trocar (um UPDATE só; jobs e funções continuam iguais):
 --   update public.posvenda_config
